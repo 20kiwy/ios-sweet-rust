@@ -1,0 +1,13 @@
+[package]
+name = "sweet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SWEET boot pipeline core: IPSW, IM4P/LZFSE, Mach-O chained fixups, Apple Device Tree, SWEETXNU payload, Android boot.img, framebuffer/logo rendering, QEMU + QMP orchestration"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.0"

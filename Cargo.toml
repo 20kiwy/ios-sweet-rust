@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/sweet-core", "crates/sweet-cli"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/20kiwy/ios-sweet-rust"
+authors = ["20kiwy"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

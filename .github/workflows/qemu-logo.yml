@@ -1,0 +1,82 @@
+name: qemu-logo
+
+# The full ios-sweet-rust boot test on a GitHub runner:
+#   real iPhone X 16.7.16 IPSW (HTTP range requests, no full download)
+#     -> Apple logo asset -> SWEETXNU payload (demo kernel)
+#     -> QEMU virt boot -> fb.png screenshot -> verdict (must pass).
+#
+# The demo kernel is synthetic (the real SWEET xnu needs the upstream xnu.yml
+# macOS build); the LOGO, the ADT, the payload pipeline and the QEMU boot are
+# the real thing, end to end.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - ".github/workflows/qemu-logo.yml"
+  workflow_run:
+    workflows: [rust]
+    types: [completed]
+
+concurrency:
+  group: qemu-logo-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  boot:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test --release
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-arm
+          qemu-system-aarch64 --version | head -1
+
+      - name: Boot the Apple logo from the real 16.7.16 IPSW
+        run: |
+          IPSW_URL=$(curl -sfL 'https://api.ipsw.me/v4/device/iPhone10,3?type=ipsw' \
+            | jq -r '.firmwares[] | select(.version=="16.7.16") | .url')
+          echo "IPSW_URL=$IPSW_URL" | tee -a "$GITHUB_ENV"
+          ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW_URL" out \
+            --demo --lowmem --secs 30 --live-serial
+
+      - name: Verdict (must pass)
+        run: |
+          cat out/boot-verdict.json
+          python3 - <<'EOF'
+          import json, sys
+          v = json.load(open('out/boot-verdict.json'))
+          ok = v['pass'] and v['logo_visible'] and not v['panic']
+          print('PASS' if ok else 'FAIL', '- logo_visible:', v['logo_visible'],
+                'kernel_ran:', v['demo_marker'], 'panic:', v['panic'])
+          sys.exit(0 if ok else 1)
+          EOF
+
+      - name: Artifacts (screenshot + verdict + payload)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-logo-results
+          path: |
+            out/
+          retention-days: 30

@@ -1,0 +1,15 @@
+[package]
+name = "sweet-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sweet-rust: boot the Apple logo from an IPSW — IPSW/IM4P/LZFSE, SWEETXNU payload, ADT, boot.img, QEMU"
+
+[[bin]]
+name = "sweet-rust"
+path = "src/main.rs"
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }
