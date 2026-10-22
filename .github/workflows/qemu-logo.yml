@@ -3,7 +3,9 @@ name: qemu-logo
 # The full ios-sweet-rust boot test on a GitHub runner:
 #   real iPhone X 16.7.16 IPSW (HTTP range requests, no full download)
 #     -> Apple logo asset -> SWEETXNU payload (demo kernel)
-#     -> QEMU virt boot -> fb.png screenshot -> verdict (must pass).
+#     -> QEMU virt boot -> fb.png screenshot -> verdict (must pass)
+#   then a second boot that ends on the iOS "Hello" welcome screen
+#     (guest kernel memcpy's it over the logo; hello_visible must be true).
 #
 # The demo kernel is synthetic (the real SWEET xnu needs the upstream xnu.yml
 # macOS build); the LOGO, the ADT, the payload pipeline and the QEMU boot are
@@ -72,11 +74,29 @@ jobs:
           sys.exit(0 if ok else 1)
           EOF
 
-      - name: Artifacts (screenshot + verdict + payload)
+      - name: Boot to the Hello welcome screen
+        run: |
+          ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW_URL" out-hello \
+            --hello --lowmem --secs 30
+
+      - name: Hello verdict (must pass)
+        run: |
+          cat out-hello/boot-verdict.json
+          python3 - <<'EOF'
+          import json, sys
+          v = json.load(open('out-hello/boot-verdict.json'))
+          ok = v['pass'] and v.get('hello_visible') and not v['panic']
+          print('PASS' if ok else 'FAIL', '- hello_visible:', v.get('hello_visible'),
+                'detection:', v.get('hello_detection'), 'panic:', v['panic'])
+          sys.exit(0 if ok else 1)
+          EOF
+
+      - name: Artifacts (screenshots + verdicts + payload)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qemu-logo-results
+          name: qemu-boot-results
           path: |
             out/
+            out-hello/
           retention-days: 30

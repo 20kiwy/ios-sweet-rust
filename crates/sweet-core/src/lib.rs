@@ -25,6 +25,7 @@ pub mod bootimg;
 pub mod cpio;
 pub mod demo;
 pub mod fblogo;
+pub mod hello;
 pub mod ibootim;
 pub mod im4p;
 pub mod ipsw;

@@ -204,11 +204,11 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "make-bootimg" => vec!["kernel", "ramdisk", "dtb", "cmdline", "o"],
         "logo-extract" | "inject-logo" => vec![],
         "fb-render" => vec!["w", "h", "logo-scale"],
-        "demo-kernel" => vec!["color", "strip"],
+        "demo-kernel" => vec!["color", "strip", "hello-scale", "png"],
         "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp"],
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
-            "logo-scale", "cpu", "w", "h", "qemu-datadir",
+            "logo-scale", "cpu", "w", "h", "qemu-datadir", "hello-scale",
         ],
         _ => vec![],
     }
@@ -471,7 +471,19 @@ fn cmd_inject_logo(args: &[String]) -> Result<()> {
 fn cmd_demo_kernel(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("demo-kernel"));
     if f.rest.is_empty() {
-        bail!("usage: demo-kernel <OUT.macho> [--color 0x30c040] [--strip 400]");
+        bail!("usage: demo-kernel <OUT.macho> [--color 0x30c040] [--strip 400] [--hello] [--hello-scale 18]");
+    }
+    if f.has("hello") {
+        let scale = f.num("hello-scale", 18) as u32;
+        let km = demo::macho_hello(scale)?;
+        ipsw::save(Path::new(f.rest[0]), &km)?;
+        eprintln!("{}: {} bytes (hello screen, glyph scale {scale})", f.rest[0], km.len());
+        if let Some(png) = f.val("png") {
+            let fb = sc::hello::welcome_fb(scale);
+            sc::ipsw::save(Path::new(png), &sc::png::encode_fb(FB_W, FB_H, &fb)?)?;
+            eprintln!("{png}: welcome-screen preview");
+        }
+        return Ok(());
     }
     let color = f.num("color", 0x30c040) as u32;
     let strip = f.num("strip", 400) as u32;
@@ -581,9 +593,15 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
     }
 
     // 2. kernel: user file, or the demo kernel
+    let hello = f.has("hello");
     let kernel: Vec<u8> = if let Some(k) = f.val("kernel") {
         verdict.set("kernel_source", J::s(k));
         std::fs::read(k)?
+    } else if hello {
+        let scale = f.num("hello-scale", 18) as u32;
+        verdict.set("kernel_source", J::s("demo-hello"));
+        verdict.set("hello_scale", J::n(scale as f64));
+        demo::macho_hello(scale)?
     } else if f.has("demo") {
         verdict.set("kernel_source", J::s("demo"));
         demo::macho(0x30c040, 400)?
@@ -661,7 +679,9 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
     // 6. verdict
     let serial = std::fs::read_to_string(outdir.join("serial.txt")).unwrap_or_default();
     let fb_png = sc::png::decode(&std::fs::read(outdir.join("fb.png")).unwrap_or_default()).ok();
-    let demo_marker = serial.contains("SWEET-RUST demo kernel OK");
+    let hello_marker = serial.contains(sc::hello::SERIAL_MARKER);
+    let demo_marker =
+        serial.contains("SWEET-RUST demo kernel OK") || hello_marker;
     let panic = serial.contains("panic(cpu ") || serial.contains("SWEET EARLY PANIC:");
     let bsd_root = serial.contains("BSD root: md0");
     let pid1 = serial.contains("init running as PID");
@@ -686,10 +706,20 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         }
         verdict.set("fb_nonblack", J::n(fblogo::nonblack_fraction(&fb)));
         verdict.set("fb_bright_center", J::n(fblogo::bright_fraction(&fb, 120)));
-        if let Some(rd) = info.ramdisk {
-            let _ = rd;
-        }
-        if logo_blob.is_some() && !f.has("no-logo") {
+        if hello_marker {
+            verdict.set("hello_visible", J::b(true));
+            verdict.set("logo_visible", J::b(false));
+            pass = true;
+        } else if f.has("hello") && fblogo::is_hello_screen(&fb) {
+            // serial capture is unreliable under TCG (0 bytes observed);
+            // the hello screen is unambiguous in the FB: solid-white text
+            // (>=250) in the center box over an almost-black background —
+            // the dithered logo never satisfies both.
+            verdict.set("hello_visible", J::b(true));
+            verdict.set("hello_detection", J::s("framebuffer"));
+            verdict.set("logo_visible", J::b(false));
+            pass = true;
+        } else if logo_blob.is_some() && !f.has("no-logo") {
             let bright = fblogo::bright_fraction(&fb, 120);
             verdict.set("logo_visible", J::b(bright > 0.005 && !panic));
             pass = pass || bright > 0.005;

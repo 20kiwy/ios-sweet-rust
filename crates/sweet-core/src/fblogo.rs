@@ -101,3 +101,12 @@ pub fn bright_fraction(fb: &[u8], thresh: u8) -> f64 {
     }
     bright as f64 / total as f64
 }
+
+/// True when the framebuffer shows the hello welcome screen: solid-white
+/// text (>= 250) in the center box over an almost-black background. The
+/// dithered Apple logo never satisfies both (its pixels are sparse grey and
+/// it keeps ~17% non-black coverage), so this cleanly separates the two
+/// boot milestones without relying on serial output.
+pub fn is_hello_screen(fb: &[u8]) -> bool {
+    nonblack_fraction(fb) < 0.05 && bright_fraction(fb, 250) > 0.01
+}

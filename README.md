@@ -6,8 +6,9 @@ This is a full reimplementation of the [ios-sweet](https://github.com/dipa-studi
 boot toolchain as a native Rust workspace. It takes Apple's **iPhone X iOS 16.7.16
 IPSW**, extracts the **Apple logo asset** out of it, packs a bootable **SWEETXNU
 payload**, injects the logo into the framebuffer at `0x9c000000` and **boots it in
-QEMU** — ending with a verified screenshot (`fb.png`) of the Apple logo on a
-1080x2400 canvas, exactly what the phone shows at boot.
+QEMU** — the guest kernel then executes and flips the framebuffer to the iOS
+**"Hello" welcome screen** on a 1080x2400 canvas, with every step verified
+(`boot-verdict.json`).
 
 Every library in the boot path is implemented here:
 
@@ -32,7 +33,8 @@ Every library in the boot path is implemented here:
 | --- | --- |
 | IPSW reading | The real `iPhone10,3_16.7.16_20H392` IPSW: ZIP64 central directory over HTTP range requests in ~2 s (no 6 GB download) |
 | Apple logo | `applelogo@3x~iphone.im4p`: IM4P → iBootIm (grey 194x238) → SSZL decode → white-on-black logo, rendered into the 1080x2400 framebuffer |
-| Payload pipeline | 10/10 unit tests: chained fixups, ADT round-trip, ramdisk → `md0`, boot_args layout (736 bytes), CPU stub, auto `-m` sizing |
+| **Hello screen** | `ipsw-boot --hello`: the kernel memcpy's the pre-rendered welcome screen over the logo once guest code runs — the visible *boot progressed* milestone, verified framebuffer-side (`hello_visible: true`) |
+| Payload pipeline | 11/11 unit tests: chained fixups, ADT round-trip, ramdisk → `md0`, boot_args layout (736 bytes), CPU stub, auto `-m` sizing, hello classification |
 | QEMU boot | `ipsw-boot --demo --lowmem`: QEMU 10 boots the payload, the injected Apple logo is visible in the screenshot, the demo kernel's framebuffer marker proves execution, `boot-verdict.json` says **pass** |
 | iBootIm/SSZL | round-trip tests + decode of the real 16.7.16 asset (visually verified) |
 
@@ -51,6 +53,8 @@ IPSW (file or URL, HTTP ranges)
   -> ibootim.rs  iBootIm header -> sszl_decode (Apple iBoot LZSS) -> grey mask
   -> fblogo.rs   black BGRA canvas 1080x2400 + centered logo -> logo.bin
   -> demo.rs     (or --kernel) arm64 Mach-O + boot_args
+                 (--hello: the Mach-O carries the pre-rendered welcome
+                  screen; the guest kernel memcpy's it over the logo)
   -> payload.rs  SWEETXNU: kernel segments + ADT + ramdisk + boot-args
   -> qemu.rs     loader devices: ram.bin @ phys_base, stub @ 0x40200000,
                  logo.bin @ 0x9c000000 -> CPU starts at the stub, x0 = boot_args
@@ -97,6 +101,18 @@ sweet-rust ipsw-boot --ipsw IPSW_or_URL out/ --demo --lowmem --secs 20
 `--lowmem` fits a 2 GiB guest (CI-friendly); without it the QEMU ADT asks for
 the phone's 4 GiB layout, like the Python tool.
 
+### Boot to the Hello screen
+
+```sh
+sweet-rust ipsw-boot --ipsw IPSW_or_URL out/ --hello --lowmem --secs 30
+# out/fb.png            the iOS welcome screen: white "Hello" + home indicator
+# out/boot-verdict.json hello_visible: true (framebuffer-detected), pass: true
+```
+
+The Apple logo from the IPSW is still injected first — the screenshot is taken
+after the guest kernel replaced it with the welcome screen, proving the boot
+chain progressed: logo → kernel executes → hello.
+
 ### Boot the real SWEET kernel
 
 ```sh
@@ -139,7 +155,9 @@ sweet-rust boot-qemu payload.bin out/ [--logo logo.bin] [--live-serial] [--gdb]
   needed them; the logo injection was ad-hoc in the previous session).
 - The demo kernel's PL011 serial marker is best-effort: QEMU 10's PL011 gates
   TX FIFO timing in ways that can drop bytes when the guest exits fast; the
-  verdict therefore uses the framebuffer corner marker, which is deterministic.
+  verdict therefore uses the framebuffer markers (corner pixel for the demo
+  kernel, solid-white-text-over-black classifier for the hello screen), which
+  are deterministic.
 - `boot-qemu` clamps guest RAM to >= 2 GiB (the Python tool clamps to 4) so the
   demo/CI boot fits small hosts; the standard QEMU ADT still computes 4-5 GiB.
 - Everything else — payload layout, boot_args fields, ADT properties, fixup

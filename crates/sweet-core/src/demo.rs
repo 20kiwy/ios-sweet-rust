@@ -4,6 +4,7 @@
 //! Apple logo stays visible above it) and prints a marker to the PL011
 //! serial at 0x09000000. CI asserts on serial + framebuffer.
 
+use crate::hello::{welcome_fb, SERIAL_MARKER};
 use crate::{bail, FB_H, Result};
 
 const BASE: u64 = 0x1_0000_0000; // __TEXT VA (matches the SWEET kernel's region)
@@ -26,6 +27,25 @@ fn b(byte_off: i64) -> u32 {
 
 fn cbz(rt: u32, byte_off: i64) -> u32 {
     0x3400_0000 | ((((byte_off >> 2) & 0x7_ffff) as u32) << 5) | rt
+}
+
+/// cbnz Xt, offset (64-bit, loop-back branch while the counter is nonzero)
+fn cbnz64(rt: u32, byte_off: i64) -> u32 {
+    0xb500_0000 | ((((byte_off >> 2) & 0x7_ffff) as u32) << 5) | rt
+}
+
+/// sub Xd, Xn, #imm12
+fn sub64_imm12(rd: u32, rn: u32, imm: u32) -> u32 {
+    0xd100_0000 | ((imm & 0xfff) << 10) | (rn << 5) | rd
+}
+
+/// ADRP Xd, page(PC + byte_off): 4GB-reach PC-relative page address
+/// (ADR's ±1MB window cannot span the multi-MB hello blob).
+fn adrp(rd: u32, byte_off: i64) -> u32 {
+    let pages = byte_off >> 12; // caller guarantees page-aligned math
+    let immlo = (pages & 3) as u32;
+    let immhi = ((pages >> 2) & 0x7_ffff) as u32;
+    0x9000_0000 | (immlo << 29) | (immhi << 5) | rd
 }
 
 fn bcond_ne(byte_off: i64) -> u32 {
@@ -171,12 +191,105 @@ pub fn macho(color: u32, strip_rows: u32) -> Result<Vec<u8>> {
     Ok(wrap_macho(&code))
 }
 
+/// Generate the hello-screen demo kernel: __TEXT carries a short memcpy stub
+/// plus the pre-rendered welcome framebuffer as trailing data. At boot it
+/// copies the blob over the whole framebuffer (replacing the injected Apple
+/// logo — the visible "boot progressed" transition), then prints the hello
+/// marker on the PL011 and parks. The blob is reached with ADRP because it
+/// sits megabytes beyond ADR's ±1MB window; the load PA is 4K-aligned
+/// (phys_base = 0x48000000), so page deltas are pure file-offset math.
+pub fn macho_hello(scale: u32) -> Result<Vec<u8>> {
+    let fb = welcome_fb(scale);
+    let words = (fb.len() / 4) as u64;
+
+    let mut code: Vec<u8> = Vec::new();
+    let mut emit = |code: &mut Vec<u8>, v: u32| code.extend_from_slice(&ins(v));
+
+    // x1 = &blob (ADRP page + low12), patched once data_off is known
+    let adrp_at = code.len();
+    emit(&mut code, 0); // adrp x1, blob_page — patch below
+    emit(&mut code, 0); // add x1, x1, #lo — patch below (needs data_off)
+    let add_lo_at = code.len() - 4;
+    // x2 = 0x9c000000 (framebuffer)
+    emit(&mut code, movz64(2, 0));
+    emit(&mut code, movk64_lsl16(2, 0x9c00));
+    // x3 = word count
+    emit(&mut code, movz64(3, (words & 0xffff) as u32));
+    emit(&mut code, movk64_lsl16(3, ((words >> 16) & 0xffff) as u32));
+    if words >> 32 != 0 {
+        bail!("hello blob unexpectedly >= 4G words");
+    }
+    // copy loop
+    let loop_at = code.len();
+    emit(&mut code, 0xb940_0024); // ldr w4, [x1]
+    emit(&mut code, 0xb900_0044); // str w4, [x2]
+    emit(&mut code, add64_imm12(1, 1, 4)); // add x1, x1, #4
+    emit(&mut code, add64_imm12(2, 2, 4)); // add x2, x2, #4
+    emit(&mut code, sub64_imm12(3, 3, 1)); // sub x3, x3, #1
+    let cbnz_at = code.len();
+    emit(&mut code, 0); // cbnz x3, loop — patch below
+
+    // PL011 enable + marker print (same proven pattern as macho())
+    emit(&mut code, movz64(3, 0x0030));
+    emit(&mut code, movk64_lsl16(3, PL011_DR >> 16)); // x3 = 0x09000030 (CR)
+    emit(&mut code, movz32(4, 0x301));
+    emit(&mut code, 0xb900_0064); // str w4, [x3]
+    emit(&mut code, movz64(0, PL011_DR & 0xffff));
+    emit(&mut code, movk64_lsl16(0, PL011_DR >> 16)); // x0 = 0x09000000 (DR)
+    let adr_at = code.len();
+    emit(&mut code, 0); // adr x1, msg — patch below
+    let ldrb_pos = code.len();
+    emit(&mut code, 0x3940_0002); // ldrb w2, [x1]
+    let cbz_pos = code.len();
+    emit(&mut code, 0); // cbz w2, done — patch below
+    emit(&mut code, 0xb900_0002); // str w2, [x0]
+    emit(&mut code, add64_imm12(1, 1, 1)); // add x1, x1, #1
+    let back_pos = code.len();
+    emit(&mut code, 0); // b ldrb — patch below
+    let done_pos = code.len();
+    emit(&mut code, 0xd503_207f); // wfi
+    emit(&mut code, b(0)); // b . (self)
+
+    let msg_pos = code.len();
+    code.extend_from_slice(format!("\n{SERIAL_MARKER}\n\0").as_bytes());
+
+    // blob lands on the next 4K boundary after the message
+    let data_off = (code.len() + 0xfff) & !0xfff;
+
+    // patches
+    let page_delta = ((data_off & !0xfff) as i64) - ((adrp_at & !0xfff) as i64);
+    code[adrp_at..adrp_at + 4].copy_from_slice(&ins(adrp(1, page_delta)));
+    code[add_lo_at..add_lo_at + 4]
+        .copy_from_slice(&ins(add64_imm12(1, 1, (data_off & 0xfff) as u32)));
+    let cbnz_off = loop_at as i64 - cbnz_at as i64;
+    code[cbnz_at..cbnz_at + 4].copy_from_slice(&ins(cbnz64(3, cbnz_off)));
+    let msg_off = msg_pos as i64 - adr_at as i64;
+    code[adr_at..adr_at + 4].copy_from_slice(&ins(adr(1, msg_off)));
+    let cbz_off = done_pos as i64 - cbz_pos as i64;
+    code[cbz_pos..cbz_pos + 4].copy_from_slice(&ins(cbz(2, cbz_off)));
+    let back_off = ldrb_pos as i64 - back_pos as i64;
+    code[back_pos..back_pos + 4].copy_from_slice(&ins(b(back_off)));
+
+    // full image: header + load commands + code + pad + blob
+    let total = data_off + fb.len();
+    let mut image = wrap_macho_sized(&code, total);
+    image[data_off..].copy_from_slice(&fb);
+    Ok(image)
+}
+
 /// Wrap position-independent __text into a static MH_EXECUTE with
 /// LC_UNIXTHREAD pc = BASE + CODE_OFF (mkinit-style layout; unsigned is fine:
 /// the demo kernel is parsed by mkpayload, never by XNU's mach_loader).
 fn wrap_macho(code: &[u8]) -> Vec<u8> {
     const SEG: usize = 0x4000;
-    let mut image = vec![0u8; SEG * 2]; // __TEXT page + __LINKEDIT page
+    wrap_macho_sized(code, SEG * 2)
+}
+
+/// Sized variant: `total` covers code plus any trailing payload (the hello
+/// blob), so __TEXT vmaddr/vmsize span the whole image.
+fn wrap_macho_sized(code: &[u8], total: usize) -> Vec<u8> {
+    let seg_vmsize = total as u64;
+    let mut image = vec![0u8; total]; // __TEXT (code [+ blob]) + __LINKEDIT region
     let mut cmds: Vec<u8> = Vec::new();
 
     // No __PAGEZERO: the SWEET xnu Mach-O starts with __TEXT at its VA
@@ -189,13 +302,21 @@ fn wrap_macho(code: &[u8]) -> Vec<u8> {
     sect[32..40].copy_from_slice(&(BASE + CODE_OFF as u64).to_le_bytes()); // addr
     sect[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // size
     sect[48..56].copy_from_slice(&(CODE_OFF as u64).to_le_bytes()); // offset
-    sect[56..64].copy_from_slice(&(code.len() as u64).to_le_bytes()); // reloff? no: reserved1.. keep size again
+    sect[56..64].copy_from_slice(&(code.len() as u64).to_le_bytes()); // reserved: size again
     sect[64..68].copy_from_slice(&3u32.to_le_bytes()); // align flags low: use 3? (this is reloc offset field; cosmetic)
     sect[68..72].copy_from_slice(&3u32.to_le_bytes());
     sect[76..80].copy_from_slice(&0x8000_0400u32.to_le_bytes()); // S_ATTR_CODE
-    cmds.extend_from_slice(&seg_cmd("__TEXT", BASE, SEG as u64, 0, SEG as u64, 5, &sect));
-    // __LINKEDIT r-- (empty)
-    cmds.extend_from_slice(&seg_cmd("__LINKEDIT", BASE + SEG as u64, SEG as u64, SEG as u64, 0, 1, &[]));
+    cmds.extend_from_slice(&seg_cmd("__TEXT", BASE, seg_vmsize, 0, seg_vmsize, 5, &sect));
+    // __LINKEDIT r-- (empty, at the end of the image)
+    cmds.extend_from_slice(&seg_cmd(
+        "__LINKEDIT",
+        BASE + seg_vmsize,
+        0,
+        total as u64,
+        0,
+        1,
+        &[],
+    ));
     // LC_UNIXTHREAD (flavor 6 = ARM_THREAD_STATE64, count 68), sp = 0, pc = entry
     cmds.extend_from_slice(&5u32.to_le_bytes()); // cmd
     cmds.extend_from_slice(&((16 + 4 * 68) as u32).to_le_bytes()); // cmdsize
@@ -208,10 +329,10 @@ fn wrap_macho(code: &[u8]) -> Vec<u8> {
     }
     cmds.extend_from_slice(&0u32.to_le_bytes()); // cpsr
     cmds.extend_from_slice(&0u32.to_le_bytes()); // pad
-    // LC_CODE_SIGNATURE (0x1d), cmdsize 16, offset/size 0 = unsigned
+    // LC_CODE_SIGNATURE (0x1d), cmdsize 16, dataoff/size 0 = unsigned
     cmds.extend_from_slice(&0x1du32.to_le_bytes());
     cmds.extend_from_slice(&16u32.to_le_bytes());
-    cmds.extend_from_slice(&((SEG * 2) as u32).to_le_bytes());
+    cmds.extend_from_slice(&0u32.to_le_bytes());
     cmds.extend_from_slice(&0u32.to_le_bytes());
 
     let hdr_len = 32 + cmds.len();

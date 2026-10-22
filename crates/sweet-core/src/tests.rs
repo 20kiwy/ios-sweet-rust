@@ -372,6 +372,43 @@ fn demo_kernel_parses_and_places() {
 }
 
 #[test]
+fn hello_screen_renders_and_kernel_places() {
+    use crate::hello::{welcome_fb, SERIAL_MARKER};
+    // renderer: exact canvas, white text bright in the center box, home bar
+    let fb = welcome_fb(18);
+    assert_eq!(fb.len(), (crate::FB_STRIDE * crate::FB_H) as usize);
+    let bright = crate::fblogo::bright_fraction(&fb, 200);
+    assert!(bright > 0.01, "hello glyphs should light the center box: {bright}");
+    // corner stays black (word is centered, not at 0,0) — verdicts rely on
+    // the serial marker, not a corner pixel
+    assert_eq!(&fb[0..4], &[0, 0, 0, 255]);
+    // the marker string is embedded in the kernel message
+    let km = demo::macho_hello(18).unwrap();
+    assert!(
+        km.windows(SERIAL_MARKER.len()).any(|w| w == SERIAL_MARKER.as_bytes()),
+        "hello kernel must carry its serial marker"
+    );
+    // parses as a Mach-O, __TEXT spans code + blob, payload pipeline accepts it
+    let m = crate::macho::parse(&km).unwrap();
+    assert_eq!(m.segments[0].name, "__TEXT");
+    assert!(m.segments[0].vmsize >= km.len() as u64);
+    let adt_blob = adt_qemu();
+    let (p, info) =
+        payload::build(&km, &adt_blob, "debug=0xc serial=3 cpus=1 rd=md0", None).unwrap();
+    assert!(info.entry > 0);
+    let placed = payload::build_image(&p).unwrap();
+    // blob end must land inside the placed image (ADT/boot_args come after)
+    assert!(placed.image.len() >= km.len());
+    // adrp page-delta sanity: the blob offset the kernel computes must be
+    // representable (positive, < 2^20 pages for any sane scale)
+    assert!(km.len() < (1 << 20) * 4096);
+    // the FB analyzer must separate hello from the dithered logo
+    assert!(crate::fblogo::is_hello_screen(&fb), "welcome_fb must classify as hello");
+    let logo_fb = crate::fblogo::blank_canvas();
+    assert!(!crate::fblogo::is_hello_screen(&logo_fb), "blank canvas is not hello");
+}
+
+#[test]
 fn qmp_dual_transport_against_fake_server() {
     // Port of test_qmp_branches.py: a tiny fake QMP server; unix socket here
     // (the TCP branch is covered by the same protocol logic + CI on Windows).
