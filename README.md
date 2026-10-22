@@ -37,6 +37,9 @@ Every library in the boot path is implemented here:
 | Payload pipeline | 12/12 unit tests: chained fixups, ADT round-trip, ramdisk → `md0`, boot_args layout (736 bytes), CPU stub, auto `-m` sizing, hello parser/rasterizer, SHA-256 |
 | QEMU boot | `ipsw-boot --demo --lowmem`: QEMU 10 boots the payload, the injected Apple logo is visible in the screenshot, the demo kernel's framebuffer marker proves execution, `boot-verdict.json` says **pass** |
 | iBootIm/SSZL | round-trip tests + decode of the real 16.7.16 asset (visually verified) |
+| **Wallpaper from the IPSW** | the real iOS 16 Clownfish: 11 HEIC layers + Apple's CoreAnimation layout (main.caml) pulled out of `/Library/Wallpaper/...` in the sealed system volume, composited at 1125x2436 with Apple's own geometry, zero hand-drawn pixels |
+| **Interactive emulator control** | `emu-boot`: boots a LIVE QEMU session (QMP + gdbstub + serial socket + shared-memory guest RAM); the host repaints the framebuffer with the IPSW wallpaper at runtime, types into the guest UART, and the guest ECHOES it back and paints the keystrokes on screen (`emu-verdict.json`: logo/wallpaper/input_visible + input_echoed all true) |
+| Rootfs file browser | `ipsw-ls` / `ipsw-find` / `ipsw-file`: list/search/extract any real file of the IPSW system volume (318,071 indexed entries in ~16 s over HTTP ranges) |
 
 The **SWEET xnu kernel itself** is built by the upstream repo's CI
 (`xnu.yml`, macOS runner); this toolchain consumes `kernel.development.sweet`
@@ -124,6 +127,48 @@ IPSW + `hello_sha256`) is recorded in the verdict and `hello-extract` writes a
 `provenance.json` next to the PNG.
 
 Just want the asset? `sweet-rust hello-extract IPSW_or_URL outdir/ --lang en_GB`
+
+### Live control: wallpaper + typing into the guest
+
+`emu-boot` keeps the VM alive and drives it from the host — this is the
+"controllable phone" mode:
+
+```bash
+sweet-rust emu-boot --ipsw ipsw.ipsw out-emu \
+  --wallpaper wall/clownfish-1080x2400.png \
+  --send "hello from the host" --secs 30
+```
+
+What happens, in order (all evidence lands in `out-emu/`):
+
+1. QEMU boots with the injected Apple logo, an interactive demo kernel that
+   POLLS the PL011 receive FIFO, a serial socket chardev, QMP, and a
+   shared-memory guest RAM file (`ram.mmap`, `memory-backend-file share=on`).
+2. Screenshot 1 — the Apple logo from the IPSW.
+3. The host repaints the framebuffer at `0x9c000000` by writing the shared RAM
+   file — Screenshot 2 shows the real iOS 16 wallpaper ON THE EMULATED PHONE.
+4. The host types into the guest UART — the guest kernel ECHOES the bytes back
+   (captured in `serial.txt`) and paints one yellow cell per keystroke onto
+   the screen — Screenshot 3. Pressing Enter makes the guest reprint its
+   banner, so the host can recover the marker even if it raced the boot log.
+5. `emu-verdict.json`: `logo_visible`, `wallpaper_visible`, `input_echoed`,
+   `input_visible`, `kernel_alive` — all must be true for pass.
+
+The wallpaper itself is 100% IPSW-sourced: `ipsw-file` pulls the 11 Clownfish
+HEIC layers and Apple's `main.caml` layer-geometry files out of
+`/Library/Wallpaper/Collections/...` in the sealed system volume, then
+`tools/compose-wallpaper.py` composites them with Apple's own CoreAnimation
+transform math at 1125x2436 (375x812 pt @3x, the iPhone X panel) and resizes
+to the 1080x2400 framebuffer. Provenance sha256s land in the verdict.
+
+Inspect the guest like a phone under test:
+
+```bash
+sweet-rust emu-peek out-emu/payload.bin out-emu/peek --addr 0x48000480 --len 96
+sweet-rust ipsw-ls ipsw.ipsw /Library/Wallpaper
+sweet-rust ipsw-find ipsw.ipsw heic
+sweet-rust ipsw-file ipsw.ipsw /Library/Wallpaper/DefaultWallpapers~iphone.plist --out dw.plist
+```
 
 ### Boot the real SWEET kernel
 

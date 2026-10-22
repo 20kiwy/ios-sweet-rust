@@ -564,3 +564,41 @@ fn ibootim_sszl_roundtrip() {
     let dec = crate::ibootim::sszl_decode(&enc, data.len()).unwrap();
     assert_eq!(dec, data);
 }
+
+#[test]
+fn interactive_kernel_no_unpatched_branches() {
+    // Regression: a hand-assembler patch once landed one slot past its
+    // placeholder, leaving a literal 0x00000000 (UDF) in the poll loop —
+    // the guest faulted into a vector storm at boot.
+    let km = crate::demo::macho_interactive(0x30c040, 60).unwrap();
+    // walk every 4-byte word of __text; only the message bytes may be
+    // non-code, and no zero word may exist inside the code region
+    let code_off = 0x400usize;
+    let code_len = {
+        // __text section size = code bytes; find the message start
+        let msg = b"\nSWEET-RUST interactive kernel OK";
+        let mut at = None;
+        for i in 0..km.len() - msg.len() {
+            if &km[i..i + msg.len()] == &msg[..] {
+                at = Some(i);
+                break;
+            }
+        }
+        let at = at.expect("banner message missing");
+        at - code_off
+    };
+    let mut i = code_off;
+    while i < code_off + code_len {
+        let w = u32::from_le_bytes([km[i], km[i + 1], km[i + 2], km[i + 3]]);
+        assert_ne!(w, 0, "unpatched placeholder at code offset {:#x}", i - code_off);
+        i += 4;
+    }
+    // the banner printer must read the MESSAGE (x1), not the UART (x0):
+    // ldrb w2, [x1] encodes rn=1 -> ...0x22, [x0] would be ...0x02
+    let printer = &km[code_off + 0x64..code_off + 0x68];
+    assert_eq!(printer, &[0x22, 0x00, 0x40, 0x39], "banner ldrb must be [x1]");
+    // the FR poll must read x6 (rn=6 -> 0xc5); the adr x7 (banner reprint)
+    // sits at 0x8c, so the poll ldr lands at 0x90
+    let poll = &km[code_off + 0x90..code_off + 0x94];
+    assert_eq!(poll, &[0xc5, 0x00, 0x40, 0xb9], "poll ldr must be [x6]");
+}

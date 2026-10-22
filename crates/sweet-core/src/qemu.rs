@@ -25,6 +25,13 @@ pub struct RunOptions {
     pub qemu_datadir: Vec<String>,
     /// Apple-logo BGRA blob loaded at 0x9c000000 before the CPU starts.
     pub logo: Option<Vec<u8>>,
+    /// When set, the guest UART is a socket chardev instead of a log file
+    /// (control-plane sessions type into the guest and capture output live).
+    pub serial_sock: Option<PathBuf>,
+    /// When set, guest RAM is a SHARED memory file (memory-backend-file with
+    /// share=on): the host paints the framebuffer / screenshots by file I/O
+    /// at (PA - 0x40000000), no QMP/gdb round trips.
+    pub ram_file: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -36,6 +43,8 @@ impl Default for RunOptions {
             hmp: Vec::new(),
             fail_on_panic: false,
             live_serial: false,
+            serial_sock: None,
+            ram_file: None,
             qemu_datadir: Vec::new(),
             logo: None,
         }
@@ -756,4 +765,158 @@ pub fn extract_font(kernel: &Path, payload: &[u8], nm: &str) -> Result<Vec<u8>> 
 #[allow(dead_code)]
 fn _use(a: &[u8]) -> (u32, u64) {
     (u32le(a, 0), u64le(a, 8))
+}
+
+// ---------------------------------------------------------------------------
+// Interactive spawn: same pipeline as run(), but the VM stays alive and the
+// control plane keeps the handles (serial socket, QMP, gdbstub).
+// ---------------------------------------------------------------------------
+
+pub struct Spawned {
+    pub child: Child,
+    pub mon: Transport,
+    pub out: PathBuf,
+    /// Unix socket of the guest UART (None on Windows: read out/serial.tcp).
+    pub serial_sock: Option<PathBuf>,
+    /// Shared guest RAM file when opts.ram_file was set.
+    pub ram_file: Option<PathBuf>,
+}
+
+/// Spawn the payload under QEMU and return WITHOUT waiting: the caller owns
+/// the running machine through Session (control.rs).
+pub fn spawn_session(
+    payload_path: &Path,
+    outdir: &Path,
+    opts: &RunOptions,
+    gdb_port: u16,
+) -> Result<Spawned> {
+    if !check_env(&opts.cpu) {
+        bail!("QEMU environment check failed");
+    }
+    let payload = std::fs::read(payload_path)?;
+    let out = std::fs::canonicalize(outdir).unwrap_or_else(|_| outdir.to_path_buf());
+    std::fs::create_dir_all(&out)?;
+
+    let PlacedImage { phys_base, image: img, boot_args_pa, entry_pa, mem_size } =
+        build_image(&payload)?;
+    let ram_bin = out.join("ram.bin");
+    std::fs::write(&ram_bin, &img)?;
+    let stub_bin = out.join("stub.bin");
+    std::fs::write(&stub_bin, stub(boot_args_pa, entry_pa))?;
+    eprintln!(
+        "phys_base={:#x} boot_args={boot_args_pa:#x} entry={entry_pa:#x}",
+        phys_base
+    );
+    drop(img);
+
+    let (mon, mon_arg) = if cfg!(windows) {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+        (Transport::Tcp("127.0.0.1".into(), port), format!("tcp:127.0.0.1:{port},server,nowait"))
+    } else {
+        let sock = out.join("mon.sock");
+        if sock.exists() {
+            let _ = std::fs::remove_file(&sock);
+        }
+        (Transport::Unix(sock.clone()), format!("unix:{},server,nowait", sock.display()))
+    };
+    let gib = ((phys_base + mem_size).saturating_sub(0x4000_0000)).div_ceil(1 << 30);
+    let ram_gib = gib.max(2);
+    let mut cmd = Command::new(find_qemu().ok_or_else(|| crate::Error::Msg("no qemu".into()))?);
+    // Shared-memory guest RAM: the control plane paints/screenshots the
+    // framebuffer by writing the RAM file directly (PA - RAM_BASE offset).
+    let mut machine = "virt,gic-version=3".to_string();
+    if let Some(ramf) = &opts.ram_file {
+        if ramf.exists() {
+            let _ = std::fs::remove_file(ramf);
+        }
+        let rf = std::fs::File::create(ramf)?;
+        rf.set_len((1u64 << 30) * ram_gib as u64)?;
+        drop(rf);
+        machine.push_str(",memory-backend=ram0");
+        cmd.args([
+            "-object",
+            &format!(
+                "memory-backend-file,id=ram0,size={ram_gib}G,mem-path={},share=on",
+                ramf.display()
+            ),
+        ]);
+    } else {
+        // plain anonymous RAM; -m is added below for both modes
+    }
+    // -m must match the backend size (virt checks maxmem against it)
+    cmd.args([
+        "-m",
+        &format!("{ram_gib}G"),
+        "-M",
+        &machine,
+        "-cpu",
+        &opts.cpu,
+        "-smp",
+        "1",
+        "-nographic",
+        "-nic",
+        "none",
+    ]);
+    // Guest UART: socket chardev (interactive) or plain log file.
+    let mut serial_sock = opts.serial_sock.clone();
+    if let Some(p) = &serial_sock {
+        if p.exists() {
+            let _ = std::fs::remove_file(p);
+        }
+        if cfg!(windows) {
+            let port = crate::control::free_tcp_port()?;
+            std::fs::write(out.join("serial.tcp"), format!("{port}\n"))?;
+            cmd.args([
+                "-chardev",
+                &format!("socket,id=ser0,host=127.0.0.1,port={port},server=on,wait=off"),
+                "-serial",
+                "chardev:ser0",
+            ]);
+            serial_sock = None; // Windows path: Session reads out/serial.tcp
+        } else {
+            cmd.args([
+                "-chardev",
+                &format!("socket,id=ser0,path={},server=on,wait=off", p.display()),
+                "-serial",
+                "chardev:ser0",
+            ]);
+        }
+    } else {
+        cmd.args(["-serial", &format!("file:{}", out.join("serial.txt").display())]);
+    }
+    cmd.args([
+        "-qmp",
+        &mon_arg,
+        "-d",
+        "int,guest_errors,unimp",
+        "-D",
+        &out.join("qemu.log").display().to_string(),
+        "-no-reboot",
+        "-device",
+        &format!("loader,file={},addr={phys_base:#x},force-raw=on", ram_bin.display()),
+        "-device",
+        &format!("loader,file={},addr={STUB_PA:#x},force-raw=on", stub_bin.display()),
+        "-device",
+        &format!("loader,addr={STUB_PA:#x},cpu-num=0"),
+    ]);
+    if let Some(logo) = &opts.logo {
+        let lf = out.join("logo.bin");
+        std::fs::write(&lf, logo)?;
+        cmd.args([
+            "-device",
+            &format!("loader,file={},addr={FB_BASE:#x},force-raw=on", lf.display()),
+        ]);
+    }
+    for d in &opts.qemu_datadir {
+        cmd.args(["-L", d]);
+    }
+    // gdbstub WITHOUT -S: the machine boots immediately; gdb attaches live.
+    // nodelay=on: without it every RSP packet round trip pays
+    // Nagle+delayed-ACK (~40ms), turning one FB paint into ~100s.
+    cmd.args(["-gdb", &format!("tcp:127.0.0.1:{gdb_port},server=on,wait=off,nodelay=on")]);
+    cmd.stdin(Stdio::null());
+    let child = cmd.spawn()?;
+    Ok(Spawned { child, mon, out, serial_sock, ram_file: opts.ram_file.clone() })
 }

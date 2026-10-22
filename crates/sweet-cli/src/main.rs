@@ -1,9 +1,10 @@
 //! sweet-rust — the ios-sweet boot pipeline, in Rust.
 //!
 //! One binary, std-only + vendored native C (Apple LZFSE, miniz):
-//!   ipsw-info | ipsw-extract | kernel-unpack | make-adt | make-payload
-//!   make-bootimg | logo-extract | fb-render | inject-logo | demo-kernel
-//!   boot-qemu | ipsw-boot
+//!   ipsw-info | ipsw-extract | ipsw-ls | ipsw-find | ipsw-file
+//!   kernel-unpack | make-adt | make-payload | make-bootimg
+//!   logo-extract | hello-extract | fb-render | inject-logo | demo-kernel
+//!   boot-qemu | ipsw-boot | emu-boot (live control) | emu-peek
 
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -33,6 +34,23 @@ COMMANDS:
 
     ipsw-extract <IPSW|URL> --member NAME [--member NAME ...] --out DIR
         Extract members (exact name or substring match).
+
+    ipsw-ls <IPSW|URL|DMG> [PATH]
+        List a directory of the IPSW system volume (default /).
+
+    ipsw-find <IPSW|URL|DMG> <SUBSTR>
+        Case-insensitive path search across the whole system volume.
+
+    ipsw-file <IPSW|URL|DMG> <PATH> --out FILE
+        Extract a real file from the system volume (decmpfs-decoded).
+
+    emu-boot --ipsw IPSW|URL <OUTDIR> [--wallpaper PNG] [--send TEXT]
+        Boot into a LIVE controllable session: QMP + gdbstub + serial socket.
+        The host pauses the VM, repaints the framebuffer with the wallpaper,
+        types into the guest UART and screenshots every stage.
+
+    emu-peek <PAYLOAD> <OUTDIR> [--addr HEX] [--len N] [--secs 6]
+        Boot a payload, pause the live VM and hex-dump guest RAM (gdbstub).
 
     kernel-unpack <IN.im4p> <OUT.macho>
         IM4P unwrap + LZFSE (bvx2) decompress -> plain Mach-O kernel.
@@ -177,6 +195,11 @@ fn dispatch(args: &[String]) -> Result<()> {
     match cmd {
         "ipsw-info" => cmd_ipsw_info(rest),
         "ipsw-extract" => cmd_ipsw_extract(rest),
+        "ipsw-ls" => cmd_ipsw_ls(rest),
+        "ipsw-find" => cmd_ipsw_find(rest),
+        "ipsw-file" => cmd_ipsw_file(rest),
+        "emu-boot" => cmd_emu_boot(rest),
+        "emu-peek" => cmd_emu_peek(rest),
         "kernel-unpack" => cmd_kernel_unpack(rest),
         "make-adt" => cmd_make_adt(rest),
         "make-payload" => cmd_make_payload(rest),
@@ -199,6 +222,12 @@ fn dispatch(args: &[String]) -> Result<()> {
 fn value_flags(cmd: &str) -> Vec<&'static str> {
     match cmd {
         "ipsw-extract" => vec!["member", "out"],
+        "ipsw-file" => vec!["out"],
+        "emu-boot" => vec![
+            "ipsw", "wallpaper", "wallpaper-manifest", "send", "secs", "cpu",
+            "strip", "logo-scale", "qemu-datadir",
+        ],
+        "emu-peek" => vec!["addr", "len", "secs", "cpu"],
         "kernel-unpack" => vec![],
         "make-adt" => vec!["product", "seed", "phys", "mem"],
         "make-payload" => vec!["cmdline", "ramdisk"],
@@ -254,11 +283,10 @@ fn rootfs_member(source: &str) -> Result<String> {
     Ok(best.name.clone())
 }
 
-/// Extract the real CursiveHello.json for `lang` from the IPSW system volume.
-/// Chain: zip-STORED dmg member (or a raw local dmg file) -> UDIF blkx chunks
-/// (lzfse/zlib via vendored Apple code) -> APFS catalog walk -> decmpfs
-/// transparent decompression.
-fn hello_json_from_ipsw(source: &str, lang: &str) -> Result<(Vec<u8>, String, String)> {
+/// Open the IPSW system volume: zip-STORED dmg member (or a raw local dmg
+/// file) -> UDIF blkx chunks (lzfse/zlib via vendored Apple code) -> APFS
+/// catalog walk. Returns the provenance member name and the indexed volume.
+fn open_system_volume(source: &str) -> Result<(String, sc::apfs::Apfs)> {
     // raw local dmg (koly trailer, no zip EOCD) vs full IPSW zip
     let (member, boxed, size): (String, Box<dyn sc::dmg::ByteSource>, u64) =
         if !source.starts_with("http") && local_is_raw_dmg(source)? {
@@ -276,7 +304,13 @@ fn hello_json_from_ipsw(source: &str, lang: &str) -> Result<(Vec<u8>, String, St
             (m, Box::new(ms) as Box<dyn sc::dmg::ByteSource>, size)
         };
     let dmg = sc::dmg::Dmg::open(boxed, size)?;
-    let mut vol = sc::apfs::Apfs::open(dmg)?;
+    let vol = sc::apfs::Apfs::open(dmg)?;
+    Ok((member, vol))
+}
+
+/// Extract the real CursiveHello.json for `lang` from the IPSW system volume.
+fn hello_json_from_ipsw(source: &str, lang: &str) -> Result<(Vec<u8>, String, String)> {
+    let (member, mut vol) = open_system_volume(source)?;
     let path = format!(
         "/System/Library/PrivateFrameworks/SpringBoard.framework/{lang}.lproj/CursiveHello.json"
     );
@@ -284,6 +318,351 @@ fn hello_json_from_ipsw(source: &str, lang: &str) -> Result<(Vec<u8>, String, St
     let json = vol.read_file(fid)?;
     let sha = sc::hash::hex(&sc::hash::sha256(&json));
     Ok((json, format!("{member}:{path}"), sha))
+}
+
+/// ipsw-ls: list a directory of the system volume.
+fn cmd_ipsw_ls(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("ipsw-ls"));
+    let Some(src) = f.rest.first() else {
+        bail!("usage: ipsw-ls <IPSW|URL|DMG> [PATH]");
+    };
+    let path = f.rest.get(1).copied().unwrap_or("/");
+    let (_member, vol) = open_system_volume(src)?;
+    let dir = if path == "/" { 2u64 } else { vol.resolve(path)? };
+    if !vol.list_dir(dir).is_empty() || path == "/" {
+        for (name, fid, is_dir) in vol.list_dir(dir) {
+            if is_dir {
+                println!("d {name}/");
+            } else {
+                let size = vol.stat(fid).map(|(_, s)| s).unwrap_or(0);
+                println!("  {name}  ({size} bytes, id {fid})");
+            }
+        }
+    } else {
+        let (mode, size) = vol.stat(dir).unwrap_or((0, 0));
+        println!("{path}: not a directory (mode {mode:#o}, {size} bytes)");
+    }
+    Ok(())
+}
+
+/// ipsw-find: case-insensitive substring search across the system volume.
+fn cmd_ipsw_find(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("ipsw-find"));
+    let [src, needle] = f.rest.as_slice() else {
+        bail!("usage: ipsw-find <IPSW|URL|DMG> <SUBSTR>");
+    };
+    let needle_l = needle.to_lowercase();
+    let (_member, vol) = open_system_volume(src)?;
+    let mut hits = 0;
+    for (path, fid) in vol.walk_all() {
+        if path.to_lowercase().contains(&needle_l) {
+            let size = vol.stat(fid).map(|(_, s)| s).unwrap_or(0);
+            println!("{path}  ({size} bytes)");
+            hits += 1;
+        }
+    }
+    if hits == 0 {
+        eprintln!("no match for {needle:?}");
+    }
+    Ok(())
+}
+
+/// ipsw-file: extract a real file from the system volume.
+fn cmd_ipsw_file(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("ipsw-file"));
+    let Some(src) = f.rest.first() else {
+        bail!("usage: ipsw-file <IPSW|URL|DMG> <PATH> --out FILE");
+    };
+    let Some(path) = f.rest.get(1) else {
+        bail!("usage: ipsw-file <IPSW|URL|DMG> <PATH> --out FILE");
+    };
+    let Some(out) = f.val("out") else {
+        bail!("--out FILE required");
+    };
+    let (member, mut vol) = open_system_volume(src)?;
+    let fid = vol.resolve(path)?;
+    let bytes = vol.read_file(fid)?;
+    std::fs::write(out, &bytes)?;
+    let sha = sc::hash::hex(&sc::hash::sha256(&bytes));
+    println!(
+        "[ok] {path} <- {member}: {} bytes, sha256 {sha}",
+        bytes.len()
+    );
+    Ok(())
+}
+
+/// Mean absolute byte difference between two equally sized FB dumps.
+fn fb_mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return f64::INFINITY;
+    }
+    let n = a.len().min(b.len());
+    let step = 4 * 97; // sparse sample: every 97th pixel, all channels
+    let mut acc: u64 = 0;
+    let mut cnt: u64 = 0;
+    let mut i = 0usize;
+    while i + 3 < n {
+        acc += (a[i].abs_diff(b[i])
+            + a[i + 1].abs_diff(b[i + 1])
+            + a[i + 2].abs_diff(b[i + 2])
+            + a[i + 3].abs_diff(b[i + 3])) as u64;
+        cnt += 4;
+        i += step;
+    }
+    if cnt == 0 { f64::INFINITY } else { acc as f64 / cnt as f64 }
+}
+
+/// Count strongly-differing pixels between two FB dumps within a row range.
+fn fb_diff_pixels(a: &[u8], b: &[u8], row_from: u32, row_to: u32) -> u64 {
+    let stride = FB_STRIDE_US as usize;
+    let mut count = 0u64;
+    let from = (row_from as usize).min(crate::FB_H as usize);
+    let to = (row_to as usize).min(crate::FB_H as usize);
+    for y in from..to {
+        let base = y * stride;
+        for x in 0..(crate::FB_W as usize) {
+            let o = base + x * 4;
+            if o + 3 >= a.len() || o + 3 >= b.len() {
+                break;
+            }
+            let d = a[o].abs_diff(b[o]) as u64
+                + a[o + 1].abs_diff(b[o + 1]) as u64
+                + a[o + 2].abs_diff(b[o + 2]) as u64;
+            if d > 96 {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// emu-boot: boot into a LIVE controllable QEMU session (QMP + gdbstub +
+/// serial socket) and drive it from the host: screenshot the logo state,
+/// repaint the framebuffer with the real IPSW wallpaper at runtime, type
+/// into the guest UART and screenshot the input trail.
+fn cmd_emu_boot(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("emu-boot"));
+    if f.rest.is_empty() {
+        bail!("usage: emu-boot --ipsw IPSW|URL <OUTDIR> [--wallpaper PNG] [--send TEXT] [--secs 60]");
+    }
+    let ipsw_src = f.val("ipsw").ok_or_else(|| sc::Error::Msg("--ipsw required".into()))?;
+    let outdir = PathBuf::from(f.rest[0]);
+    std::fs::create_dir_all(&outdir)?;
+    let secs: f64 = f.val("secs").and_then(|v| v.parse().ok()).unwrap_or(60.0);
+    let strip_rows: u32 = f.num("strip", 60) as u32;
+    let send_text = f.val("send").unwrap_or("hello from the host").to_string();
+
+    let mut verdict = J::obj();
+    verdict.set("ipsw", J::s(ipsw_src));
+    verdict.set("mode", J::s("interactive-control"));
+
+    // 1. Apple logo pre-fill (real IPSW asset, same as ipsw-boot)
+    let logo_scale = f.num("logo-scale", 33) as u32;
+    let mut logo_blob = None;
+    match logo_image(ipsw_src) {
+        Ok((img, name)) => {
+            eprintln!("logo from IPSW: {name} ({}x{})", img.width, img.height);
+            verdict.set("logo_member", J::s(name));
+            logo_blob = Some(fblogo::loader_blob(&fblogo::compose(&img, logo_scale))?);
+        }
+        Err(e) => {
+            eprintln!("[!] logo extraction failed: {e}");
+            verdict.set("logo_member", J::Null);
+        }
+    }
+
+    // 2. Wallpaper (real IPSW pixels, pre-composited to exactly FB size)
+    let mut wall_bgra = None;
+    if let Some(wp) = f.val("wallpaper") {
+        let img = sc::png::decode(&std::fs::read(wp)?)?;
+        if img.width != FB_W || img.height != FB_H {
+            bail!(
+                "wallpaper PNG must be exactly {FB_W}x{FB_H} (got {}x{})",
+                img.width,
+                img.height
+            );
+        }
+        let mut bgra = vec![0u8; (FB_W as usize) * (FB_H as usize) * 4];
+        for y in 0..FB_H {
+            for x in 0..FB_W {
+                let [r, g, b, a] = img.pixel(x, y);
+                let o = (y as usize * FB_W as usize + x as usize) * 4;
+                bgra[o] = b;
+                bgra[o + 1] = g;
+                bgra[o + 2] = r;
+                bgra[o + 3] = a;
+            }
+        }
+        let sha = sc::hash::hex(&sc::hash::sha256(&std::fs::read(wp)?));
+        verdict.set("wallpaper_png", J::s(wp));
+        verdict.set("wallpaper_sha256", J::s(sha));
+        if let Some(man) = f.val("wallpaper-manifest") {
+            verdict.set("wallpaper_manifest", J::s(std::fs::read_to_string(man)?));
+        }
+        wall_bgra = Some(bgra);
+    }
+
+    // 3. Interactive kernel (polls the UART; paints input onto the strip)
+    let kernel = demo::macho_interactive(0x30c040, strip_rows)?;
+    verdict.set("kernel_source", J::s("demo-interactive"));
+    let strip_top = FB_H.saturating_sub(strip_rows);
+
+    // 4. ADT + payload (lowmem: fits 2G guest RAM on small hosts)
+    let root = mkadt::build(&AdtOptions {
+        qemu: true,
+        product: None,
+        phys_override: Some((mkadt::LOW_PHYS_BASE, mkadt::LOW_MEM_SIZE)),
+        ..Default::default()
+    })?;
+    let adt_blob = adt::serialize(&root);
+    ipsw::save(&outdir.join("qemu.adt"), &adt_blob)?;
+    let (pl, info) = payload::build(&kernel, &adt_blob, "debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0", None)?;
+    let payload_path = outdir.join("payload.bin");
+    ipsw::save(&payload_path, &pl)?;
+    eprintln!("{}", info.summary());
+
+    // 5. Boot the live session
+    let gdb_port = sc::control::free_tcp_port()?;
+    let sock = outdir.join("serial.sock");
+    let opts = RunOptions {
+        secs,
+        cpu: f.val("cpu").unwrap_or("cortex-a76").to_string(),
+        logo: logo_blob.clone(),
+        serial_sock: Some(sock),
+        ram_file: Some(outdir.join("ram.mmap")),
+        qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
+        ..Default::default()
+    };
+    let mut sess = sc::control::Session::boot(&payload_path, &outdir, &opts, gdb_port)?;
+    let mut pass = true;
+
+    // 6. Wait for the interactive kernel marker. If the socket connect raced
+    //    the boot-time banner, Enter makes the guest reprint it.
+    let marker = "SWEET-RUST interactive kernel OK";
+    let mut marker_ok = sess.serial.wait_marker(marker, 8.0);
+    if !marker_ok {
+        let _ = sess.serial.send(b"\n");
+        marker_ok = sess.serial.wait_marker(marker, 15.0);
+    }
+    verdict.set("serial_marker", J::b(marker_ok));
+
+    // 7. Screenshot stage 1: the Apple logo from the IPSW
+    let (p1, fb1) = sess.shot("fb-stage1-logo.png")?;
+    eprintln!("[*] stage1 -> {}", p1.display());
+
+    // 8. CONTROL ACTION: repaint the framebuffer with the real wallpaper
+    if let Some(wall) = &wall_bgra {
+        let fb_base = sc::FB_BASE;
+        sess.poke(fb_base, wall)?;
+        eprintln!("[*] wallpaper painted into guest framebuffer at {fb_base:#x}");
+    }
+    let (p2, fb2) = sess.shot("fb-stage2-wallpaper.png")?;
+    eprintln!("[*] stage2 -> {}", p2.display());
+
+    // 9. CONTROL ACTION: type into the guest UART
+    sess.serial.send(send_text.as_bytes())?;
+    verdict.set("sent_text", J::s(send_text.clone()));
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs_f64() < 4.0 {
+        sess.serial.pump()?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let (p3, fb3) = sess.shot("fb-stage3-input.png")?;
+    eprintln!("[*] stage3 -> {}", p3.display());
+
+    // 10. verdicts
+    let stride = FB_STRIDE_US as usize;
+    let lum1 = mean_luminance(&fb1, 0, FB_H / 3);
+    let lum2 = mean_luminance(&fb2, 0, FB_H / 3);
+    let logo_visible = lum1 < 90.0 && fb_mean_abs_diff(&fb1, &fb2) > 8.0;
+    let wallpaper_visible = fb_mean_abs_diff(&fb1, &fb2) > 8.0 && lum2 > lum1;
+    let input_echoed = sess.serial.text().contains(send_text.as_str());
+    let input_visible = fb_diff_pixels(&fb2, &fb3, strip_top, FB_H) > 8;
+    // raw BGRA corner bytes of the word 0xff30c040 (little endian)
+    let corner_ok = fb1.len() >= 4 && fb1[0..4] == [0x40, 0xc0, 0x30, 0xff];
+    verdict.set("kernel_alive", J::b(marker_ok || corner_ok || input_echoed));
+    verdict.set("fb_corner_marker", J::b(corner_ok));
+    verdict.set("logo_visible", J::b(logo_visible));
+    verdict.set("wallpaper_visible", J::b(wallpaper_visible));
+    verdict.set("input_echoed", J::b(input_echoed));
+    verdict.set("input_visible", J::b(input_visible));
+    verdict.set("serial_tail", J::s({
+        let t = sess.serial.text();
+        let cut = t.len().saturating_sub(400);
+        t[cut..].to_string()
+    }));
+    pass = pass
+        && (marker_ok || corner_ok)
+        && wallpaper_visible
+        && (wall_bgra.is_none() || input_visible || input_echoed);
+
+    sess.kill();
+    verdict.set("pass", J::b(pass));
+    write_json(&outdir.join("emu-verdict.json"), &verdict)?;
+    eprintln!("{}", verdict.dump());
+    if !pass {
+        bail!("EXIT3: interactive control verdict failed");
+    }
+    Ok(())
+}
+
+/// emu-peek: boot a payload, pause the VM, hex-dump guest RAM via gdbstub.
+fn cmd_emu_peek(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("emu-peek"));
+    if f.rest.len() < 2 {
+        bail!("usage: emu-peek <PAYLOAD> <OUTDIR> [--addr HEX] [--len N] [--secs 6]");
+    }
+    let payload_path = PathBuf::from(f.rest[0]);
+    let outdir = PathBuf::from(f.rest[1]);
+    std::fs::create_dir_all(&outdir)?;
+    let addr = f.num("addr", sc::FB_BASE);
+    let len = f.num("len", 256) as usize;
+    let secs: f64 = f.val("secs").and_then(|v| v.parse().ok()).unwrap_or(6.0);
+    let gdb_port = sc::control::free_tcp_port()?;
+    let sock = outdir.join("serial.sock");
+    let opts = RunOptions {
+        secs,
+        cpu: f.val("cpu").unwrap_or("cortex-a76").to_string(),
+        serial_sock: Some(sock),
+        ..Default::default()
+    };
+    let mut sess = sc::control::Session::boot(&payload_path, &outdir, &opts, gdb_port)?;
+    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    let mem = sess.peek(addr, len)?;
+    sess.kill();
+    for (i, chunk) in mem.chunks(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| if (32..127).contains(&b) { b as char } else { '.' })
+            .collect();
+        println!("{:08x}: {:48}  {}", addr + (i * 16) as u64, hex.join(" "), ascii);
+    }
+    Ok(())
+}
+
+/// Mean 8-bit luminance of an FB dump row range.
+fn mean_luminance(fb: &[u8], row_from: u32, row_to: u32) -> f64 {
+    let stride = FB_STRIDE_US as usize;
+    let from = (row_from as usize).min(crate::FB_H as usize);
+    let to = (row_to as usize).min(crate::FB_H as usize);
+    let mut acc: u64 = 0;
+    let mut cnt: u64 = 0;
+    for y in from..to {
+        let base = y * stride;
+        let mut x = 0usize;
+        while x + 3 < crate::FB_W as usize {
+            let o = base + x * 4;
+            if o + 3 >= fb.len() {
+                break;
+            }
+            // BGRA: b,g,r
+            acc += (fb[o] as u64 * 7 + fb[o + 1] as u64 * 42 + fb[o + 2] as u64 * 21) / 70;
+            cnt += 1;
+            x += 7;
+        }
+    }
+    if cnt == 0 { 0.0 } else { acc as f64 / cnt as f64 }
 }
 
 /// A local path is a raw dmg (not an IPSW zip) when its tail has no zip EOCD.
@@ -558,7 +937,11 @@ fn cmd_demo_kernel(args: &[String]) -> Result<()> {
     }
     let color = f.num("color", 0x30c040) as u32;
     let strip = f.num("strip", 400) as u32;
-    let km = demo::macho(color, strip)?;
+    let km = if f.has("interactive") {
+        demo::macho_interactive(color, strip)?
+    } else {
+        demo::macho(color, strip)?
+    };
     ipsw::save(Path::new(f.rest[0]), &km)?;
     eprintln!("{}: {} bytes (color {color:#x}, strip {strip} rows)", f.rest[0], km.len());
     Ok(())

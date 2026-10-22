@@ -161,7 +161,7 @@ pub fn macho(color: u32, strip_rows: u32) -> Result<Vec<u8>> {
     adr_x1_at = Some(adr_at);
     let ldrb_pos = code.len();
     ldrb_at = Some(ldrb_pos);
-    emit(&mut code, 0x3940_0002); // ldrb w2, [x1]
+    emit(&mut code, 0x3940_0022); // ldrb w2, [x1]
     let cbz_pos = code.len();
     cbz_at = Some(cbz_pos);
     emit(&mut code, 0); // cbz w2, done — patch below
@@ -187,6 +187,144 @@ pub fn macho(color: u32, strip_rows: u32) -> Result<Vec<u8>> {
     let back_off = ldrb_pos as i64 - back_pos as i64;
     code[back_pos..back_pos + 4].copy_from_slice(&ins(b(back_off)));
     let _ = (adr_x1_at, cbz_at, ldrb_at, back_b_at, done_at);
+
+    Ok(wrap_macho(&code))
+}
+
+/// Interactive demo kernel: same boot behavior as `macho` (paint the bottom
+/// strip, print the marker), but instead of parking it POLLS the PL011
+/// receive FIFO. Every byte typed into the serial chardev is echoed back to
+/// the host AND painted onto the strip as one 4-byte greyscale cell — the
+/// screen itself proves that host input reached the guest.
+pub fn macho_interactive(color: u32, strip_rows: u32) -> Result<Vec<u8>> {
+    if strip_rows == 0 || strip_rows > FB_H {
+        bail!("strip_rows must be 1..={FB_H}");
+    }
+    let first_row = (FB_H - strip_rows) as u32;
+    let r8 = (color >> 16) & 0xff;
+    let g8 = (color >> 8) & 0xff;
+    let b8 = color & 0xff;
+    let bgra = (0xff << 24) | (r8 << 16) | (g8 << 8) | b8;
+
+    let mut code: Vec<u8> = Vec::new();
+    let mut emit = |code: &mut Vec<u8>, v: u32| code.extend_from_slice(&ins(v));
+
+    // ---- identical prologue to macho(): boot_args -> FB -> strip paint ----
+    emit(&mut code, mov64(19, 0));
+    emit(&mut code, 0xf940_1674); // x20 = video base
+    emit(&mut code, 0xf940_1e75); // x21 = video stride
+    emit(&mut code, movz32(24, bgra & 0xffff));
+    emit(&mut code, movk32_lsl16(24, bgra >> 16));
+    emit(&mut code, movz64(23, first_row));
+    emit(&mut code, mul64(23, 21, 23));
+    emit(&mut code, add64(23, 20, 23));
+    emit(&mut code, movz64(25, FB_H));
+    emit(&mut code, mul64(25, 21, 25));
+    emit(&mut code, add64(25, 20, 25));
+    emit(&mut code, mov64(22, 23)); // cursor = strip start
+    let loop_at = code.len();
+    emit(&mut code, 0xb900_02d8); // str w24, [x22]
+    emit(&mut code, add64_imm12(22, 22, 4));
+    emit(&mut code, 0xeb19_02df); // cmp x22, x25
+    let bne_at = code.len();
+    emit(&mut code, 0); // b.ne loop
+    let bne_off = loop_at as i64 - bne_at as i64;
+    code[bne_at..bne_at + 4].copy_from_slice(&ins(bcond_ne(bne_off)));
+    // corner markers
+    emit(&mut code, 0xb900_0298); // str w24, [x20]
+    emit(&mut code, 0xb900_02b8); // str w24, [x21]
+    // PL011 enable (CR = UARTEN | TXE | RXE)
+    emit(&mut code, movz64(3, 0x0030));
+    emit(&mut code, movk64_lsl16(3, PL011_DR >> 16));
+    emit(&mut code, movz32(4, 0x301));
+    emit(&mut code, 0xb900_0064); // str w4, [x3]
+    // serial print of the marker message
+    emit(&mut code, movz64(0, PL011_DR & 0xffff));
+    emit(&mut code, movk64_lsl16(0, PL011_DR >> 16)); // x0 = DR
+    let adr_at = code.len();
+    emit(&mut code, 0); // adr x1, msg
+    let ldrb_pos = code.len();
+    emit(&mut code, 0x3940_0022); // ldrb w2, [x1]
+    let cbz_pos = code.len();
+    emit(&mut code, 0); // cbz w2, done
+    emit(&mut code, 0xb900_0002); // str w2, [x0]
+    emit(&mut code, add64_imm12(1, 1, 1));
+    let back_pos = code.len();
+    emit(&mut code, 0); // b ldrb
+    let done_pos = code.len();
+
+    // ---- interactive tail: UART poll -> echo + framebuffer trail ----
+    emit(&mut code, mov64(22, 23)); // input cursor = strip start
+    emit(&mut code, movz64(6, (PL011_DR + 0x18) & 0xffff)); // x6 = FR
+    emit(&mut code, movk64_lsl16(6, (PL011_DR + 0x18) >> 16));
+    emit(&mut code, movz32(11, 0xff00)); // w11 = 0xFFFFFF00
+    emit(&mut code, movk32_lsl16(11, 0xffff));
+    let adr7_at = code.len();
+    emit(&mut code, 0); // adr x7, msg — patch below (banner reprint on Enter)
+    let poll_at = code.len();
+    emit(&mut code, 0xb940_00c5); // ldr w5, [x6]  (FR; rn=6 -> 0xc5, NOT 0xa5)
+    // tbnz w5, #4, poll  (RXFE=1 -> FIFO empty -> keep polling)
+    let tbnz_at = code.len();
+    emit(&mut code, 0); // patch below
+    emit(&mut code, 0x3940_0002); // ldrb w2, [x0]  (DR byte)
+    emit(&mut code, 0x7100_285f); // cmp w2, #10 ('\n' -> reprint banner)
+    let beq_at = code.len();
+    emit(&mut code, 0); // b.eq reprint — patch below
+    emit(&mut code, 0xb900_0002); // str w2, [x0]   (echo to host)
+    emit(&mut code, 0x5318_7c49); // lsl w9, w2, #8   (ubfm 24,31)
+    emit(&mut code, 0x2a02_0129); // orr w9, w9, w2
+    emit(&mut code, 0x5310_7c4a); // lsl w10, w2, #16 (ubfm 16,31)
+    emit(&mut code, 0x2a0a_0129); // orr w9, w9, w10
+    emit(&mut code, 0x2a0b_0129); // orr w9, w9, w11  (| 0xFFFFFF00: yellow, byte in B)
+    emit(&mut code, 0xb900_02c9); // str w9, [x22]  (paint cell)
+    emit(&mut code, add64_imm12(22, 22, 4)); // advance cursor
+    emit(&mut code, 0xeb19_02df); // cmp x22, x25
+    let bne2_at = code.len();
+    emit(&mut code, 0); // b.ne nowrap
+    emit(&mut code, mov64(22, 23)); // wrap cursor to strip start
+    let nowrap_at = code.len();
+    emit(&mut code, 0); // b poll — patch below
+    // Enter pressed: reprint the banner (lets the host recover the marker
+    // even when its serial connect lost the boot-time print).
+    let reprint_at = code.len();
+    emit(&mut code, mov64(1, 7)); // x1 = msg
+    let pr_loop = code.len();
+    emit(&mut code, 0x3940_0022); // ldrb w2, [x1]
+    let pr_cbz = code.len();
+    emit(&mut code, 0); // cbz w2, poll — patch below
+    emit(&mut code, 0xb900_0002); // str w2, [x0]
+    emit(&mut code, add64_imm12(1, 1, 1));
+    let pr_back = code.len();
+    emit(&mut code, 0); // b pr_loop — patch below
+    let end_at = code.len();
+
+    let msg_pos = code.len();
+    code.extend_from_slice(
+        b"\nSWEET-RUST interactive kernel OK (type into the serial console)\n\0",
+    );
+
+    // patches
+    let msg_off = msg_pos as i64 - adr_at as i64;
+    code[adr_at..adr_at + 4].copy_from_slice(&ins(adr(1, msg_off)));
+    let cbz_off = done_pos as i64 - cbz_pos as i64;
+    code[cbz_pos..cbz_pos + 4].copy_from_slice(&ins(cbz(2, cbz_off)));
+    let back_off = ldrb_pos as i64 - back_pos as i64;
+    code[back_pos..back_pos + 4].copy_from_slice(&ins(b(back_off)));
+    let msg_off7 = msg_pos as i64 - adr7_at as i64;
+    code[adr7_at..adr7_at + 4].copy_from_slice(&ins(adr(7, msg_off7)));
+    let tbnz_off = poll_at as i64 - tbnz_at as i64;
+    code[tbnz_at..tbnz_at + 4]
+        .copy_from_slice(&ins(0x3700_0000 | (4 << 19) | ((((tbnz_off >> 2) & 0x3fff) as u32) << 5) | 5));
+    let beq_off = reprint_at as i64 - beq_at as i64;
+    code[beq_at..beq_at + 4].copy_from_slice(&ins(0x5400_0000 | ((((beq_off >> 2) & 0x7_ffff) as u32) << 5)));
+    let bne2_off = nowrap_at as i64 - bne2_at as i64;
+    code[bne2_at..bne2_at + 4].copy_from_slice(&ins(bcond_ne(bne2_off)));
+    let poll_off = poll_at as i64 - nowrap_at as i64;
+    code[nowrap_at..nowrap_at + 4].copy_from_slice(&ins(b(poll_off)));
+    let pr_cbz_off = poll_at as i64 - pr_cbz as i64;
+    code[pr_cbz..pr_cbz + 4].copy_from_slice(&ins(cbz(2, pr_cbz_off)));
+    let pr_back_off = pr_loop as i64 - pr_back as i64;
+    code[pr_back..pr_back + 4].copy_from_slice(&ins(b(pr_back_off)));
 
     Ok(wrap_macho(&code))
 }
@@ -238,7 +376,7 @@ pub fn macho_hello(fb: &[u8]) -> Result<Vec<u8>> {
     let adr_at = code.len();
     emit(&mut code, 0); // adr x1, msg — patch below
     let ldrb_pos = code.len();
-    emit(&mut code, 0x3940_0002); // ldrb w2, [x1]
+    emit(&mut code, 0x3940_0022); // ldrb w2, [x1]
     let cbz_pos = code.len();
     emit(&mut code, 0); // cbz w2, done — patch below
     emit(&mut code, 0xb900_0002); // str w2, [x0]

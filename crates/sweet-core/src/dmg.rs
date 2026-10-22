@@ -63,26 +63,48 @@ impl ByteSource for MemberSource {
         if self.local {
             return crate::ipsw::read_at(&self.source, self.data_off + off, len);
         }
-        // windowed path (remote): align down, keep a small LRU of windows
-        let wstart = off - (off % self.window_size);
-        if let Some((s, ref w)) = self.windows.iter().find(|(s, _)| *s == wstart) {
-            let s = (off - wstart) as usize;
-            if s + len <= w.len() {
-                return Ok(w[s..s + len].to_vec());
+        // windowed path (remote): reads may CROSS window boundaries (a blkx
+        // chunk is ~8 MiB and its coff is not window-aligned), so assemble
+        // the result one 16 MiB-aligned window at a time.
+        let mut out = Vec::with_capacity(len);
+        let mut pos = off;
+        let end = off + len as u64;
+        while pos < end {
+            let wstart = pos - (pos % self.window_size);
+            // cached window?
+            let cached_take = match self.windows.iter().find(|(s, _)| *s == wstart) {
+                Some((s, w)) => {
+                    let s = (pos - *s) as usize;
+                    w.len().saturating_sub(s).min((end - pos) as usize)
+                }
+                None => 0,
+            };
+            if cached_take > 0 {
+                let s = (pos - wstart) as usize;
+                let w = &self.windows.iter().find(|(st, _)| *st == wstart).unwrap().1;
+                out.extend_from_slice(&w[s..s + cached_take]);
+                pos += cached_take as u64;
+                continue;
             }
+            // fetch the window clamped to member size
+            let wlen = self.window_size.min(self.size.saturating_sub(wstart)) as usize;
+            if wlen == 0 {
+                bail!("read past member end (off={off:#x}, window at {wstart:#x})");
+            }
+            let w = crate::ipsw::read_at(&self.source, self.data_off + wstart, wlen)?;
+            if self.windows.len() >= 4 {
+                self.windows.remove(0);
+            }
+            self.windows.push((wstart, w.clone()));
+            let s = (pos - wstart) as usize;
+            let take = w.len().saturating_sub(s).min((end - pos) as usize);
+            if take == 0 {
+                bail!("read past member end (off={off:#x} len={len})");
+            }
+            out.extend_from_slice(&w[s..s + take]);
+            pos += take as u64;
         }
-        // fetch the window clamped to member size
-        let wlen = self.window_size.min(self.size.saturating_sub(wstart)) as usize;
-        let w = crate::ipsw::read_at(&self.source, self.data_off + wstart, wlen)?;
-        if self.windows.len() >= 4 {
-            self.windows.remove(0);
-        }
-        self.windows.push((wstart, w.clone()));
-        let s = (off - wstart) as usize;
-        if s + len > w.len() {
-            bail!("read past member end");
-        }
-        Ok(w[s..s + len].to_vec())
+        Ok(out)
     }
 }
 

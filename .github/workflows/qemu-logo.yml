@@ -101,6 +101,52 @@ jobs:
           sys.exit(0 if ok else 1)
           EOF
 
+      - name: Compose the real IPSW wallpaper (Clownfish HEIC layers + Apple CAML)
+        run: |
+          pip install pillow-heif
+          mkdir -p wall
+          B="/Library/Wallpaper/Collections/Clownfish~iphone.wallpaperCollection/Wallpapers/7420.Clownfish-375w-812h@3x~iphone.wallpaper"
+          for a in \
+            "7420.Clownfish_Background-375w-812h@3x~iphone.ca/assets/Background.HEIC" \
+            "7420.Clownfish_Foreground-375w-812h@3x~iphone.ca/assets/Foreground.HEIC" \
+            "7420.Clownfish_Foreground-375w-812h@3x~iphone.ca/assets/Foreground_Upper.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_One.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Two.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Three.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Four.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Five.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Six.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_One_Left.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_One_Right.HEIC" \
+            "7420.Clownfish_Background-375w-812h@3x~iphone.ca/main.caml" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/main.caml" \
+            "7420.Clownfish_Foreground-375w-812h@3x~iphone.ca/main.caml" ; do
+            n=$(basename "$a")
+            ./target/release/sweet-rust ipsw-file ipsw.ipsw "$B/$a" --out "wall/$n"
+          done
+          python3 tools/compose-wallpaper.py wall
+          ls -la wall/*.png
+
+      - name: LIVE control run (boot -> paint wallpaper -> type into the guest)
+        run: |
+          ./target/release/sweet-rust emu-boot --ipsw ipsw.ipsw out-emu \
+            --wallpaper wall/clownfish-1080x2400.png \
+            --send "hello from the host" --secs 30
+
+      - name: Control verdict (must pass)
+        run: |
+          cat out-emu/emu-verdict.json
+          python3 - <<'EOF'
+          import json, sys
+          v = json.load(open('out-emu/emu-verdict.json'))
+          ok = (v['pass'] and v['logo_visible'] and v['wallpaper_visible']
+                and v['input_echoed'] and v['input_visible']
+                and len(v.get('wallpaper_sha256', '')) == 64)
+          print('PASS' if ok else 'FAIL', '- wallpaper:', v['wallpaper_visible'],
+                'input_echoed:', v['input_echoed'], 'input_visible:', v['input_visible'])
+          sys.exit(0 if ok else 1)
+          EOF
+
       - name: Artifacts (screenshots + verdicts + payload)
         if: always()
         uses: actions/upload-artifact@v4
@@ -109,4 +155,6 @@ jobs:
           path: |
             out/
             out-hello/
+            out-emu/
+            wall/clownfish-1080x2400.png
           retention-days: 30

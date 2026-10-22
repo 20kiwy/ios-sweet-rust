@@ -263,13 +263,82 @@ impl Apfs {
         Ok(cur)
     }
 
+    /// Sorted directory listing: (name, fid, is_dir).
+    pub fn list_dir(&self, dir: u64) -> Vec<(String, u64, bool)> {
+        let mut v: Vec<(String, u64, bool)> = self
+            .dirs
+            .get(&dir)
+            .map(|m| {
+                m.iter()
+                    .map(|(n, f)| (n.clone(), *f, self.dirs.contains_key(f)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Every entry in the volume as (full path, fid), sorted by path.
+    pub fn walk_all(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = vec![("/".into(), 2)];
+        let mut stack = vec![(String::new(), 2u64)];
+        while let Some((prefix, dir)) = stack.pop() {
+            if let Some(m) = self.dirs.get(&dir) {
+                for (name, fid) in m {
+                    let path = format!("{prefix}/{name}");
+                    if self.dirs.contains_key(fid) {
+                        stack.push((path.clone(), *fid));
+                    }
+                    out.push((path, *fid));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// (mode, size) for a file id, if indexed. Size prefers real data
+    /// coverage (extents / decmpfs) over the catalog inode field, which is
+    /// 0 for files whose inode_val omits the optional uncompressed-size
+    /// field (observed on WallpaperKit HEIC assets in 16.7.16).
+    pub fn stat(&self, fid: u64) -> Option<(u16, u64)> {
+        let size = self.file_size(fid);
+        let mode = self.inodes.get(&fid).map(|(m, _)| *m)?;
+        Some((mode, size))
+    }
+
+    /// Best-effort logical file size: extent coverage -> decmpfs record ->
+    /// inode size field.
+    fn file_size(&self, fid: u64) -> u64 {
+        if let Some(exts) = self.extents.get(&fid) {
+            let m = exts.iter().map(|e| e.laddr + e.len).max().unwrap_or(0);
+            if m > 0 {
+                return m;
+            }
+        }
+        if let Some(dec) = self.xattrs.get(&fid).and_then(|m| m.get(XS_DECMPFS)) {
+            if dec.len() >= 20 {
+                return u64le(dec, 12); // cmpf header: u16 flags, u16 len, magic, algo u32, usize u64
+            }
+        }
+        self.inodes.get(&fid).map(|(_, s)| *s).unwrap_or(0)
+    }
+
+    /// decmpfs raw record for a file id (for provenance diagnostics).
+    pub fn xattr(&self, fid: u64, name: &str) -> Option<&Vec<u8>> {
+        self.xattrs.get(&fid)?.get(name)
+    }
+
     /// Full file bytes, transparently decompressing decmpfs content.
     pub fn read_file(&mut self, fid: u64) -> Result<Vec<u8>> {
-        let (mode, size) = *self
-            .inodes
-            .get(&fid)
-            .ok_or_else(|| crate::Error::Msg(format!("inode {fid} missing")))?;
+        let (mode, size) = (
+            self.inodes.get(&fid).map(|(m, _)| *m).unwrap_or(0),
+            self.file_size(fid),
+        );
         let _ = mode;
+        if size == 0 {
+            bail!("no data for inode {fid}");
+        }
         if let Some(exts) = self.extents.get(&fid).cloned() {
             return self.read_extents(&exts, size);
         }

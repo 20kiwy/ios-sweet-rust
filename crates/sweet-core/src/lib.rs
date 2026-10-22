@@ -24,6 +24,7 @@ pub mod adt;
 pub mod apfs;
 pub mod bootimg;
 pub mod cpio;
+pub mod control;
 pub mod demo;
 pub mod dmg;
 pub mod fblogo;
