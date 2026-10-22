@@ -198,6 +198,27 @@ fn parse_cd(cd: &[u8]) -> Result<IpswIndex> {
     Ok(IpswIndex { entries })
 }
 
+/// Raw byte range read from a local file or URL (HTTP ranges via curl).
+pub fn read_at(source: &str, off: u64, len: usize) -> Result<Vec<u8>> {
+    match open(source)? {
+        Source::File(mut f) => {
+            use std::io::{Read, Seek, SeekFrom};
+            f.seek(SeekFrom::Start(off))?;
+            let mut v = vec![0u8; len];
+            f.read_exact(&mut v)?;
+            Ok(v)
+        }
+        Source::Url(url) => curl_range(&url, off, len as u64),
+    }
+}
+
+/// zlib-wrapped inflate into an exactly sized buffer (blkx zlib chunks).
+pub fn zlib_inflate(src: &[u8], expect: usize) -> Result<Vec<u8>> {
+    let mut dst = vec![0u8; expect];
+    inflate_into(src, &mut dst)?;
+    Ok(dst)
+}
+
 /// Extract one member. Works for STORE and DEFLATE (miniz inflate).
 pub fn extract(source: &str, entry: &IpswEntry) -> Result<Vec<u8>> {
     // Re-read the local header for the true name/extra lengths.

@@ -182,6 +182,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "make-payload" => cmd_make_payload(rest),
         "make-bootimg" => cmd_make_bootimg(rest),
         "logo-extract" => cmd_logo_extract(rest),
+        "hello-extract" => cmd_hello_extract(rest),
         "fb-render" => cmd_fb_render(rest),
         "inject-logo" => cmd_inject_logo(rest),
         "demo-kernel" => cmd_demo_kernel(rest),
@@ -204,11 +205,12 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "make-bootimg" => vec!["kernel", "ramdisk", "dtb", "cmdline", "o"],
         "logo-extract" | "inject-logo" => vec![],
         "fb-render" => vec!["w", "h", "logo-scale"],
-        "demo-kernel" => vec!["color", "strip", "hello-scale", "png"],
+        "demo-kernel" => vec!["color", "strip", "png"],
+        "hello-extract" => vec!["lang", "ipsw"],
         "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp"],
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
-            "logo-scale", "cpu", "w", "h", "qemu-datadir", "hello-scale",
+            "logo-scale", "cpu", "w", "h", "qemu-datadir", "hello-lang",
         ],
         _ => vec![],
     }
@@ -240,6 +242,87 @@ fn find_logo<'a>(idx: &'a ipsw::IpswIndex) -> Result<&'a ipsw::IpswEntry> {
 }
 
 /// Extract + decode the Apple logo of an IPSW (local file or URL) to RGBA.
+/// Locate the zip-STORED rootfs dmg member (largest .dmg, method 0).
+fn rootfs_member(source: &str) -> Result<String> {
+    let idx = ipsw::index(source)?;
+    let best = idx
+        .entries
+        .iter()
+        .filter(|e| e.name.ends_with(".dmg") && e.method == 0 && e.size > (1 << 30))
+        .max_by_key(|e| e.size)
+        .ok_or_else(|| sc::Error::Msg("no stored rootfs .dmg member in IPSW".into()))?;
+    Ok(best.name.clone())
+}
+
+/// Extract the real CursiveHello.json for `lang` from the IPSW system volume.
+/// Chain: zip-STORED dmg member (or a raw local dmg file) -> UDIF blkx chunks
+/// (lzfse/zlib via vendored Apple code) -> APFS catalog walk -> decmpfs
+/// transparent decompression.
+fn hello_json_from_ipsw(source: &str, lang: &str) -> Result<(Vec<u8>, String, String)> {
+    // raw local dmg (koly trailer, no zip EOCD) vs full IPSW zip
+    let (member, boxed, size): (String, Box<dyn sc::dmg::ByteSource>, u64) =
+        if !source.starts_with("http") && local_is_raw_dmg(source)? {
+            let f = std::fs::File::open(source)?;
+            let size = f.metadata()?.len();
+            let member = std::path::Path::new(source)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "rootfs.dmg".into());
+            (member, Box::new(sc::dmg::FileSource::open(std::path::Path::new(source))?), size)
+        } else {
+            let m = rootfs_member(source)?;
+            let ms = sc::dmg::MemberSource::open(source, &m)?;
+            let size = ms.size;
+            (m, Box::new(ms) as Box<dyn sc::dmg::ByteSource>, size)
+        };
+    let dmg = sc::dmg::Dmg::open(boxed, size)?;
+    let mut vol = sc::apfs::Apfs::open(dmg)?;
+    let path = format!(
+        "/System/Library/PrivateFrameworks/SpringBoard.framework/{lang}.lproj/CursiveHello.json"
+    );
+    let fid = vol.resolve(&path)?;
+    let json = vol.read_file(fid)?;
+    let sha = sc::hash::hex(&sc::hash::sha256(&json));
+    Ok((json, format!("{member}:{path}"), sha))
+}
+
+/// A local path is a raw dmg (not an IPSW zip) when its tail has no zip EOCD.
+fn local_is_raw_dmg(path: &str) -> Result<bool> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() < 64 {
+        return Ok(false);
+    }
+    let tail = ipsw::read_at(path, meta.len() - 64, 64)?;
+    Ok(!tail.windows(4).any(|w| w == [0x50, 0x4b, 0x05, 0x06]))
+}
+
+/// hello-extract: pull + render the real welcome-screen vector data.
+fn cmd_hello_extract(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("hello-extract"));
+    if f.rest.is_empty() {
+        bail!("usage: hello-extract <IPSW|URL> <OUTDIR> [--lang en_GB]");
+    }
+    let source = f.val("ipsw").unwrap_or_else(|| f.rest[0].clone());
+    let outdir = PathBuf::from(f.rest.get(1).map(|s| s.to_string()).unwrap_or_else(|| ".".to_string()));
+    std::fs::create_dir_all(&outdir)?;
+    let lang = f.val("lang").unwrap_or("en_GB").to_string();
+    let (json, src_path, sha) = hello_json_from_ipsw(&source, &lang)?;
+    let json_path = outdir.join(format!("CursiveHello_{lang}.json"));
+    ipsw::save(&json_path, &json)?;
+    let fb = sc::hello::welcome_fb_from_json(&json)?;
+    let png_path = outdir.join(format!("hello_{lang}.png"));
+    ipsw::save(&png_path, &sc::png::encode_fb(FB_W, FB_H, &fb)?)?;
+    let mut prov = J::obj();
+    prov.set("source", J::s(src_path));
+    prov.set("sha256", J::s(sha));
+    prov.set("bytes", J::n(json.len() as f64));
+    prov.set("lang", J::s(lang));
+    prov.set("note", J::s("vector data (cubic bezier strokes) rendered verbatim; no hand-drawn stand-ins"));
+    write_json(&outdir.join("provenance.json"), &prov)?;
+    eprintln!("hello-extract: {} bytes, sha256 provenance written", json.len());
+    Ok(())
+}
+
 fn logo_image(source: &str) -> Result<(sc::png::Image, String)> {
     let idx = ipsw::index(source)?;
     let logo = find_logo(&idx)?;
@@ -471,19 +554,7 @@ fn cmd_inject_logo(args: &[String]) -> Result<()> {
 fn cmd_demo_kernel(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("demo-kernel"));
     if f.rest.is_empty() {
-        bail!("usage: demo-kernel <OUT.macho> [--color 0x30c040] [--strip 400] [--hello] [--hello-scale 18]");
-    }
-    if f.has("hello") {
-        let scale = f.num("hello-scale", 18) as u32;
-        let km = demo::macho_hello(scale)?;
-        ipsw::save(Path::new(f.rest[0]), &km)?;
-        eprintln!("{}: {} bytes (hello screen, glyph scale {scale})", f.rest[0], km.len());
-        if let Some(png) = f.val("png") {
-            let fb = sc::hello::welcome_fb(scale);
-            sc::ipsw::save(Path::new(png), &sc::png::encode_fb(FB_W, FB_H, &fb)?)?;
-            eprintln!("{png}: welcome-screen preview");
-        }
-        return Ok(());
+        bail!("usage: demo-kernel <OUT.macho> [--color 0x30c040] [--strip 400]");
     }
     let color = f.num("color", 0x30c040) as u32;
     let strip = f.num("strip", 400) as u32;
@@ -598,10 +669,18 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         verdict.set("kernel_source", J::s(k));
         std::fs::read(k)?
     } else if hello {
-        let scale = f.num("hello-scale", 18) as u32;
+        let lang = f.val("hello-lang").unwrap_or("en_GB").to_string();
+        let (json, src_path, sha) = hello_json_from_ipsw(ipsw_src, &lang)?;
         verdict.set("kernel_source", J::s("demo-hello"));
-        verdict.set("hello_scale", J::n(scale as f64));
-        demo::macho_hello(scale)?
+        verdict.set("hello_lang", J::s(lang));
+        verdict.set("hello_source", J::s(src_path));
+        verdict.set("hello_sha256", J::s(sha));
+        verdict.set("hello_json_bytes", J::n(json.len() as f64));
+        let fb = sc::hello::welcome_fb_from_json(&json)?;
+        sc::ipsw::save(&outdir.join("hello-fb.png"), &sc::png::encode_fb(FB_W, FB_H, &fb)?)?;
+        sc::ipsw::save(&outdir.join("CursiveHello.json"), &json)?;
+        eprintln!("hello: real IPSW vector data ({} bytes) rendered", json.len());
+        demo::macho_hello(&fb)?
     } else if f.has("demo") {
         verdict.set("kernel_source", J::s("demo"));
         demo::macho(0x30c040, 400)?

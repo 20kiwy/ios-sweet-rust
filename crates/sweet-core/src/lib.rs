@@ -21,10 +21,13 @@
 //! `src/vendor/PROVENANCE.md`.
 
 pub mod adt;
+pub mod apfs;
 pub mod bootimg;
 pub mod cpio;
 pub mod demo;
+pub mod dmg;
 pub mod fblogo;
+pub mod hash;
 pub mod hello;
 pub mod ibootim;
 pub mod im4p;

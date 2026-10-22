@@ -50,6 +50,20 @@ extern "C" {
     ) -> usize;
 }
 
+
+/// LZFSE decode with the expected output size known up front (blkx chunks).
+pub fn lzfse_exact(src: &[u8], expect: usize) -> Result<Vec<u8>> {
+    let mut dst = vec![0u8; expect + 64];
+    let n = unsafe {
+        lzfse_decode_buffer(dst.as_mut_ptr(), dst.len(), src.as_ptr(), src.len(), std::ptr::null_mut())
+    };
+    if n == 0 || n > expect {
+        bail!("lzfse_exact: decoded {n}, expected {expect}");
+    }
+    dst.truncate(n);
+    Ok(dst)
+}
+
 /// LZFSE decode with an output-size doubling loop (bvx2/bvxn/bvn/bvlzvn blocks).
 pub fn lzfse_decode(src: &[u8]) -> Result<Vec<u8>> {
     let mut dst_size = (src.len() as u64).saturating_mul(4).max(1 << 20) as usize;

@@ -4,7 +4,7 @@
 //! Apple logo stays visible above it) and prints a marker to the PL011
 //! serial at 0x09000000. CI asserts on serial + framebuffer.
 
-use crate::hello::{welcome_fb, SERIAL_MARKER};
+use crate::hello::SERIAL_MARKER;
 use crate::{bail, FB_H, Result};
 
 const BASE: u64 = 0x1_0000_0000; // __TEXT VA (matches the SWEET kernel's region)
@@ -198,8 +198,7 @@ pub fn macho(color: u32, strip_rows: u32) -> Result<Vec<u8>> {
 /// marker on the PL011 and parks. The blob is reached with ADRP because it
 /// sits megabytes beyond ADR's ±1MB window; the load PA is 4K-aligned
 /// (phys_base = 0x48000000), so page deltas are pure file-offset math.
-pub fn macho_hello(scale: u32) -> Result<Vec<u8>> {
-    let fb = welcome_fb(scale);
+pub fn macho_hello(fb: &[u8]) -> Result<Vec<u8>> {
     let words = (fb.len() / 4) as u64;
 
     let mut code: Vec<u8> = Vec::new();
