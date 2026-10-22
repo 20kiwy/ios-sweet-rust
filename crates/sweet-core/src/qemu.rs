@@ -594,6 +594,11 @@ pub fn run(
         "-m",
         &format!("{ram_gib}G"),
         "-nographic",
+        // No guest NIC: Debian builds map the implicit default NIC to
+        // virtio-net-pci and then die on a missing efi-virtio.rom. The boot
+        // pipeline is serial+QMP only, so remove the device entirely.
+        "-nic",
+        "none",
         "-serial",
         &format!("file:{}", out.join("serial.txt").display()),
         "-qmp",
