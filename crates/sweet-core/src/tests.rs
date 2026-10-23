@@ -832,7 +832,9 @@ fn decmpfs_algo14_zbitmap_roundtrip() {
 
     // raw-stored chunks (flag byte 0xF? + uncompressed bytes): the real
     // files show these tile at 64K just like ZBM streams
-    let raw_src: Vec<u8> = (0..70_000u32).map(|i| (i * 2654435761 >> 24) as u8).collect();
+    let raw_src: Vec<u8> = (0..70_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
     let pieces: Vec<&[u8]> = raw_src.chunks(0x10000).collect();
     let mut rsrc2 = vec![0u8; 4 * (pieces.len() + 1)];
     let table_end2 = (4 * (pieces.len() + 1)) as u32;

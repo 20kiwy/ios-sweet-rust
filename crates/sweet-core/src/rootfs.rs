@@ -31,8 +31,13 @@ pub struct Report {
 }
 
 /// `mini` profile: SystemOS files included (the dyld shared cache).
+/// AXAssetLoader rides here too when the framework lives in the cryptex
+/// (xpcproxy's inventory named /System/Library/PrivateFrameworks/
+/// AXAssetLoader.framework/Support/axassetsd as a missing user-domain
+/// executable — com.apple.accessibility.axassetsd init failure 0x6f).
 fn mini_keep_sysos(path: &str) -> bool {
     path.starts_with("/System/Library/Caches/com.apple.dyld/")
+        || path.starts_with("/System/Library/PrivateFrameworks/AXAssetLoader.framework/")
 }
 
 /// `mini` profile: boot-critical /usr/libexec binaries, added one wall at a
@@ -106,6 +111,7 @@ fn mini_keep(path: &str, is_dir: bool) -> bool {
         || top_dir
         || mini_keep_libexec(path)
         || mini_keep_coreservices(path)
+        || mini_keep_private_frameworks(path)
 }
 
 /// `mini` profile: the user-domain goal (M7) — SpringBoard's app bundle.
@@ -122,6 +128,12 @@ fn mini_keep(path: &str, is_dir: bool) -> bool {
 fn mini_keep_coreservices(path: &str) -> bool {
     path.starts_with("/System/Library/CoreServices/SpringBoard.app/")
         || path == "/System/Library/CoreServices/OTACrashCopier"
+}
+
+/// `mini` profile: xpcproxy's missing-executable inventory (runs 40023667468
+/// + 40032399701): the user-domain accessibility asset loader.
+fn mini_keep_private_frameworks(path: &str) -> bool {
+    path.starts_with("/System/Library/PrivateFrameworks/AXAssetLoader.framework/")
 }
 
 struct Builder<'a> {
@@ -232,6 +244,15 @@ impl<'a> Builder<'a> {
         let modified: Option<Vec<u8>> = if self.tweaks {
             if path == "/System/Library/xpc/launchd.plist" {
                 Some(tweak_launchd(vol, fid)?)
+            } else if path.starts_with("/System/Library/LaunchDaemons/")
+                && path.ends_with(".plist")
+            {
+                // per-daemon os_log mirror (CONSOLE_LABELS) — the monolithic
+                // tweak matched none of these (see tweak_daemon_plist)
+                match vol.read_file(fid) {
+                    Ok(raw) => tweak_daemon_plist(raw).unwrap_or(None),
+                    Err(_) => None,
+                }
             } else if path.contains("MediaToolbox.framework")
                 && path.ends_with("SubServerConfiguration.plist")
             {
@@ -294,12 +315,12 @@ impl<'a> Builder<'a> {
     }
 }
 
-fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
-    // upstream patch-launchd-plist.py parity: mirror the bring-up-critical
-    // daemons' os_log/stderr to /dev/console (the kernel framebuffer console)
-    // so their output lands in fb.txt; rename _PanicOnCrash so a crashing
-    // daemon does not panic the system; drop CommCenter (baseband).
-    const CONSOLE_LABELS: &[&str] = &[
+/// The bring-up-critical daemon labels whose os_log must reach the console.
+/// Used BOTH by the monolithic com.apple.xpc.launchd.plist tweak AND by the
+/// per-daemon /System/Library/LaunchDaemons/*.plist surgery (see
+/// tweak_daemon_plist — run 40032399701 proved the monolithic dict holds
+/// only launchd-internal jobs: 0 of these labels matched there).
+const CONSOLE_LABELS: &[&str] = &[
         "com.apple.mobile.usermanagerd", // getpwnam/muser: the 'mobile' resolver
         "com.apple.containermanagerd",   // system containers (backboardd dep)
         "com.apple.usabilityd",
@@ -313,6 +334,12 @@ fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
         "com.apple.SpringBoard", // the user-domain goal: its os_log is the
                                   // M7 wall map (dyld/Info.plist/services)
     ];
+
+fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
+    // upstream patch-launchd-plist.py parity: mirror the bring-up-critical
+    // daemons' os_log/stderr to /dev/console (the kernel framebuffer console)
+    // so their output lands in fb.txt; rename _PanicOnCrash so a crashing
+    // daemon does not panic the system; drop CommCenter (baseband).
     let raw = vol.read_file(fid)?;
     let mut p = plist_parse(&raw)?;
     if let Some(d) = p.as_dict_mut() {
@@ -375,6 +402,50 @@ fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
 
 fn progress_note(msg: &str) {
     eprintln!("[mkiosroot] {msg}");
+}
+
+/// Per-daemon LaunchDaemons plist surgery. The monolithic launchd tweak
+/// above matched ZERO of the CONSOLE_LABELS (run 40032399701 build log:
+/// "launchd.plist: ... 0 os_log-mirrored ()") — the real jobs live as
+/// separate plist FILES in /System/Library/LaunchDaemons/ (backboardd,
+/// SpringBoard, ...), which shipped verbatim. Their stdout/stderr then
+/// went to /dev/null and the M5/M6 Mach-service negotiations
+/// (com.apple.backboard.display.services, com.apple.iohideventsystem)
+/// produced no console traffic — the invisible-wall problem.
+/// Same surgery as the monolithic tweak, matched on the file's inner
+/// Label (authoritative), so a wrong label name just no-ops.
+fn tweak_daemon_plist(raw: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    let p = plist_parse(&raw)?;
+    let Some(label) = p
+        .as_dict()
+        .and_then(|d| d.get("Label"))
+        .and_then(|l| l.as_str())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+    if !CONSOLE_LABELS.contains(&label.as_str()) {
+        return Ok(None);
+    }
+    let mut p = p;
+    if let Some(d) = p.as_dict_mut() {
+        if let Some(v) = d.remove("_PanicOnCrash") {
+            d.insert("_PanicOnCrasX".into(), v);
+        }
+        for k in ["StandardOutPath", "StandardErrorPath"] {
+            if let Some(v) = d.remove(k) {
+                d.insert(format!("{k}X"), v);
+            }
+        }
+        let mut env = match d.get("EnvironmentVariables") {
+            Some(Plist::Dict(e)) => e.clone(),
+            _ => BTreeMap::new(),
+        };
+        env.insert("OS_ACTIVITY_DT_MODE".into(), Plist::Str("YES".into()));
+        env.insert("CFLOG_FORCE_STDERR".into(), Plist::Str("1".into()));
+        d.insert("EnvironmentVariables".into(), Plist::Dict(env));
+    }
+    Ok(Some(plist_write(&p)?))
 }
 
 fn tweak_subserver(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {

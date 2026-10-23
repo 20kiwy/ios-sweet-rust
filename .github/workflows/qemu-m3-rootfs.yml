@@ -52,6 +52,15 @@ jobs:
           sudo apt-get install -y -q qemu-system-arm llvm
           qemu-system-aarch64 --version | head -1
 
+      # cargo registry + target cache — skip the full vendored-C rebuild
+      # (miniz/lzfse/libzbitmap) on every push; tests still recompile the
+      # workspace itself, only dependency artifacts are restored.
+      - name: Cache cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-targets: true
+
       - name: Build + unit tests
         run: |
           cargo build --release
@@ -64,11 +73,37 @@ jobs:
             | jq -r '.firmwares[] | select(.version=="16.7.16") | .url')
           echo "IPSW_URL=$IPSW_URL" | tee -a "$GITHUB_ENV"
 
+      # The 6.6 GB IPSW was re-pulled from the Apple CDN over windowed HTTP
+      # range requests on EVERY run (~5-8 min). Cache it once per build and
+      # stream every member locally afterwards (the dmg readers treat local
+      # paths natively: MemberSource opens them without HTTP).
+      # NOTE: same path+key as qemu-logo.yml — one shared 6.6 GB entry, not
+      # two (the 10 GB repo cache total would LRU-evict between them).
+      - name: Cache the 16.7.16 IPSW (6.6 GB, one-time download)
+        uses: actions/cache@v4
+        with:
+          path: ipsw.ipsw
+          key: ipsw-20H392-iPhone10,3
+
+      - name: Fetch the IPSW (cache miss -> Apple CDN, retried)
+        run: |
+          if [ ! -s ipsw.ipsw ]; then
+            echo "IPSW cache miss — pulling $IPSW_URL"
+            # temp file + atomic move: a dropped connection must never
+            # poison the cache with a truncated ipsw.ipsw
+            curl -fL --retry 5 --retry-delay 10 -o ipsw.ipsw.tmp "$IPSW_URL" \
+              && mv ipsw.ipsw.tmp ipsw.ipsw
+          else
+            echo "IPSW cache hit ($(du -h ipsw.ipsw | cut -f1))"
+          fi
+          df -h / | head -2
+          echo "IPSW=ipsw.ipsw" | tee -a "$GITHUB_ENV"
+
       - name: Extract the SystemOS cryptex (dyld shared cache source)
         run: |
-          ./target/release/sweet-rust ipsw-extract "$IPSW_URL" \
+          ./target/release/sweet-rust ipsw-extract "$IPSW" \
             --member 087-86593-047.dmg --out cryptex
-          ./target/release/sweet-rust ipsw-extract "$IPSW_URL" \
+          ./target/release/sweet-rust ipsw-extract "$IPSW" \
             --member DeviceTree.d22ap.im4p --out dt
           ls -la cryptex dt
           # diagnostic: the full dyld cache directory of the cryptex —
@@ -80,7 +115,7 @@ jobs:
       - name: Build the mini HFS+ root (real files, root-free writer)
         run: |
           ./target/release/sweet-rust mkiosroot \
-            --os "$IPSW_URL" \
+            --os "$IPSW" \
             --systemos cryptex/087-86593-047.dmg \
             --unlink-systemos \
             --profile mini \
@@ -133,7 +168,7 @@ jobs:
         run: |
           MSGREF=$(llvm-nm kernel/kernel.development.sweet | grep ' _msgbufp$' | awk '{print $1}')
           echo "_msgbufp = 0x$MSGREF"
-          ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW_URL" out-m3 \
+          ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW" out-m3 \
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \

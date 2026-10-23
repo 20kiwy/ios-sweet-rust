@@ -44,6 +44,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      # cargo registry + target cache — skip the full vendored-C rebuild
+      - name: Cache cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+
       - name: Build
         run: cargo build --release
 
@@ -77,8 +83,22 @@ jobs:
           EOF
 
       - name: Download the IPSW once (hello needs rootfs chunks; runners have the bandwidth)
+        # cached: same path+key as qemu-m3-rootfs.yml — ONE shared 6.6 GB
+        # entry for the repo (two entries would exceed the 10 GB cache
+        # total and LRU-evict each other)
+        uses: actions/cache@v4
+        with:
+          path: ipsw.ipsw
+          key: ipsw-20H392-iPhone10,3
+
+      - name: Fetch the IPSW if the cache missed
         run: |
-          curl -sfL --retry 3 -o ipsw.ipsw "$IPSW_URL"
+          if [ ! -s ipsw.ipsw ]; then
+            curl -fL --retry 5 --retry-delay 10 -o ipsw.ipsw.tmp "$IPSW_URL" \
+              && mv ipsw.ipsw.tmp ipsw.ipsw
+          else
+            echo "IPSW cache hit ($(du -h ipsw.ipsw | cut -f1))"
+          fi
           ls -la ipsw.ipsw
 
       - name: Boot to the real Hello welcome screen (IPSW CursiveHello.json)

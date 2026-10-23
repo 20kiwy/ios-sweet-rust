@@ -46,6 +46,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      # cargo registry + target cache: the vendored C deps (miniz/lzfse/
+      # libzbitmap) dominated a full ~3-5 min rebuild per OS per push.
+      - name: Cache cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+
       - name: Build (release)
         run: cargo build --release
 
