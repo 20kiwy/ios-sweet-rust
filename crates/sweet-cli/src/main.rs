@@ -1520,6 +1520,15 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
     eprintln!("{}", info.summary());
     verdict.set("payload_size", J::n(pl.len() as f64));
     verdict.set("fixups", J::n(info.fixups as f64));
+    // MEMORY: the loader reads payload.bin from disk (-device loader,file=…),
+    // so the in-RAM copies are dead weight from here on. On a 16GB CI runner
+    // a 4.2GB root held twice (ramdisk + payload) plus QEMU's resident
+    // shared-memory backend OOMs the agent (job dies as "The operation was
+    // canceled" ~45s into the boot — the 2026-10-23 M3 run cliff).
+    drop(pl);
+    drop(ramdisk);
+    drop(kernel);
+    drop(adt_blob);
 
     // 5. QEMU boot with the logo loader device
     let mut opts = RunOptions {
