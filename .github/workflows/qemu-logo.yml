@@ -117,12 +117,17 @@ jobs:
             "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Five.HEIC" \
             "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Six.HEIC" \
             "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_One_Left.HEIC" \
-            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_One_Right.HEIC" \
-            "7420.Clownfish_Background-375w-812h@3x~iphone.ca/main.caml" \
-            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/main.caml" \
-            "7420.Clownfish_Foreground-375w-812h@3x~iphone.ca/main.caml" ; do
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_One_Right.HEIC" ; do
             n=$(basename "$a")
             ./target/release/sweet-rust ipsw-file ipsw.ipsw "$B/$a" --out "wall/$n"
+          done
+          # the three CAML layout docs share the basename main.caml — name
+          # them per doc or they overwrite each other (compose-wallpaper.py
+          # looks for Background/Floating/Foreground.main.caml)
+          for d in Background Floating Foreground; do
+            ./target/release/sweet-rust ipsw-file ipsw.ipsw \
+              "$B/7420.Clownfish_${d}-375w-812h@3x~iphone.ca/main.caml" \
+              --out "wall/$d.main.caml"
           done
           python3 tools/compose-wallpaper.py wall
           ls -la wall/*.png
