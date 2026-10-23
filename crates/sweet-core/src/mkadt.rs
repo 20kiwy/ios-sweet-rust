@@ -13,7 +13,12 @@ pub const MEM_SIZE: u64 = 0x4d00_0000;
 pub const PANIC_LOG_SIZE: u64 = 0x100000;
 /// --highmem (phone only): the whole upper DDR bank.
 pub const HIGH_PHYS_BASE: u64 = 0x1_0000_0000;
-pub const HIGH_MEM_SIZE: u64 = 0xfcc0_0000;
+/// 4 GiB bank. The md0 root (mini profile with the dyld shared cache) is
+/// ~4.2 GiB; with the old 0xfcc0_0000 bank the ramdisk end (kernel_end +
+/// size) overflowed the ADT DRAM range by ~7 MB and arm_init died on a
+/// translation fault (ESR 0x96000006, FAR 0x220) before any driver ran.
+/// 0x1_0000_0000 keeps -m at exactly 7G on QEMU virt (0x40000000..0x200000000).
+pub const HIGH_MEM_SIZE: u64 = 0x1_0000_0000;
 /// /arm-io children are relative to this; must not be 0 (serial_init bails).
 pub const SOC_BASE: u64 = 0x0100_0000;
 
