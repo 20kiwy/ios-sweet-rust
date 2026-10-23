@@ -147,6 +147,7 @@ const CHUNK_RAW: u32 = 0x0000_0001;
 const CHUNK_LZFSE: u32 = 0x8000_0007;
 const CHUNK_ZLIB: u32 = 0x8000_0004;
 const CHUNK_TERM: u32 = 0xFFFF_FFFF;
+const CHUNK_APFS_MAGIC: u32 = 0x4253_584E; // NXSB
 
 #[derive(Clone)]
 struct Chunk {
@@ -165,6 +166,8 @@ pub struct Dmg {
     cache: HashMap<usize, Vec<u8>>,
     order: Vec<usize>,
     cache_max: usize,
+    /// raw-APFS passthrough (open_raw/open_auto): no chunk table, no cache.
+    raw: bool,
     pub part_size: u64,
     stats_decoded: u64,
 }
@@ -247,13 +250,48 @@ impl Dmg {
             cache: HashMap::new(),
             order: Vec::new(),
             cache_max: 48,
+            raw: false,
             part_size,
             stats_decoded: 0,
         })
     }
 
+    /// Open a RAW APFS container (the iOS cryptex dmg members are raw
+    /// volumes, not UDIF): identity map, no chunk table, no cache
+    /// (the single "chunk" is the whole multi-GB volume).
+    pub fn open_raw(mut src: Box<dyn ByteSource>, size: u64) -> Result<Self> {
+        let b0 = src.read_at(0, 4096)?;
+        if u32le(&b0, 0x20) != CHUNK_APFS_MAGIC {
+            bail!("open_raw: no APFS container superblock at block 0");
+        }
+        Ok(Self {
+            src,
+            chunks: vec![Chunk { sector: 0, sectors: size / 512, kind: CHUNK_RAW, coff: 0, clen: size }],
+            starts: vec![0],
+            cache: HashMap::new(),
+            order: Vec::new(),
+            cache_max: 0,
+            raw: true,
+            part_size: size,
+            stats_decoded: 0,
+        })
+    }
+
+    /// Open from any byte source, auto-detecting UDIF (koly) vs raw APFS.
+    pub fn open_auto(mut src: Box<dyn ByteSource>, size: u64) -> Result<Self> {
+        let koly = src.read_at(size - 512, 512)?;
+        if koly[0..4] == *b"koly" {
+            Self::open(src, size)
+        } else {
+            Self::open_raw(src, size)
+        }
+    }
+
     /// Partition-relative random read.
     pub fn read(&mut self, off: u64, len: usize) -> Result<Vec<u8>> {
+        if self.raw {
+            return self.src.read_at(off, len);
+        }
         let mut out = Vec::with_capacity(len);
         let mut pos = off;
         let end = off + len as u64;

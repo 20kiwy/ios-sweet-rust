@@ -322,7 +322,7 @@ fn open_system_volume(source: &str) -> Result<(String, sc::apfs::Apfs)> {
             let size = ms.size;
             (m, Box::new(ms) as Box<dyn sc::dmg::ByteSource>, size)
         };
-    let dmg = sc::dmg::Dmg::open(boxed, size)?;
+    let dmg = sc::dmg::Dmg::open_auto(boxed, size)?;
     let vol = sc::apfs::Apfs::open(dmg)?;
     Ok((member, vol))
 }
