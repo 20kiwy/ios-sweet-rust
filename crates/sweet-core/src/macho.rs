@@ -10,9 +10,15 @@ use crate::{bail, Result};
 
 pub const LC_SEGMENT_64: u32 = 0x19;
 pub const LC_UNIXTHREAD: u32 = 0x5;
+pub const LC_LOAD_DYLIB: u32 = 0xc;
+pub const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018; // (0x18 | LC_REQ_DYLD)
+pub const LC_LOAD_UPWARD_DYLIB: u32 = 0x8000_0023; // (0x23 | LC_REQ_DYLD)
+pub const LC_REEXPORT_DYLIB: u32 = 0x8000_001f; // (0x1f | LC_REQ_DYLD)
 pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
 pub const MH_MAGIC_64: u32 = 0xfeedfacf;
+pub const MH_CIGAM_FAT: u32 = 0xbeba_feca; // FAT_MAGIC 0xcafebabe, read LE
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+pub const CPU_TYPE_ARM64E: u32 = 0x0200_000c;
 
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -32,6 +38,47 @@ pub struct Macho {
     pub entry: u64,
     /// (dataoff, datasize) of LC_DYLD_CHAINED_FIXUPS, if present.
     pub fixups: Option<(u32, u32)>,
+    /// Linked libraries: LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB.
+    pub dylibs: Vec<String>,
+}
+
+/// (offset, size, cputype) of the arm64 slice of a FAT Mach-O (thin files
+/// return (0, len, cputype)). iOS userspace binaries are FAT; A11 userspace
+/// is plain arm64 (arm64e starts at A12).
+pub fn fat_slice_arm64(buf: &[u8]) -> Result<(usize, usize, u32)> {
+    if buf.len() < 8 || u32le(buf, 0) != MH_CIGAM_FAT {
+        // thin: must still be a 64-bit Mach-O to accept it
+        if buf.len() >= 4 && u32le(buf, 0) == MH_MAGIC_64 {
+            return Ok((0, buf.len(), u32le(buf, 4)));
+        }
+        bail!("not a FAT or 64-bit Mach-O");
+    }
+    let be32 = |off: usize| -> u32 { u32le(buf, off).swap_bytes() };
+    let narch = be32(4) as usize;
+    let mut arm64e = None;
+    for i in 0..narch {
+        let e = 8 + i * 20;
+        if e + 20 > buf.len() {
+            bail!("FAT arch entry out of bounds");
+        }
+        let (cpu, off, size) = (be32(e), be32(e + 8) as usize, be32(e + 12) as usize);
+        if off + size > buf.len() {
+            bail!("FAT slice out of bounds");
+        }
+        if cpu == CPU_TYPE_ARM64 {
+            return Ok((off, size, cpu));
+        }
+        if cpu == CPU_TYPE_ARM64E && arm64e.is_none() {
+            arm64e = Some((off, size, cpu));
+        }
+    }
+    arm64e.ok_or_else(|| crate::Error::Msg("no arm64 slice in FAT Mach-O".into()))
+}
+
+/// Parse the arm64 slice of a (FAT or thin) Mach-O; returns (macho, slice offset).
+pub fn parse_best(buf: &[u8]) -> Result<(Macho, usize)> {
+    let (off, size, _) = fat_slice_arm64(buf)?;
+    Ok((parse(&buf[off..off + size])?, off))
 }
 
 /// Little-endian u16 at `off`.
@@ -46,7 +93,8 @@ pub fn parse(buf: &[u8]) -> Result<Macho> {
     let cputype = u32le(buf, 4);
     let cpusub = u32le(buf, 8) & 0xff;
     let ncmds = u32le(buf, 16) as usize;
-    let mut m = Macho { cputype, cpusub, segments: Vec::new(), entry: 0, fixups: None };
+    let mut m =
+        Macho { cputype, cpusub, segments: Vec::new(), entry: 0, fixups: None, dylibs: Vec::new() };
     let mut off = 32usize;
     for _ in 0..ncmds {
         if off + 8 > buf.len() {
@@ -88,6 +136,24 @@ pub fn parse(buf: &[u8]) -> Result<Macho> {
                     bail!("short LC_DYLD_CHAINED_FIXUPS");
                 }
                 m.fixups = Some((u32le(buf, off + 8), u32le(buf, off + 12)));
+            }
+            LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_LOAD_UPWARD_DYLIB | LC_REEXPORT_DYLIB => {
+                // dylib_command: cmd, cmdsize, name offset (from cmd start), ...
+                if size < 12 {
+                    bail!("short LC_*_DYLIB");
+                }
+                let name_off = off + u32le(buf, off + 8) as usize;
+                if name_off >= off + size || name_off >= buf.len() {
+                    bail!("dylib name offset out of bounds");
+                }
+                let name: String = buf[name_off..off + size]
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as char)
+                    .collect();
+                if !name.is_empty() {
+                    m.dylibs.push(name);
+                }
             }
             _ => {}
         }

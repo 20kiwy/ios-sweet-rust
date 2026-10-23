@@ -44,6 +44,14 @@ COMMANDS:
     ipsw-file <IPSW|URL|DMG> <PATH> --out FILE
         Extract a real file from the system volume (decmpfs-decoded).
 
+    macho-deps <FILE>
+        Parse the arm64 slice of a (FAT or thin) Mach-O: cputype, segments,
+        and every LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB.
+
+    adt-dump <DeviceTree.im4p> [--out FILE.md] [--table]
+        Parse the real ADT from an IPSW DeviceTree im4p: full tree dump,
+        optionally one line per device node (path, compatible, reg base/size).
+
     emu-boot --ipsw IPSW|URL <OUTDIR> [--wallpaper PNG] [--send TEXT]
         Boot into a LIVE controllable session: QMP + gdbstub + serial socket.
         The host pauses the VM, repaints the framebuffer with the wallpaper,
@@ -198,6 +206,8 @@ fn dispatch(args: &[String]) -> Result<()> {
         "ipsw-ls" => cmd_ipsw_ls(rest),
         "ipsw-find" => cmd_ipsw_find(rest),
         "ipsw-file" => cmd_ipsw_file(rest),
+        "macho-deps" => cmd_macho_deps(rest),
+        "adt-dump" => cmd_adt_dump(rest),
         "emu-boot" => cmd_emu_boot(rest),
         "emu-peek" => cmd_emu_peek(rest),
         "kernel-unpack" => cmd_kernel_unpack(rest),
@@ -223,6 +233,8 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
     match cmd {
         "ipsw-extract" => vec!["member", "out"],
         "ipsw-file" => vec!["out"],
+        "macho-deps" => vec![],
+        "adt-dump" => vec!["out"],
         "emu-boot" => vec![
             "ipsw", "wallpaper", "wallpaper-manifest", "send", "secs", "cpu",
             "strip", "logo-scale", "qemu-datadir",
@@ -389,6 +401,106 @@ fn cmd_ipsw_file(args: &[String]) -> Result<()> {
         bytes.len()
     );
     Ok(())
+}
+
+/// macho-deps: cputype, segments and dylibs of the arm64 slice of a Mach-O.
+fn cmd_macho_deps(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("macho-deps"));
+    let Some(path) = f.rest.first() else {
+        bail!("usage: macho-deps <MACHO>");
+    };
+    let buf = std::fs::read(path)?;
+    let (m, slice_off) = sc::macho::parse_best(&buf)?;
+    println!("file        : {path} ({} bytes)", buf.len());
+    println!("arm64 slice : offset {slice_off:#x}");
+    println!("cputype     : {:#x}", m.cputype);
+    println!("entry       : {:#x}", m.entry);
+    println!("segments ({}):", m.segments.len());
+    for s in &m.segments {
+        println!(
+            "  {:<18} vm {:#011x} vsize {:#x} file {:#x} fsize {}",
+            s.name, s.vmaddr, s.vmsize, s.fileoff, s.filesize
+        );
+    }
+    println!("dylibs ({}):", m.dylibs.len());
+    for d in &m.dylibs {
+        println!("  {d}");
+    }
+    Ok(())
+}
+
+/// adt-dump: parse the real ADT out of a DeviceTree im4p and dump it.
+fn cmd_adt_dump(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("adt-dump"));
+    let Some(path) = f.rest.first() else {
+        bail!("usage: adt-dump <DeviceTree.im4p> [--out FILE] [--table]");
+    };
+    let raw = load_adtish(Path::new(path))?;
+    let (root, _) = adt::parse(&raw)?;
+    print!("{}", adt::dump(&root, 0, false));
+    if f.has("table") {
+        let mut rows = Vec::new();
+        adt_walk(&root, "", &mut rows);
+        println!("\n--- devices with reg (path | compatible | base size) ---");
+        for (p, compat, regs) in &rows {
+            if regs.is_empty() {
+                continue;
+            }
+            let rs: Vec<String> =
+                regs.iter().map(|(a, s)| format!("{a:#x} {s:#x}")).collect();
+            println!("{p:<44} | {compat:<30} | {}", rs.join(" "));
+        }
+    }
+    if let Some(out) = f.val("out") {
+        let mut text = adt::dump(&root, 0, false);
+        if f.has("table") {
+            text.push_str("\n--- devices with reg (path | compatible | base size) ---\n");
+            let mut rows = Vec::new();
+            adt_walk(&root, "", &mut rows);
+            for (p, compat, regs) in rows {
+                if regs.is_empty() {
+                    continue;
+                }
+                let rs: Vec<String> =
+                    regs.iter().map(|(a, s)| format!("{a:#x} {s:#x}")).collect();
+                text.push_str(&format!("{p:<44} | {compat:<30} | {}\n", rs.join(" ")));
+            }
+        }
+        std::fs::write(out, text)?;
+        eprintln!("[ok] wrote {out}");
+    }
+    Ok(())
+}
+
+/// (path, compatible, (base,size)[]) for every ADT node carrying a reg.
+fn adt_walk(node: &adt::Node, path: &str, out: &mut Vec<(String, String, Vec<(u64, u64)>)>) {
+    let p =
+        if path.is_empty() { node.name().to_string() } else { format!("{path}/{}", node.name()) };
+    let compat = node
+        .prop("compatible")
+        .map(|v| {
+            let s: String = v
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as char)
+                .collect();
+            s.trim_end_matches('\u{0}').to_string()
+        })
+        .unwrap_or_default();
+    let mut regs = Vec::new();
+    if let Some(r) = node.prop("reg") {
+        if r.len() >= 16 && r.len() % 16 == 0 {
+            for i in 0..r.len() / 16 {
+                let a = sc::aarch64::u64le(r, i * 16);
+                let s = sc::aarch64::u64le(r, i * 16 + 8);
+                regs.push((a, s));
+            }
+        }
+    }
+    out.push((p.clone(), compat, regs));
+    for c in &node.children {
+        adt_walk(c, &p, out);
+    }
 }
 
 /// Mean absolute byte difference between two equally sized FB dumps.

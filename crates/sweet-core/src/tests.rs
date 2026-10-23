@@ -602,3 +602,81 @@ fn interactive_kernel_no_unpatched_branches() {
     let poll = &km[code_off + 0x90..code_off + 0x94];
     assert_eq!(poll, &[0xc5, 0x00, 0x40, 0xb9], "poll ldr must be [x6]");
 }
+
+#[test]
+fn macho_fat_slice_and_dylibs() {
+    // FAT Mach-O with one arm64 slice carrying two LC_LOAD_DYLIB.
+    // fat header: magic(BE) 0xcafebabe, nfat_arch=1, arch={cputype(BE) 0x0100000c,
+    // cpusub 0, offset 0x20(32B hdr), size, align}
+    let mut inner: Vec<u8> = Vec::new();
+    inner.extend_from_slice(&0xfeedfacfu32.to_le_bytes()); // MH_MAGIC_64
+    inner.extend_from_slice(&0x0100_000cu32.to_le_bytes()); // CPU_TYPE_ARM64
+    inner.extend_from_slice(&0u32.to_le_bytes());
+    inner.extend_from_slice(&0u32.to_le_bytes()); // filetype
+    inner.extend_from_slice(&3u32.to_le_bytes()); // ncmds: segment + 2 dylibs
+    inner.extend_from_slice(&0u32.to_le_bytes()); // sizeofcmds
+    inner.extend_from_slice(&0u32.to_le_bytes()); // flags
+    inner.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    // one minimal LC_SEGMENT_64 (__TEXT, vm 0, size 0x1000)
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&0x19u32.to_le_bytes());
+    seg.extend_from_slice(&72u32.to_le_bytes());
+    seg.extend_from_slice(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+    seg.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+    seg.extend_from_slice(&0x1000u64.to_le_bytes()); // vmsize
+    seg.extend_from_slice(&0u64.to_le_bytes()); // fileoff
+    seg.extend_from_slice(&0x1000u64.to_le_bytes()); // filesize
+    seg.extend_from_slice(&0x07u32.to_le_bytes()); // maxprot
+    seg.extend_from_slice(&0x05u32.to_le_bytes()); // initprot
+    seg.extend_from_slice(&1u32.to_le_bytes()); // nsects
+    seg.extend_from_slice(&0u32.to_le_bytes()); // flags
+    inner.extend_from_slice(&seg);
+    // LC_LOAD_DYLIB "/usr/lib/libSystem.B.dylib"
+    let name = b"/usr/lib/libSystem.B.dylib\0";
+    let cmdsize = (24 + name.len()) as u32;
+    let mut ld = Vec::new();
+    ld.extend_from_slice(&0xcu32.to_le_bytes());
+    ld.extend_from_slice(&cmdsize.to_le_bytes());
+    ld.extend_from_slice(&24u32.to_le_bytes()); // name offset
+    ld.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+    ld.extend_from_slice(&0u32.to_le_bytes()); // current_version
+    ld.extend_from_slice(&0u32.to_le_bytes()); // compatibility_version
+    ld.extend_from_slice(name);
+    inner.extend_from_slice(&ld);
+    // a second dylib (weak)
+    let name2 = b"/System/Library/Frameworks/Foo.framework/Foo\0";
+    let mut ld2 = Vec::new();
+    ld2.extend_from_slice(&0x8000_0018u32.to_le_bytes());
+    ld2.extend_from_slice(&(24 + name2.len() as u32).to_le_bytes());
+    ld2.extend_from_slice(&24u32.to_le_bytes());
+    ld2.extend_from_slice(&0u32.to_le_bytes());
+    ld2.extend_from_slice(&0u32.to_le_bytes());
+    ld2.extend_from_slice(&0u32.to_le_bytes());
+    ld2.extend_from_slice(name2);
+    inner.extend_from_slice(&ld2);
+
+    let mut fat: Vec<u8> = Vec::new();
+    fat.extend_from_slice(&0xcafebabEu32.swap_bytes().to_le_bytes()); // 0xcafebabe BE
+    fat.extend_from_slice(&1u32.swap_bytes().to_le_bytes()); // nfat_arch
+    fat.extend_from_slice(&0x0100_000cu32.swap_bytes().to_le_bytes());
+    fat.extend_from_slice(&0u32.swap_bytes().to_le_bytes());
+    fat.extend_from_slice(&32u32.swap_bytes().to_le_bytes()); // offset
+    fat.extend_from_slice(&(inner.len() as u32).swap_bytes().to_le_bytes());
+    fat.extend_from_slice(&12u32.swap_bytes().to_le_bytes()); // align
+    assert_eq!(fat.len(), 28);
+    fat.extend(std::iter::repeat(0).take(4)); // pad to 32
+    fat.extend_from_slice(&inner);
+
+    let (m, off) = crate::macho::parse_best(&fat).unwrap();
+    assert_eq!(off, 32);
+    assert_eq!(m.cputype, 0x0100_000c);
+    assert_eq!(m.segments.len(), 1);
+    assert_eq!(m.segments[0].name, "__TEXT");
+    assert_eq!(m.dylibs.len(), 2);
+    assert_eq!(m.dylibs[0], "/usr/lib/libSystem.B.dylib");
+    assert_eq!(m.dylibs[1], "/System/Library/Frameworks/Foo.framework/Foo");
+    // thin files also parse via parse_best
+    let (m2, off2) = crate::macho::parse_best(&inner).unwrap();
+    assert_eq!(off2, 0);
+    assert_eq!(m2.dylibs.len(), 2);
+}

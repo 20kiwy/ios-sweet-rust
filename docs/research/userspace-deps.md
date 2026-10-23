@@ -1,0 +1,101 @@
+# Userspace dependency manifest — real iPhone X 16.7.16 binaries
+
+**Provenance (all real, extracted over HTTP ranges from the IPSW rootfs):**
+
+IPSW: `iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw`
+(Apple CDN `updates.cdn-apple.com`, rootfs member `087-86698-044.dmg`)
+
+| Binary | Rootfs path | Size | SHA-256 |
+|---|---|---|---|
+| backboardd | `/usr/libexec/backboardd` | 1,184,848 | `7aa6f8bf5ea2c3634fb8c8916a4e9c3c84508de78eccf57ca65c1ae4f676267c` |
+| SpringBoard | `/System/Library/CoreServices/SpringBoard.app/SpringBoard` | 112,960 | `ea835980610a95591fb349bca077840fab7bdd663efaa11ef054d91bc2125475` |
+| IOMFB_bics_daemon | `/usr/libexec/IOMFB_bics_daemon` | 111,920 | `d49eaf97fa763a0cd03f924ca0edb4aa64ce8a9380d35d39101f874614845b8f` |
+| backboardd launchd job | `/System/Library/LaunchDaemons/com.apple.backboardd.plist` | 1,045 | `f0bb457d564014065f091d4325a8eec8b37df88eb91c5b8bd4296c52cd0dfc8f` |
+
+Parsed with this repo's `macho-deps` (arm64 slice, cputype `0x0100000c` — A11
+userspace is plain arm64).
+
+---
+
+## SpringBoard — thin stub (4 dylibs)
+
+```
+/System/Library/PrivateFrameworks/SpringBoard.framework/SpringBoard
+/System/Library/Frameworks/Foundation.framework/Foundation
+/usr/lib/libobjc.A.dylib
+/usr/lib/libSystem.B.dylib
+```
+
+**Reading:** the 112 KB `SpringBoard` binary is a launch stub; the entire home
+screen implementation lives in `SpringBoard.framework` (same rootfs). This is
+good news for M7: stub + framework means the framework's own dependencies
+define the true surface — to be enumerated by `macho-deps` on the framework
+binary next (M1 follow-up).
+
+## backboardd — the userspace gate (46 dylibs)
+
+Display path (M5 gates):
+`IOMobileFramebuffer`, `IOSurface`, `Metal`, `QuartzCore`,
+`GraphicsServices`, `CoreGraphics`, `CoreText`, `ImageIO`
+
+Input path (M6 gates):
+`IOKit.framework`, `BackBoardHIDEventFoundation`, `BackBoardHIDEventProcessors`,
+`BackBoardServices`, `BaseBoard`, `BoardServices`, `CoreMotion`
+
+System/runtime (AMFI/launch gates):
+`libSystem.B`, `libobjc.A`, `libc++.1`, `CoreFoundation`, `Foundation`,
+`Security`, `libMobileGestalt`, `liblockdown`, `SoftLinking`
+
+Peripheral/system daemons it talks to (M7 tolerability to assess):
+`BiometricKit` (SEP-coupled), `Haptics`, `CarKit`, `CoreBrightness`,
+`CoreAccessories`, `SystemWake`, `RunningBoardServices`, `WatchdogClient`,
+`CrashReporterSupport`, `HangTracer`, `CoreAnalytics`, `AggregateDictionary`,
+`DataMigration`, `ProgressUI`, `StudyLog`, `ButtonResolver`, `libsp`,
+`libAccessibility`, `AVFoundation`, `CoreServices`, `SystemConfiguration`
+
+## IOMFB_bics_daemon (11 dylibs)
+
+`CoreAnalytics`, `libMobileGestalt`, `libamsupport`, + 8 more — the
+userspace-side companion of the kernel IOMobileFramebuffer driver.
+
+---
+
+## The launchd job that must succeed (M7 bootstrap spec)
+
+`com.apple.backboardd.plist` (binary plist, decoded):
+
+* `ProgramArguments` = `/usr/libexec/backboardd`
+* `Label` = `com.apple.backboardd`
+* `UserName` = `mobile`
+* `RunAtLoad` + `KeepAlive` = true — launchd restarts it forever if it dies
+* `POSIXSpawnType` = `Interactive`, `HighPriorityIO`
+* `MachServices` (bootstrap ports it registers):
+  `PurpleSystemEventPort`, `PurpleWorkspacePort`,
+  `com.apple.iohideventsystem` (input), `com.apple.backlightd`,
+  `com.apple.CARenderServer` (render), `com.apple.libEDR.Notification`,
+  `com.apple.AttentionAwareness`, `com.apple.backboard.hid.services`,
+  `com.apple.backboard.hid-services.xpc`, `com.apple.backboard.display.services`
+  (display), `com.apple.backboard.oswatchdog`, `com.apple.backboard.watchdog`,
+  `com.apple.backboard.system-app-server`, `com.apple.backboard.altsysapp`,
+  `com.apple.accessibility.AXBackBoardServer`,
+  `com.apple.accessibility.gax.backboard`,
+  `com.apple.iphone.axserver-systemwide`,
+  `com.apple.backboard.TouchDeliveryPolicyServer`
+
+**Implication for M5/M6:** backboardd will not complete launchd check-in
+until it can register `com.apple.backboard.display.services` (needs a working
+IOMobileFramebuffer connect) and `com.apple.iohideventsystem` (needs IOKit HID
+event sources). Those two MachServices are the concrete milestones.
+
+## Mapping dependencies → DeviceTree devices (the emulation surface)
+
+| Userspace dependency | Kernel/IOKit driver | D22AP device (see `devicetree-d22ap.md`) |
+|---|---|---|
+| IOMobileFramebuffer | IOMobileFramebuffer kext | `arm-io/disp0` `disp0,t8015` @ `0x18000000`; `dart-disp0` `dart,t8015` @ `0x18704000`; `mipi-dsim-1,synopsys` @ `0x18400000` |
+| IOKit HID / BackBoardHIDEvent* | AppleHIDTransport | `arm-io/spi1/multi-touch` `hid-transport,k1` (on `spi-1,samsung` @ `0x2e404000`) |
+| GraphicsServices/QuartzCore | framebuffer provider | same display path; FB at `0x9c000000` (host-shared) |
+| BiometricKit | SEP client | `arm-io/sep` `iop,t8015` @ `0x43000000` (M7: tolerate absence) |
+| liblockdown | lockdownd | userspace daemon, rootfs |
+
+Full register map of every device: `docs/research/devicetree-d22ap.md`
+(generated by `adt-dump` from the real IPSW DeviceTree im4p).
