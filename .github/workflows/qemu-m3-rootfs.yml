@@ -1,0 +1,156 @@
+name: qemu-m3-rootfs
+
+# M3: boot the REAL iOS userland toward launchd.
+#   real iPhone X 16.7.16 IPSW
+#     -> SystemOS cryptex extracted (holds the dyld shared cache)
+#     -> mini HFS+ root built root-free by our own writer (mkiosroot parity:
+#        DSC + launchd + dyld + LaunchDaemons + xpc + /usr + /sbin + /private/etc
+#        + SWEET additions), fsck_hfs-validated
+#     -> SWEETXNU payload (kernel.development.sweet + highmem ADT + root as md0)
+#     -> QEMU virt, upstream boot-args (rd=md0 ignition_level=1
+#        launchd_unsecure_cache=1 unentitled_ios_sim_launch=1 rootrw=1 ...)
+#     -> fb.png decoded back to console text via the kernel's own _iso_font
+#
+# Honesty: this boots Apple's launchd from Apple's files; everything the
+# console prints is real guest output. The runner has 16 GB RAM; the local
+# sandbox cannot hold a ~3.3 GB md0 (that is why the boot lives here).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "kernel/**"
+      - ".github/workflows/qemu-m3-rootfs.yml"
+
+concurrency:
+  group: qemu-m3-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  m3-mini-root:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust, QEMU, llvm-nm, fsck
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-arm llvm
+          qemu-system-aarch64 --version | head -1
+
+      - name: Build + unit tests
+        run: |
+          cargo build --release
+          cargo test --release
+          sha256sum -c kernel/SHA256SUMS
+
+      - name: Resolve the IPSW URL
+        run: |
+          IPSW_URL=$(curl -sfL 'https://api.ipsw.me/v4/device/iPhone10,3?type=ipsw' \
+            | jq -r '.firmwares[] | select(.version=="16.7.16") | .url')
+          echo "IPSW_URL=$IPSW_URL" | tee -a "$GITHUB_ENV"
+
+      - name: Extract the SystemOS cryptex (dyld shared cache source)
+        run: |
+          ./target/release/sweet-rust ipsw-extract "$IPSW_URL" \
+            --member 087-86593-047.dmg --out cryptex
+          ./target/release/sweet-rust ipsw-extract "$IPSW_URL" \
+            --member DeviceTree.d22ap.im4p --out dt
+          ls -la cryptex dt
+
+      - name: Build the mini HFS+ root (real files, root-free writer)
+        run: |
+          ./target/release/sweet-rust mkiosroot \
+            --os "$IPSW_URL" \
+            --systemos cryptex/087-86593-047.dmg \
+            --unlink-systemos \
+            --profile mini \
+            --out mini-root.img
+
+      - name: fsck gate (no structural errors; hard-link overlaps reported)
+        run: |
+          FSCK=$(find / -name fsck.hfsplus -path "*sbin*" 2>/dev/null | head -1 || true)
+          if [ -z "$FSCK" ]; then
+            # hfsprogs was removed from Debian; pull the Ubuntu universe binary
+            curl -sfL -o /tmp/hfsprogs.deb \
+              http://archive.ubuntu.com/ubuntu/pool/universe/h/hfsprogs/hfsprogs_540.1.linux3-6_amd64.deb
+            dpkg -x /tmp/hfsprogs.deb /tmp/hfstools
+            FSCK=$(find /tmp/hfstools -name fsck.hfsplus | head -1)
+          fi
+          set +e
+          "$FSCK" -f -n mini-root.img | tee fsck.log
+          rc=$?
+          set -e
+          invalid=$(grep -cE "Invalid|Incorrect|should be" fsck.log || true)
+          overlaps=$(grep -c "Overlapped" fsck.log || true)
+          echo "fsck rc=$rc invalid=$invalid overlaps=$overlaps" | tee fsck-summary.txt
+          # structural errors are fatal; shared extents of the SOURCE volume's
+          # own hard links are expected and documented (upstream parity)
+          test "$invalid" -eq 0
+
+      - name: Boot md0 = mini-root with the real SWEET kernel (highmem)
+        run: |
+          ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW_URL" out-m3 \
+            --kernel kernel/kernel.development.sweet \
+            --ramdisk mini-root.img \
+            --product dt/DeviceTree.d22ap.im4p \
+            --highmem --no-logo --secs 240 \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1' \
+            || true
+          ls -la out-m3
+
+      - name: Decode the framebuffer console (kernel _iso_font)
+        run: |
+          set +e
+          ./target/release/sweet-rust screen-decode \
+            --kernel kernel/kernel.development.sweet \
+            --payload out-m3/payload.bin \
+            out-m3/fb.png > out-m3/fb.txt 2> out-m3/screen-decode.log
+          rc=$?
+          set -e
+          echo "screen-decode rc=$rc"
+          wc -c out-m3/fb.txt || true
+          cat out-m3/boot-verdict.json || true
+
+      - name: M3 verdict
+        run: |
+          cat out-m3/fb.txt 2>/dev/null | tail -40 || true
+          python3 - <<'EOF'
+          import json, re, sys
+          v = json.load(open('out-m3/boot-verdict.json'))
+          try:
+              fb = open('out-m3/fb.txt', errors='replace').read()
+          except OSError:
+              fb = ''
+          panic = bool(re.search(r'panic\(cpu|SWEET EARLY PANIC', fb)) or v.get('panic')
+          bsd_root = 'BSD root: md0' in fb or v.get('bsd_root_md0')
+          mounted = re.search(r'hfs: mounted', fb) is not None
+          launchd = re.search(r'launchd|init running as PID', fb) is not None
+          print(f"panic={panic} bsd_root_md0={bsd_root} hfs_mounted={mounted} launchd_seen={launchd}")
+          json.dump({'panic': panic, 'bsd_root_md0': bsd_root, 'hfs_mounted': mounted,
+                     'launchd_seen': launchd, 'pass': bool(bsd_root and not panic)},
+                    open('out-m3/m3-verdict.json', 'w'), indent=1)
+          # M3 gate: the real rootfs mounts as md0 without a panic.
+          # (launchd_seen is recorded but NOT required yet - userland progress
+          # beyond the mount is the M4/M5 measurement.)
+          sys.exit(0 if (bsd_root and not panic) else 1)
+          EOF
+
+      - name: Artifacts (root evidence: fb, console text, verdicts, fsck)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3-mini-root-boot
+          path: |
+            out-m3/
+            fsck.log
+            fsck-summary.txt
+          retention-days: 30
