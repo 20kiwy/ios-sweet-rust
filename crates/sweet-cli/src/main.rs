@@ -273,6 +273,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
             "logo-scale", "cpu", "w", "h", "qemu-datadir", "hello-lang",
+            "hmp", "msgbuf-dump",
         ],
         _ => vec![],
     }
@@ -1750,6 +1751,13 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()
     };
+    if let Some(hmps) = f.val("hmp") {
+        opts.hmp = hmps.split(';').map(|s| s.to_string()).collect();
+    }
+    if let Some(mb) = f.val("msgbuf-dump") {
+        opts.msgbufp = Some(u64::from_str_radix(mb.trim_start_matches("0x"), 16)
+            .map_err(|e| sc::Error::Msg(format!("--msgbuf-dump: {e}")))?);
+    }
     let boot = match qemu::run(&payload_path, &outdir, &opts, None) {
         Ok(o) => Some(o),
         Err(e) if e.to_string().starts_with("EXIT1") => {

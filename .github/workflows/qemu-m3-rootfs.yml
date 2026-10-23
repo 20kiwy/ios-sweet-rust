@@ -114,15 +114,26 @@ jobs:
         # (uipc_mbuf.c:1743 m_total(MC_BIGCL)==0 && m_minlimit!=0) with the
         # larger pool. 49152 clusters is exactly what the launchd-reaching
         # boots computed; revisit the >=4GB mbinit path as its own item.
+        #
+        # --msgbuf-dump: fb.txt is only the LAST console screen; the kernel's
+        # msgbuf ring holds everything printed before the panic. llvm-nm
+        # gives _msgbufp (static, dev kernels do not slide); the runner
+        # walks msgbufp -> struct -> bufc and memsave's 128 KiB to
+        # msgbuf.bin (upstream NOTES.md boot-0038 trick, now native).
         run: |
+          MSGREF=$(llvm-nm kernel/kernel.development.sweet | grep ' _msgbufp$' | awk '{print $1}')
+          echo "_msgbufp = 0x$MSGREF"
           ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW_URL" out-m3 \
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
             --highmem --no-logo --secs 240 \
+            --msgbuf-dump "0x$MSGREF" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           ls -la out-m3
+          echo "===== msgbuf console history (head 200 lines) ====="
+          head -200 out-m3/msgbuf.txt 2>/dev/null || echo "(msgbuf.txt missing)"
 
       - name: Decode the framebuffer console (kernel _iso_font)
         run: |
@@ -182,6 +193,8 @@ jobs:
           path: |
             out-m3/fb.png
             out-m3/fb.txt
+            out-m3/msgbuf.bin
+            out-m3/msgbuf.txt
             out-m3/boot-verdict.json
             out-m3/m3-verdict.json
             out-m3/qemu.log

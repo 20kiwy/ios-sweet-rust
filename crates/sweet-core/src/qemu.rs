@@ -32,6 +32,14 @@ pub struct RunOptions {
     /// share=on): the host paints the framebuffer / screenshots by file I/O
     /// at (PA - 0x40000000), no QMP/gdb round trips.
     pub ram_file: Option<PathBuf>,
+    /// When set (address of xnu's `_msgbufp`, from `llvm-nm KERNEL | grep
+    /// _msgbufp`), the runner dumps the kernel console ring at stop time:
+    /// x /1gx -> struct msgbuf address, x /3gx -> bufc (3rd quad), then
+    /// HMP memsave of 0x20000 bytes to msgbuf.bin. fb.txt is only the LAST
+    /// screen; the msgbuf holds everything printed before it (upstream
+    /// NOTES.md 0038 trick). Development kernels do not slide: the nm
+    /// address is the runtime VA (upstream verified across boots).
+    pub msgbufp: Option<u64>,
 }
 
 impl Default for RunOptions {
@@ -45,6 +53,7 @@ impl Default for RunOptions {
             live_serial: false,
             serial_sock: None,
             ram_file: None,
+            msgbufp: None,
             qemu_datadir: Vec::new(),
             logo: None,
         }
@@ -445,6 +454,75 @@ impl Qmp {
     }
 }
 
+/// Dump xnu's console ring (the `msgbuf`) to `file` via HMP while the VM is
+/// stopped. `msgbufp` is the kernel-symbol address of `_msgbufp` (a
+/// `struct msgbuf *`): `x /1gx` reads the struct pointer, `x /3gx` reads
+/// `{bufx?, size?, bufc}` — bufc (3rd quad) points at the ring buffer
+/// (upstream NOTES.md boot-0038 recipe; static across boots, dev kernels
+/// do not slide). HMP memsave translates the kernel VA through the CPU's
+/// page tables.
+fn dump_msgbuf(q: &mut Qmp, msgbufp: u64, file: &str) -> Result<()> {
+    // pointer -> struct msgbuf
+    let out1 = q.hmp(&format!("x /1gx {msgbufp:#x}"))?;
+    let struct_addr = parse_hmp_quad(&out1)
+        .ok_or_else(|| sc_error(format!("x /1gx gave no quad: {out1:?}")))?;
+    // struct: { ... , ..., bufc } — bufc is the 3rd quad
+    let out2 = q.hmp(&format!("x /3gx {struct_addr:#x}"))?;
+    let quads = parse_hmp_quads(&out2);
+    if quads.len() < 3 {
+        return Err(sc_error(format!("x /3gx gave {} quads: {out2:?}", quads.len())));
+    }
+    let bufc = quads[2];
+    // ring size 0x20000 (128 KiB, the stock xnu msgbuf pool)
+    let r = q.hmp(&format!("memsave {bufc:#x} 0x20000 {file}"))?;
+    if !r.trim().is_empty() {
+        eprintln!("memsave note: {r}");
+    }
+    Ok(())
+}
+
+/// First "0x...: 0xVALUE" hex value in HMP `x` output.
+pub(crate) fn parse_hmp_quad(s: &str) -> Option<u64> {
+    parse_hmp_quads(s).into_iter().next()
+}
+
+pub(crate) fn parse_hmp_quads(s: &str) -> Vec<u64> {
+    let mut v = Vec::new();
+    for line in s.lines() {
+        // format: "fffffe0007b56678:  0xfffffe0007b56000  0x..." or
+        //          "0xfffffe0007b56678:  0x..."
+        let after_colon = match line.find(':') {
+            Some(i) => &line[i + 1..],
+            None => continue,
+        };
+        for tok in after_colon.split_whitespace() {
+            let t = tok;
+            // QEMU prints x-command values either "0x"-prefixed (any
+            // length) or as bare hex; bare words like "a" in error text
+            // must not parse, so bare tokens need >= 4 digits
+            let (prefixed, digits) = match t.strip_prefix("0x").or(t.strip_prefix("0X")) {
+                Some(d) => (true, d),
+                None => (false, t),
+            };
+            if !digits.is_empty()
+                && digits.chars().all(|c| c.is_ascii_hexdigit())
+                && (prefixed || digits.len() >= 4)
+            {
+                if let Ok(val) = u64::from_str_radix(digits, 16) {
+                    // the leading address quad (== the address we asked for)
+                    // is on the left of the colon and already excluded
+                    v.push(val);
+                }
+            }
+        }
+    }
+    v
+}
+
+fn sc_error(msg: String) -> crate::error::Error {
+    crate::error::Error::Msg(msg)
+}
+
 // ---------------------------------------------------------------------------
 // Framebuffer text decoding (exact port of decode_screen)
 // ---------------------------------------------------------------------------
@@ -688,6 +766,15 @@ pub fn run(
                 eprintln!("qmp pmemsave: {e:?}");
             }
         }
+        // kernel console ring dump (see RunOptions::msgbufp): x /1gx reads
+        // the struct msgbuf pointer, x /3gx reads {.., .., bufc}, memsave
+        // pulls the ring. HMP `x` prints "0x....: 0xVALUE" per quad.
+        if let Some(mb) = opts.msgbufp {
+            match dump_msgbuf(&mut q, mb, "msgbuf.bin") {
+                Ok(()) => eprintln!("msgbuf: dumped 0x20000 bytes to msgbuf.bin"),
+                Err(e) => eprintln!("msgbuf: dump failed: {e}"),
+            }
+        }
         let _ = p.kill();
         let _ = p.wait();
 
@@ -701,6 +788,16 @@ pub fn run(
             let (screen, unknown) = decode_screen(&fb_raw, &font);
             std::fs::write(out.join("fb.txt"), &screen)?;
             result = screen_result(&screen, unknown);
+        }
+        // human-readable console history (NULs stripped); memsave used a
+        // dash-free relative name (HMP parser limitation), move into out/
+        let mb_tmp = std::path::Path::new("msgbuf.bin");
+        if mb_tmp.exists() {
+            let mb = out.join("msgbuf.bin");
+            let _ = std::fs::rename(mb_tmp, &mb);
+            let raw = std::fs::read(&mb)?;
+            let txt: Vec<u8> = raw.into_iter().filter(|&b| b != 0).collect();
+            std::fs::write(out.join("msgbuf.txt"), &txt)?;
         }
         let _ = std::fs::remove_file(out.join("fb.raw"));
     } else {

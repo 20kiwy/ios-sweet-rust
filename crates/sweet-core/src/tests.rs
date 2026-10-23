@@ -881,3 +881,21 @@ fn decmpfs_algo9_marker_skip() {
     let got2 = crate::apfs::decompress_for_test(9, body.len(), &body, None).unwrap();
     assert_eq!(got2, body, "algo 9 without marker must be verbatim");
 }
+
+#[test]
+fn hmp_x_output_parsing() {
+    // QEMU 10 HMP `x /1gx` / `x /3gx` output shapes; the msgbuf dump walks
+    // _msgbufp -> struct msgbuf -> bufc (3rd quad) through these.
+    let one = "fffffe0007b7a678:  0xfffffe0007b7a660\n";
+    assert_eq!(qemu::parse_hmp_quad(one), Some(0xfffffe0007b7a660));
+    let three = "fffffe0007b7a660:  0x00000000 0x00000041 0xfffffe0012345000\n";
+    let quads = qemu::parse_hmp_quads(three);
+    assert_eq!(quads, vec![0, 0x41, 0xfffffe0012345000]);
+    assert_eq!(quads[2], 0xfffffe0012345000, "bufc is the 3rd of /3gx");
+    // wrapped rows: /3gx prints 2 quads per line on some widths
+    let wrapped = "fffffe0007b7a660:  0x1 0x2\nfffffe0007b7a670:  0x3\n";
+    assert_eq!(qemu::parse_hmp_quads(wrapped), vec![1, 2, 3]);
+    // non-quad noise must not parse
+    assert_eq!(qemu::parse_hmp_quads("qemu-system: not a memory dump"), Vec::<u64>::new());
+    assert_eq!(qemu::parse_hmp_quad(""), None);
+}

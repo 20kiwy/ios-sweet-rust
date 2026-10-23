@@ -243,11 +243,23 @@ fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
     if let Some(d) = p.as_dict_mut() {
         if let Some(Plist::Dict(daemons)) = d.get_mut("LaunchDaemons") {
             let mut renamed = 0usize;
+            let mut stdout_renamed = 0usize;
             for (_, job) in daemons.iter_mut() {
                 if let Some(jd) = job.as_dict_mut() {
                     if let Some(v) = jd.remove("_PanicOnCrash") {
                         jd.insert("_PanicOnCrasX".into(), v);
                         renamed += 1;
+                    }
+                    // upstream v9: rename StandardOutPath/StandardErrorPath so
+                    // launchd skips per-daemon redirection; the daemons' own
+                    // stdout/stderr then reaches /dev/console (the kernel's
+                    // console = fbcon + msgbuf), giving boot-log visibility
+                    // (NOTES.md "in-place phone fix", pairs with patch 0048).
+                    for k in ["StandardOutPath", "StandardErrorPath"] {
+                        if let Some(v) = jd.remove(k) {
+                            jd.insert(format!("{k}X"), v);
+                            stdout_renamed += 1;
+                        }
                     }
                 }
             }
@@ -259,7 +271,7 @@ fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
                     != Some("com.apple.CommCenter")
             });
             progress_note(&format!(
-                "launchd.plist: {renamed} _PanicOnCrash renamed, {} CommCenter jobs removed ({} -> {})",
+                "launchd.plist: {renamed} _PanicOnCrash renamed, {stdout_renamed} StandardOut/ErrPath renamed, {} CommCenter jobs removed ({} -> {})",
                 before - daemons.len(),
                 before,
                 daemons.len()
