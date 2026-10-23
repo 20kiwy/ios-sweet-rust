@@ -275,6 +275,39 @@ reality beats the original guess.
   display-services/HID negotiations produce no console traffic yet; the
   32-38 s startup-log window fell between the 20 s snapshots, so the
   next run closes the gap with --snap-every 5.
+* **THE MACH WALL, measured — the M4/M5 device work is now the path (run 40034787036, 2026-10-23).**
+  A 20-minute boot (38 snapshot windows) gave the definitive answer to
+  "slow or stuck": the launchd log froze at 00:00:44 guest time and never
+  moved again; the kernel idle-loops on timer IRQs at a fixed PC for the
+  remaining 19 minutes; no daemon exits; nothing new logs. The whole
+  userland is ALIVE and parked in mach_msg waits. The dependency chain
+  (userspace-deps.md): backboardd cannot complete its launchd check-in
+  until it registers `com.apple.backboard.display.services`, which needs
+  a working **IOMobileFramebuffer user client**; SpringBoard waits for
+  backboardd. The kernel side explains it: the QEMU ADT carries a
+  SYNTHETIC `/arm-io/disp0` (`compatible = "sweet,display"`, canvas
+  props only) that the SWEET-patched console driver matches — but the
+  REAL `IOMobileFramebuffer` kext matches `disp0,t8015` with the D22AP
+  register map (`disp0 @ 0x18000000`, `dart-disp0 @ 0x18704000`,
+  `mipi-dsim-1 @ 0x18400000`), none of which exists on QEMU `virt`.
+  No match → no user client → no registration → the whole graph waits.
+  **This is the originally-planned M4/M5 wall** (DART + disp0 register
+  model in QEMU).
+  Nuance for the next session: the SWEET patch set already includes
+  0046 "AppleCLCD/IOSurface/IOMobileFramebuffer on /arm-io/disp0" (the
+  kernel console renders through AppleCLCD today), so IOMFB may already
+  ATTACH on the synthetic node — the block is then inside the user
+  client's hardware-dependent flow (surface/dart/interrupt ops that no
+  QEMU device ever completes). The M5 plan's own alternative — "a
+  virtual-display patch keyed on the IOMFB kext mapping the
+  DART-translated surface to FB 0x9c000000" — remains the designed
+  answer. Scoped experiments, cheapest first: (a) IOKit-verbose boot
+  (debug=0x8) to capture IOMFB's attach/user-client state on the
+  synthetic node; (b) gdb-attach at end-of-boot via QMP `gdbserver` HMP
+  to read backboardd's thread state; (c) the virtual-display kernel
+  patch (upstream SWEET patch set) or QEMU `unimplemented-device`
+  stubs at the real D22AP MMIO bases (reads-as-zero; a half-matched
+  real IOMFB may panic — revert restores the proven stable state).
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —

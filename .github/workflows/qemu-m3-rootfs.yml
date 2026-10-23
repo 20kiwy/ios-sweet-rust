@@ -121,13 +121,15 @@ jobs:
         # walks msgbufp -> struct -> bufc and memsave's 128 KiB to
         # msgbuf.bin (upstream NOTES.md boot-0038 trick, now native).
         #
-        # --secs 1200 (run 40032399701 reframe): the whole first wave +
-        # SpringBoard (pid 5, 330MB jetsam profile) is ALIVE and quiet by
-        # 44s of guest time — under TCG (~10-20x slowdown) UIKit/
-        # BackBoardServices init is measured in MINUTES, not the 200s the
-        # old boot gave it. 20 min of guest time + 30s fb snapshots give
-        # the Mach-service negotiations (backboardd -> IOMFB -> SpringBoard)
-        # room to actually progress.
+        # --secs 240 (run 40034787036 answered the TCG question): a 20-MINUTE
+        # boot showed the console freeze at 00:00:44 guest time forever —
+        # the kernel idle-loops on timer IRQs, no daemon exits, nothing new
+        # logs. The processes are ALIVE but parked: backboardd cannot
+        # complete its launchd check-in until it registers
+        # com.apple.backboard.display.services (needs a REAL
+        # IOMobileFramebuffer user client) — the M4/M5 device work in
+        # docs/RESEARCH-SPRINGBOARD.md. Time does not help; 240s is enough
+        # to prove the stable state each run.
         run: |
           MSGREF=$(llvm-nm kernel/kernel.development.sweet | grep ' _msgbufp$' | awk '{print $1}')
           echo "_msgbufp = 0x$MSGREF"
@@ -135,8 +137,8 @@ jobs:
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
-            --highmem --no-logo --secs 1200 --dump-ramdisk \
-            --snap-every 30 \
+            --highmem --no-logo --secs 240 --dump-ramdisk \
+            --snap-every 20 \
             --msgbuf-dump "0x$MSGREF" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
