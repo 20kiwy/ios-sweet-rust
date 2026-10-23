@@ -98,6 +98,7 @@ jobs:
 
       - name: Boot md0 = mini-root with the real SWEET kernel (highmem)
         run: |
+          rm -f mini-root.img   # payload embeds the ramdisk copy; free disk
           ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW_URL" out-m3 \
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \

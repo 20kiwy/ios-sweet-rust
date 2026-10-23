@@ -564,8 +564,9 @@ pub fn run(
 
     let PlacedImage { phys_base, image: img, boot_args_pa, entry_pa, mem_size } =
         build_image(&payload)?;
-    let mut ram_bin = out.join("ram.bin");
-    std::fs::write(&ram_bin, &img)?;
+    // QEMU's generic loader rejects files >= 2GiB (get_image_size() is a
+    // signed int) - split the image into chunks loaded at consecutive PAs.
+    let loader_parts = write_loader_chunks(&out, "ram.bin", &img, phys_base)?;
     let stub_bin = out.join("stub.bin");
     std::fs::write(&stub_bin, stub(boot_args_pa, entry_pa))?;
     eprintln!(
@@ -617,8 +618,19 @@ pub fn run(
         "-D",
         &out.join("qemu.log").display().to_string(),
         "-no-reboot",
-        "-device",
-        &format!("loader,file={},addr={phys_base:#x},force-raw=on", ram_bin.display()),
+    ]);
+    // payload image: one loader device per <=1.5GiB chunk, consecutive PAs
+    for (p, off) in &loader_parts {
+        cmd.args([
+            "-device",
+            &format!(
+                "loader,file={},addr={:#x},force-raw=on",
+                p.display(),
+                phys_base + off
+            ),
+        ]);
+    }
+    cmd.args([
         "-device",
         &format!("loader,file={},addr={STUB_PA:#x},force-raw=on", stub_bin.display()),
         "-device",
@@ -704,7 +716,9 @@ pub fn run(
         result.set("qemu_returncode", J::n(qemu_rc.unwrap_or(-1) as f64));
     }
     std::fs::write(out.join("result.json"), format!("{}\n", result.dump()))?;
-    let _ = std::fs::remove_file(&ram_bin);
+    for (p, _) in &loader_parts {
+        let _ = std::fs::remove_file(p);
+    }
     if let Some(lf) = logo_file {
         let _ = std::fs::remove_file(lf);
     }
@@ -740,6 +754,31 @@ pub fn run(
         result_json: out.join("result.json"),
         result,
     })
+}
+
+/// QEMU's generic loader rejects files >= 2GiB (get_image_size() returns a
+/// signed int). Split the boot image into <=1.5GiB chunks; each chunk gets
+/// its own `-device loader` at phys_base + offset (guest RAM ends up
+/// byte-identical to the single-file case).
+const LOADER_CHUNK: usize = 1_500_000_000;
+
+fn write_loader_chunks(
+    out: &Path,
+    base: &str,
+    img: &[u8],
+    phys_base: u64,
+) -> Result<Vec<(std::path::PathBuf, u64)>> {
+    let _ = phys_base;
+    let n = img.len().div_ceil(LOADER_CHUNK).max(1);
+    let mut parts = Vec::with_capacity(n);
+    for i in 0..n {
+        let s = i * LOADER_CHUNK;
+        let e = (s + LOADER_CHUNK).min(img.len());
+        let p = out.join(format!("{base}.{i:03}"));
+        std::fs::write(&p, &img[s..e])?;
+        parts.push((p, (i * LOADER_CHUNK) as u64));
+    }
+    Ok(parts)
 }
 
 /// Extract the `_iso_font` glyph table from an unstripped kernel via llvm-nm.
@@ -799,8 +838,7 @@ pub fn spawn_session(
 
     let PlacedImage { phys_base, image: img, boot_args_pa, entry_pa, mem_size } =
         build_image(&payload)?;
-    let ram_bin = out.join("ram.bin");
-    std::fs::write(&ram_bin, &img)?;
+    let loader_parts = write_loader_chunks(&out, "ram.bin", &img, phys_base)?;
     let stub_bin = out.join("stub.bin");
     std::fs::write(&stub_bin, stub(boot_args_pa, entry_pa))?;
     eprintln!(
@@ -894,8 +932,18 @@ pub fn spawn_session(
         "-D",
         &out.join("qemu.log").display().to_string(),
         "-no-reboot",
-        "-device",
-        &format!("loader,file={},addr={phys_base:#x},force-raw=on", ram_bin.display()),
+    ]);
+    for (p, off) in &loader_parts {
+        cmd.args([
+            "-device",
+            &format!(
+                "loader,file={},addr={:#x},force-raw=on",
+                p.display(),
+                phys_base + off
+            ),
+        ]);
+    }
+    cmd.args([
         "-device",
         &format!("loader,file={},addr={STUB_PA:#x},force-raw=on", stub_bin.display()),
         "-device",
