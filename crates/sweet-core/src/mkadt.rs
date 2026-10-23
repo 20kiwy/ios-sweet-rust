@@ -13,14 +13,17 @@ pub const MEM_SIZE: u64 = 0x4d00_0000;
 pub const PANIC_LOG_SIZE: u64 = 0x100000;
 /// --highmem (phone only): the whole upper DDR bank.
 pub const HIGH_PHYS_BASE: u64 = 0x1_0000_0000;
-/// Bank sized so the ~4.2GiB md0 (mini root + dyld shared cache) fits:
-/// ramdisk end = 0x1FD330000, DRAM top after the panic-log carve =
-/// 0x1FEC00000 (~25MB headroom). It must stay UNDER 4GiB: crossing xnu's
-/// ncl_table 4GB row changes the whole BSD memory scaling and this
-/// DEVELOPMENT kernel VERIFY-panics in mbinit (uipc_mbuf.c:1743) with the
-/// 128MB pool (ncl=49152 pins the pool but the rest of the scaling still
-/// differs). 0xff00_0000 keeps -m at exactly 7G on QEMU virt.
-pub const HIGH_MEM_SIZE: u64 = 0xff00_0000;
+/// The proven highmem bank (the only configuration where xnu reached
+/// launchd and dyld mapped the shared cache successfully). It is SMALL on
+/// purpose: >=4GiB crosses xnu's ncl_table row and every
+/// bsd_scale_setup-derived limit changes with it — measured failures at
+/// 4GiB: mbinit VERIFY panic (uipc_mbuf.c:1743) unpinned, and with
+/// ncl=49152 pinned the boot reaches launchd but dyld then fails
+/// "Library not loaded: /usr/lib/libSystem.B.dylib". At 0xff000000 with
+/// the big root, arm_init died in current_percpu_base (NULL per-cpu base).
+/// The bank top must therefore bound the ramdisk: keep the mini root
+/// (with the dyld shared cache) under ~3.9GiB — see rootfs.rs mini_keep.
+pub const HIGH_MEM_SIZE: u64 = 0xfcc0_0000;
 /// /arm-io children are relative to this; must not be 0 (serial_init bails).
 pub const SOC_BASE: u64 = 0x0100_0000;
 
