@@ -241,6 +241,25 @@ reality beats the original guess.
   `--snap-every N` — interval framebuffer screenshots (fresh sequential
   QMP connections, guest keeps running) that screen-decode turns into
   the launchd log TIMELINE in artifacts.
+* **The first wave lives — system domain STABLE (run 40023667468, 2026-10-23).**
+  With the first wave in the root, the kernel msgbuf recorded the full
+  exec cascade: distnoted, bluetoothd, logd, watchdogd, mediaserverd,
+  notifyd, configd, keybagd, backboardd, containermanagerd, lockdownd,
+  usermanagerd, fairplayd.H2, IOMFB_FDR_Loader, WirelessRadioManagerd —
+  all by 39.1s, all through the real xpcproxy trampoline. keybagd made
+  successful AppleKeyStore kernel calls (SWEET AKS sel 0 -> 0x0). The
+  `--snap-every 20` timeline (fb-0020..fb-0200.txt) shows launchd's log
+  settling at 39.6s: present daemons running (`Successfully spawned
+  logd[69]`, bluetoothd[63] running), missing ones parked ("Service
+  setup event to handle failure and will not launch until it fires") —
+  200 s of steady state, no crash loops, no panics. xpcproxy's inventory
+  named the next absent binaries: /usr/libexec/remoted, fseventsd,
+  thermalmonitord (all added now). Next goal: the user domain's main job
+  com.apple.SpringBoard (WILL_SPAWN-cycling on its binary since the
+  xpcproxy run) — the app bundle joins the mini root and its os_log is
+  mirrored to the console (CONSOLE_LABELS) so its startup names the
+  next wall (M5/M6 services: com.apple.backboard.display.services,
+  com.apple.iohideventsystem).
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —

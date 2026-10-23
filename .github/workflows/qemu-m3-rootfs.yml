@@ -150,7 +150,7 @@ jobs:
             ls -la "$D"
             # launchd + usermanagerd file logs and any panic-adjacent text
             strings -n 8 "$D" | grep -aE \
-              'launchd|usermanagerd|mobile|getpwnam|libinfo|muser|keybag|persona|UIKitApplication|exit reason|unable to|failed|xpcproxy|user/501|WILL_SPAWN|Early boot complete' \
+              'launchd|usermanagerd|mobile|getpwnam|libinfo|muser|keybag|persona|UIKitApplication|exit reason|unable to|failed|xpcproxy|user/501|WILL_SPAWN|Early boot complete|Successfully spawned|Missing executable|SpringBoard|backboardd' \
               > out-m3/guest-strings.txt || true
             wc -l out-m3/guest-strings.txt || true
             # the launchd log file itself is plaintext: pull its head/tail

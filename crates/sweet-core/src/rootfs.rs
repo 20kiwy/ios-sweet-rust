@@ -69,6 +69,10 @@ fn mini_keep_libexec(path: &str) -> bool {
         "/usr/libexec/configd",
         "/usr/libexec/watchdogd",
         "/usr/libexec/tccd",
+        // named by xpcproxy's own inventory (run 40023667468):
+        "/usr/libexec/remoted",
+        "/usr/libexec/fseventsd",
+        "/usr/libexec/thermalmonitord",
     ];
     FIRST_WAVE.contains(&path)
 }
@@ -80,12 +84,11 @@ fn mini_keep(path: &str, is_dir: bool) -> bool {
     // top-level real directories ride along empty (dir records are free):
     // /dev (devfs mountpoint — bsd_init.c devfs_kernel_mount), /cores, /bin…
     let top_dir = is_dir && top_level;
-    // NOTE: /usr/libexec (daemon binaries) and /System/Library/CoreServices
-    // are deliberately NOT in the mini profile yet: they grow the md0 past
-    // the proven 0xfcc00000 highmem bank and xnu's >=4GiB BSD scaling is
-    // broken in this kernel build (see mkadt HIGH_MEM_SIZE). launchd
-    // tolerates missing daemons at this stage; the DSC carries the
-    // frameworks. They return once the >=4GiB path is solved (or the
+    // NOTE: the rest of /usr/libexec (daemon binaries) and most of
+    // /System/Library/CoreServices are deliberately NOT in the mini profile:
+    // they grow the md0 past the proven 0xfcc00000 highmem bank and xnu's
+    // >=4GiB BSD scaling is broken in this kernel build (see mkadt
+    // HIGH_MEM_SIZE). They return once the >=4GiB path is solved (or the
     // selection is trimmed).
     let prefixes = [
         "/private/etc/",
@@ -98,7 +101,27 @@ fn mini_keep(path: &str, is_dir: bool) -> bool {
         "/usr/local/",
         "/usr/share/",
     ];
-    prefixes.iter().any(|p| path.starts_with(p)) || top_symlink || top_dir || mini_keep_libexec(path)
+    prefixes.iter().any(|p| path.starts_with(p))
+        || top_symlink
+        || top_dir
+        || mini_keep_libexec(path)
+        || mini_keep_coreservices(path)
+}
+
+/// `mini` profile: the user-domain goal (M7) — SpringBoard's app bundle.
+/// Run 40023667468 proved the system domain STABLE: every first-wave daemon
+/// exec'd by 39.1s (backboardd, configd, keybagd — successful AKS kernel
+/// calls — lockdownd, watchdogd, containermanagerd, usermanagerd,
+/// mediaserverd, logd, bluetoothd, notifyd, distnoted, fairplayd.H2,
+/// IOMFB_FDR_Loader, WirelessRadioManagerd), then the console went quiet —
+/// no crash loops, no panics, 200s of steady state. Meanwhile the user
+/// domain's main job com.apple.SpringBoard has been WILL_SPAWN-cycling on
+/// its missing binary since the xpcproxy run (user/501/com.apple.SpringBoard).
+/// The DSC already carries its frameworks (UIKit, BackBoardServices, ...);
+/// the app bundle is the binary + Info.plist + resources.
+fn mini_keep_coreservices(path: &str) -> bool {
+    path.starts_with("/System/Library/CoreServices/SpringBoard.app/")
+        || path == "/System/Library/CoreServices/OTACrashCopier"
 }
 
 struct Builder<'a> {
@@ -287,6 +310,8 @@ fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
         "com.apple.logd",
         "com.apple.configd",
         "com.apple.watchdogd",
+        "com.apple.SpringBoard", // the user-domain goal: its os_log is the
+                                  // M7 wall map (dyld/Info.plist/services)
     ];
     let raw = vol.read_file(fid)?;
     let mut p = plist_parse(&raw)?;
