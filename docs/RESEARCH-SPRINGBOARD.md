@@ -260,6 +260,21 @@ reality beats the original guess.
   mirrored to the console (CONSOLE_LABELS) so its startup names the
   next wall (M5/M6 services: com.apple.backboard.display.services,
   com.apple.iohideventsystem).
+* **SpringBoard execs — the real shell is alive (run 40029781267, 2026-10-23).**
+  With the app bundle present, the kernel msgbuf recorded
+  `exec SpringBoard` at 31.88s: pid 5, **priority 160, 330 MB jetsam
+  limit** — the real SpringBoard profile launchd assigns on hardware.
+  The binary came straight from the IPSW's CoreServices (+7.5 MB md0),
+  validated by xpcproxy (access X_OK) and exec'd against the DSC. The
+  whole xpcproxy-named set joined: fseventsd, remoted, thermalmonitord,
+  OTACrashCopier (running). **Zero exit events in the kernel ring** and
+  no re-exec of SpringBoard for the rest of the boot: the shell process
+  was alive and idle-blocked, not crash-looping. payload 3.9496 GB
+  (bank headroom ~293 MB). Wall now: the Mach bootstrap service
+  ecosystem — SpringBoard + backboardd alive but the
+  display-services/HID negotiations produce no console traffic yet; the
+  32-38 s startup-log window fell between the 20 s snapshots, so the
+  next run closes the gap with --snap-every 5.
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —
