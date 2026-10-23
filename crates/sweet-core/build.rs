@@ -37,4 +37,14 @@ fn main() {
         m.file(dir.join(f));
     }
     m.compile("miniz_vendored");
+
+    // libzbitmap: Apple's LZBITMAP (decmpfs algo 13/14) — clean-room decoder.
+    let mut z = cc::Build::new();
+    z.include(dir)
+        .flag_if_supported("-O2")
+        .flag_if_supported("-fno-stack-protector")
+        .warnings(false);
+    println!("cargo:rerun-if-changed=src/vendor/libzbitmap.c");
+    z.file(dir.join("libzbitmap.c"));
+    z.compile("libzbitmap_vendored");
 }

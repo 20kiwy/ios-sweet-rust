@@ -838,6 +838,17 @@ fn parse_node_hdr(b: &[u8]) -> (u16, u16, u32) {
     (flags, level, nkeys)
 }
 
+/// Test hook for the private decmpfs decompress entry.
+#[cfg(test)]
+pub(crate) fn decompress_for_test(
+    algo: u32,
+    usize_: usize,
+    inline: &[u8],
+    rsrc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    decompress(algo, usize_, inline, rsrc)
+}
+
 /// (key_off, key_len, val_off, val_len) — offsets absolute in the node block.
 type Ent = (usize, usize, usize, usize);
 
@@ -948,6 +959,82 @@ fn decompress(algo: u32, usize_: usize, inline: &[u8], rsrc: Option<&[u8]>) -> R
                 Ok(out)
             }
         }
+        14 => {
+            // LZBITMAP: same u32le offset-table layout as algo 12, but each
+            // 64K decmpfs chunk is a complete LZBITMAP stream (ZBM\x09 magic,
+            // 32K sub-chunks, terminator; trailing pad ignored by decoder).
+            let rsrc = rsrc.ok_or_else(|| crate::Error::Msg("algo needs resource fork".into()))?;
+            if rsrc.len() < 8 {
+                bail!("rsrc too small for offset list");
+            }
+            let n = rsrc.len() / 4;
+            let mut off_list = Vec::with_capacity(n);
+            for i in 0..n {
+                off_list.push(u32le(rsrc, i * 4) as usize);
+            }
+            if off_list.len() < 2 {
+                bail!("zbitmap offset list too short");
+            }
+            // one table entry per chunk; the last chunk may be short
+            let nchunks = usize_.div_ceil(0x10000);
+            if nchunks == 0 {
+                bail!("zbitmap: zero-size file");
+            }
+            if off_list.len() < nchunks + 1 {
+                bail!(
+                    "zbitmap: table has {} entries, want {} chunks",
+                    off_list.len(),
+                    nchunks
+                );
+            }
+            let mut out = vec![0u8; nchunks * 0x10000];
+            let mut k = 0usize;
+            while k < nchunks {
+                let (s, e) = (off_list[k], off_list[k + 1]);
+                if e > rsrc.len() || s >= e {
+                    bail!("zbitmap chunk {k} range bad: {s}..{e}");
+                }
+                let dcap = (usize_ - (k << 16)).min(0x10000);
+                let dst = &mut out[(k << 16)..(k << 16) + dcap];
+                if rsrc[s] & 0x0F == 0x0F {
+                    // raw-stored chunk (incompressible tail): flag byte 0xF?
+                    // + uncompressed bytes, same convention as algo 4.
+                    let raw = &rsrc[s + 1..e];
+                    if raw.len() != dcap {
+                        bail!("zbitmap raw chunk {k}: got {} bytes, want {dcap}", raw.len());
+                    }
+                    dst.copy_from_slice(raw);
+                } else {
+                    let mut out_len = 0usize;
+                    let rc = unsafe {
+                        zbm_decompress(
+                            dst.as_mut_ptr(),
+                            dst.len(),
+                            rsrc[s..e].as_ptr(),
+                            e - s,
+                            &mut out_len,
+                        )
+                    };
+                    if rc != 0 {
+                        if std::env::var("SWEET_ZBM_DEBUG").is_ok() {
+                            let head = &rsrc[s..e.min(s + 24)];
+                            let hx: String = head.iter().map(|b| format!("{b:02x} ")).collect();
+                            eprintln!(
+                                "zbm chunk {k} rc={rc}: rsrc {s}..{e} ({} bytes), head: {hx}",
+                                e - s
+                            );
+                        }
+                        bail!("zbitmap chunk {k} failed: rc={rc}");
+                    }
+                    if out_len != dcap {
+                        bail!("zbitmap chunk {k}: got {out_len}, want {dcap}");
+                    }
+                }
+                k += 1;
+            }
+            out.truncate(usize_);
+            Ok(out)
+        }
         a => bail!("decmpfs algo {a} not supported"),
     }
 }
@@ -976,6 +1063,15 @@ impl LibLzfseExact {
 extern "C" {
     #[link_name = "lzfse_decode_buffer"]
     fn lzfse_raw(dst: *mut u8, dst_size: usize, src: *const u8, src_size: usize, scratch: *mut u8) -> usize;
+
+    // vendored clean-room LZBITMAP decoder (eafer/libzbitmap, MIT)
+    fn zbm_decompress(
+        dest: *mut u8,
+        dest_size: usize,
+        src: *const u8,
+        src_size: usize,
+        out_len: *mut usize,
+    ) -> i32;
 }
 
 fn be32(b: &[u8], o: usize) -> u32 {

@@ -7,7 +7,9 @@ code comes from the original sources, driven from Rust through FFI).
 | --- | --- | --- | --- |
 | `lzfse_*.c/h`, `lzvn_*.c/h`, `lzfse_internal.h`, `lzfse_tunables.h`, `lzfse_fse.*` | [lzfse/lzfse](https://github.com/lzfse/lzfse) (Apple) | BSD-3-Clause (`LICENSE.lzfse`) | `bvx2/bvxn/bvn` LZFSE blocks of IM4P payloads (kernelcache, DeviceTree, all_flash assets) |
 | `miniz.c`, `miniz.h` | [richgel999/miniz](https://github.com/richgel999/miniz) | MIT (`LICENSE.miniz`) | zlib inflate (PNG decode, IPSW zip members) + deflate (PNG encode) + CRC32 |
+| `libzbitmap.c`, `libzbitmap.h` | [eafer/libzbitmap](https://github.com/eafer/libzbitmap) (Corellium, clean-room) | MIT (`LICENSE.libzbitmap`) | decmpfs algo 13/14 LZBITMAP transparent decompression (dyld shared cache sub-caches in the SystemOS cryptex) |
 
-Both libraries are compiled by `build.rs` with the `cc` crate and linked into
+All libraries are compiled by `build.rs` with the `cc` crate and linked into
 `sweet-core`; Rust only declares the FFI symbols (`lzfse_decode_buffer`,
-`lzfse_encode_buffer`, `mz_uncompress2`, `mz_compress2`, `mz_crc32`).
+`lzfse_encode_buffer`, `mz_uncompress2`, `mz_compress2`, `mz_crc32`,
+`zbm_decompress`).

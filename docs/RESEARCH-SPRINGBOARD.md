@@ -144,6 +144,28 @@ reality beats the original guess.
   explicit VFS mountpoint set + a pre-ship boot-critical-closure verifier
   (`mkiosroot` now asserts `/dev`, `/sbin/launchd`, 491 daemon plists,
   `SystemVersion.plist`, DSC before the image ships).
+* **The dyld wall — libSystem not loadable (run 39992149493, 2026-10-23).**
+  With `/dev` fixed, launchd got one dyld step further and died with its own
+  exit reason: `Library not loaded: /usr/lib/libSystem.B.dylib ... (no such
+  file, no dyld cache)` — dyld refuses an INCOMPLETE shared cache, and
+  libSystem exists only inside it on iOS. The per-file skip report (994c974)
+  had already named the exact 3 skipped files: all three dyld shared cache
+  sub-caches (`dyld_shared_cache_arm64.28/.42.dyldlinkedit` + `.symbols`,
+  0.89 GiB), all blocked by decmpfs algo 14.
+* **The LZBITMAP fix.** decmpfs algo 13/14 (Apple "LZBITMAP", used by the
+  SystemOS cryptex for the DSC sub-caches) had no public decoder; Corellium
+  published a clean-room MIT implementation (eafer/libzbitmap), now vendored
+  like LZFSE/miniz. Format, verified against the real IPSW bytes: rsrc fork
+  = u32le offset table (same layout as algo 12) + chunks; each 64K chunk is
+  either a complete LZBITMAP stream (`ZBM\x09` magic, `{len u24, decmp_len
+  u24}` sub-chunks of ≤32 KiB, literal + 3 metadata areas + 17-byte trailing
+  bitmap table, `decmp_len=0` terminator, zero pad) or raw-stored
+  (`0xF?` flag byte + plain bytes) for incompressible tails. All three
+  sub-caches decode byte-exact (sizes match the decmpfs records; outputs
+  begin with a genuine `dyld_v1   arm64` cache header); round-trip unit test
+  added. mkiosroot no longer skips anything for algo 14: the mini root now
+  carries the COMPLETE dyld shared cache, so dyld can resolve
+  `/usr/lib/libSystem.B.dylib` for launchd.
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —

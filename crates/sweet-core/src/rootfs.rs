@@ -158,18 +158,9 @@ impl<'a> Builder<'a> {
             self.skip(path, "excluded: mediaserverd crash loop (v12)");
             return Ok(());
         }
-        // decmpfs algo 14 (LZBITMAP) is not implemented yet: the affected
-        // files are DSC companion metadata (.dyldlinkedit etc), not boot-
-        // critical. Count and skip honestly.
-        if let Some(dec) = vol.xattr(fid, "com.apple.decmpfs") {
-            if dec.len() >= 12 && &dec[4..8] == b"fpmc" {
-                let algo = u32::from_le_bytes(dec[8..12].try_into().unwrap());
-                if algo == 14 {
-                    self.skip(path, "decmpfs algo 14 LZBITMAP not implemented");
-                    return Ok(());
-                }
-            }
-        }
+        // decmpfs algo 14 (LZBITMAP) is implemented now (vendored
+        // libzbitmap): the dyld shared cache sub-caches ride the standard
+        // decmpfs path below. Nothing is skipped for this reason anymore.
         // plist surgery: edit before writing
         let modified: Option<Vec<u8>> = if self.tweaks {
             if path == "/System/Library/xpc/launchd.plist" {

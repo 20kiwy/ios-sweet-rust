@@ -212,6 +212,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "ipsw-find" => cmd_ipsw_find(rest),
         "ipsw-file" => cmd_ipsw_file(rest),
         "ipsw-stat" => cmd_ipsw_stat(rest),
+        "decmp-dump" => cmd_decmp_dump(rest),
         "rootfs-plan" => cmd_rootfs_plan(rest),
         "mkiosroot" => cmd_mkiosroot(rest),
         "screen-decode" => cmd_screen_decode(rest),
@@ -263,6 +264,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "demo-kernel" => vec!["color", "strip", "png"],
         "hello-extract" => vec!["lang", "ipsw"],
         "mkiosroot" => vec!["os", "systemos", "appos", "profile", "out"],
+        "decmp-dump" => vec!["member", "out", "bytes", "scan", "rsrc"],
         "rootfs-plan" => vec![],
         "screen-decode" => vec!["kernel", "payload", "nm"],
         "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp"],
@@ -650,6 +652,144 @@ fn cmd_ipsw_stat(args: &[String]) -> Result<()> {
             }
             println!("  +{:03}: {hexs} {le}", i * 8);
         }
+        }
+    }
+    Ok(())
+}
+
+/// decmp-dump: reverse-engineering aid for exotic decmpfs algos (14 LZBitmap).
+/// Opens ANY dmg member of the IPSW (default: the rootfs member), resolves a
+/// path and dumps the decmpfs record + resource-fork head/chunks for offline
+/// format analysis. Never part of the boot path.
+///
+///   decmp-dump <IPSW|URL|DMG> <PATH> [--member NAME] [--out PREFIX] [--bytes N]
+fn cmd_decmp_dump(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("decmp-dump"));
+    let Some(src) = f.rest.first() else {
+        bail!("usage: decmp-dump <IPSW|URL|DMG> <PATH> [--member NAME] [--out PREFIX] [--bytes N]");
+    };
+    let Some(path) = f.rest.get(1) else {
+        bail!("usage: decmp-dump <IPSW|URL|DMG> <PATH> [--member NAME] [--out PREFIX] [--bytes N]");
+    };
+    let nbytes = f.num("bytes", 4096) as usize;
+    let prefix = f.val("out").unwrap_or_else(|| "/tmp/decmp".into());
+
+    // open the requested member (default: largest stored dmg = rootfs)
+    let (member, boxed, size): (String, Box<dyn sc::dmg::ByteSource>, u64) =
+        if !src.starts_with("http") && local_is_raw_dmg(src)? {
+            let m = std::path::Path::new(src)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "vol.dmg".into());
+            (m, Box::new(sc::dmg::FileSource::open(std::path::Path::new(src))?), {
+                std::fs::File::open(src)?.metadata()?.len()
+            })
+        } else {
+            let m: String = match f.val("member") {
+                Some(m) => m.to_string(),
+                None => rootfs_member(src)?,
+            };
+            let ms = sc::dmg::MemberSource::open(src, &m)?;
+            let sz = ms.size;
+            (m, Box::new(ms) as Box<dyn sc::dmg::ByteSource>, sz)
+        };
+    let dmg = sc::dmg::Dmg::open_auto(boxed, size)?;
+    let mut vol = sc::apfs::Apfs::open(dmg)?;
+    println!("member {member}, path {path}");
+
+    if f.has("scan") {
+        // list every decmpfs-compressed file of this volume grouped by algo,
+        // with per-algo totals — locates the smallest sample of each algo.
+        let mut per: std::collections::BTreeMap<u32, (u64, u64, Option<(u64, String)>)> = std::collections::BTreeMap::new();
+        let mut n = 0u64;
+        for (p, fid) in vol.walk_all() {
+            let Some(dec) = vol.xattr(fid, "com.apple.decmpfs") else {
+                continue;
+            };
+            if dec.len() < 16 || &dec[4..8] != b"fpmc" {
+                continue;
+            }
+            let algo = u32::from_le_bytes(dec[8..12].try_into().unwrap());
+            let usize_ = u64::from_le_bytes(dec[12..20].try_into().unwrap());
+            let e = per.entry(algo).or_insert((0, 0, None));
+            e.0 += 1;
+            e.1 += usize_;
+            let is_smaller = match &e.2 {
+                Some((best, _)) => usize_ < *best,
+                None => true,
+            };
+            if is_smaller {
+                e.2 = Some((usize_, p.clone()));
+            }
+            n += 1;
+        }
+        println!("scan: {n} decmpfs files, by algo:");
+        for (algo, (cnt, bytes, smallest)) in &per {
+            let s = match smallest {
+                Some((sz, p)) => format!("smallest {sz}B: {p}"),
+                None => "-".into(),
+            };
+            println!("  algo {algo}: {cnt} files, {bytes} bytes total; {s}");
+        }
+        return Ok(());
+    }
+
+    let fid = vol.resolve(path)?;
+    let st = vol.stat(fid);
+    println!("fid {fid} stat {st:?}");
+    let Some(dec) = vol.xattr(fid, "com.apple.decmpfs").cloned() else {
+        bail!("no decmpfs xattr on {path}");
+    };
+    println!("decmpfs xattr: {} bytes", dec.len());
+    for (i, c) in dec[..dec.len().min(96)].chunks(16).enumerate() {
+        let hexs: String = c.iter().map(|b| format!("{b:02x} ")).collect();
+        let asc: String = c.iter().map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
+        println!("  +{:03x}: {hexs} {asc}", i * 16);
+    }
+    if dec.len() >= 16 && &dec[4..8] == b"fpmc" {
+        let algo = u32::from_le_bytes(dec[8..12].try_into().unwrap());
+        let usize_ = u64::from_le_bytes(dec[12..20].try_into().unwrap());
+        println!("algo {algo}, uncompressed size {usize_} ({} MiB)", usize_ >> 20);
+        println!("inline payload after 16B hdr: {} bytes", dec.len().saturating_sub(20));
+    }
+
+    // resource fork (resolved through the dstream if huge)
+    let rsrc = vol.xattr_resolved(fid, "com.apple.ResourceFork")?;
+    match rsrc {
+        None => println!("no resource fork"),
+        Some(r) => {
+            println!("rsrc fork: {} bytes ({} MiB)", r.len(), r.len() >> 20);
+            let head = r.len().min(256);
+            for (i, c) in r[..head].chunks(16).enumerate() {
+                let hexs: String = c.iter().map(|b| format!("{b:02x} ")).collect();
+                let asc: String = c.iter().map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
+                println!("  +{:06x}: {hexs} {asc}", i * 16);
+            }
+            // find ZBM magics in the head + at chunk boundaries
+            let mut zbm = Vec::new();
+            for i in 0..r.len().saturating_sub(4) {
+                if &r[i..i + 3] == b"ZBM" {
+                    zbm.push(i);
+                    if zbm.len() > 8 {
+                        break;
+                    }
+                }
+            }
+            println!("first ZBM magics at: {zbm:?}");
+            std::fs::write(format!("{prefix}.rsrc-head.bin"), &r[..head])?;
+            if f.has("rsrc") {
+                let path = format!("{prefix}.rsrc.bin");
+                std::fs::write(&path, &r)?;
+                println!("wrote full rsrc fork to {path} ({} bytes)", r.len());
+            }
+            if let Some(&z0) = zbm.first() {
+                let take = nbytes.min(r.len() - z0);
+                std::fs::write(format!("{prefix}.chunk0.bin"), &r[z0..z0 + take])?;
+                println!(
+                    "wrote {prefix}.rsrc-head.bin ({}B) + {prefix}.chunk0.bin (ZBM at {z0:#x}, {}B)",
+                    head, take
+                );
+            }
         }
     }
     Ok(())

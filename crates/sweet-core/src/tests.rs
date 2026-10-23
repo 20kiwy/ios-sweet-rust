@@ -747,3 +747,105 @@ fn hfs_catalog_dev_mountpoint() {
     img.finish("cat").unwrap();
     let _ = std::fs::remove_file(&img_path);
 }
+
+/// LZBITMAP (decmpfs algo 14) round-trip through the vendored clean-room
+/// codec: zbm_compress (C) produces a complete stream (magic + sub-chunks +
+/// terminator); the algo-14 path must unwrap it from the decmpfs offset
+/// table and reproduce the input byte-exactly — both the ZBM form and the
+/// raw-stored form (flag byte 0xF? + plain bytes) that Apple's compressor
+/// emits for incompressible chunks (observed on the real dyld sub-caches).
+#[test]
+fn decmpfs_algo14_zbitmap_roundtrip() {
+    extern "C" {
+        fn zbm_compress(
+            dest: *mut u8,
+            dest_size: usize,
+            src: *const u8,
+            src_size: usize,
+            out_len: *mut usize,
+        ) -> i32;
+        fn zbm_decompress(
+            dest: *mut u8,
+            dest_size: usize,
+            src: *const u8,
+            src_size: usize,
+            out_len: *mut usize,
+        ) -> i32;
+    }
+    // pseudo-random but deterministic payload > 32K so the stream holds
+    // several sub-chunks, with runs of zeros like real linkedit data
+    let mut src = vec![0u8; 100_000];
+    let mut x = 0x12345678u32;
+    for i in (0..src.len()).step_by(7) {
+        x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+        src[i] = (x >> 24) as u8;
+    }
+
+    // compress (query size first, then encode)
+    let mut cap = 0usize;
+    let rc = unsafe { zbm_compress(std::ptr::null_mut(), 0, src.as_ptr(), src.len(), &mut cap) };
+    assert_eq!(rc, 0, "zbm_compress size query failed");
+    let mut stream = vec![0u8; cap];
+    let mut clen = 0usize;
+    let rc = unsafe { zbm_compress(stream.as_mut_ptr(), stream.len(), src.as_ptr(), src.len(), &mut clen) };
+    assert_eq!(rc, 0, "zbm_compress failed");
+    stream.truncate(clen);
+    // a zbm stream of the whole buffer must decode whole (direct FFI check)
+    let mut whole = vec![0u8; src.len() + 64];
+    let mut out_len = 0usize;
+    let rc = unsafe {
+        zbm_decompress(whole.as_mut_ptr(), whole.len(), stream.as_ptr(), clen, &mut out_len)
+    };
+    assert_eq!(rc, 0, "direct zbm_decompress failed");
+    assert_eq!(out_len, src.len());
+    assert_eq!(&whole[..out_len], &src[..], "direct zbm round-trip mismatch");
+
+    // wrap as decmpfs algo-14 resource fork the way Apple lays it out:
+    // each decmpfs chunk (<= 64K output) is its OWN independent zbm stream;
+    // table = [off0 = table end, off1, off2...], streams concatenated after.
+    let mut streams: Vec<Vec<u8>> = Vec::new();
+    for piece in src.chunks(0x10000) {
+        let mut c = 0usize;
+        let rc = unsafe { zbm_compress(std::ptr::null_mut(), 0, piece.as_ptr(), piece.len(), &mut c) };
+        assert_eq!(rc, 0);
+        let mut buf = vec![0u8; c];
+        let mut n = 0usize;
+        let rc = unsafe { zbm_compress(buf.as_mut_ptr(), buf.len(), piece.as_ptr(), piece.len(), &mut n) };
+        assert_eq!(rc, 0);
+        buf.truncate(n);
+        streams.push(buf);
+    }
+    let mut rsrc = vec![0u8; 4 * (streams.len() + 1)];
+    let table_end = (4 * (streams.len() + 1)) as u32;
+    // off[0] = table end = chunk 0 start; off[i+1] = end of chunk i
+    rsrc[..4].copy_from_slice(&table_end.to_le_bytes());
+    let mut pos = table_end;
+    for (i, s) in streams.iter().enumerate() {
+        pos += s.len() as u32;
+        rsrc[(i + 1) * 4..(i + 2) * 4].copy_from_slice(&pos.to_le_bytes());
+    }
+    for s in &streams {
+        rsrc.extend_from_slice(s);
+    }
+    let got = crate::apfs::decompress_for_test(14, src.len(), &[], Some(&rsrc)).unwrap();
+    assert_eq!(got, src, "zbm stream round-trip mismatch");
+
+    // raw-stored chunks (flag byte 0xF? + uncompressed bytes): the real
+    // files show these tile at 64K just like ZBM streams
+    let raw_src: Vec<u8> = (0..70_000u32).map(|i| (i * 2654435761 >> 24) as u8).collect();
+    let pieces: Vec<&[u8]> = raw_src.chunks(0x10000).collect();
+    let mut rsrc2 = vec![0u8; 4 * (pieces.len() + 1)];
+    let table_end2 = (4 * (pieces.len() + 1)) as u32;
+    rsrc2[..4].copy_from_slice(&table_end2.to_le_bytes());
+    let mut pos2 = table_end2;
+    for (i, p) in pieces.iter().enumerate() {
+        pos2 += 1 + p.len() as u32; // flag byte + payload
+        rsrc2[(i + 1) * 4..(i + 2) * 4].copy_from_slice(&pos2.to_le_bytes());
+    }
+    for p in &pieces {
+        rsrc2.push(0xFF);
+        rsrc2.extend_from_slice(p);
+    }
+    let got2 = crate::apfs::decompress_for_test(14, raw_src.len(), &[], Some(&rsrc2)).unwrap();
+    assert_eq!(got2, raw_src, "raw chunk round-trip mismatch");
+}
