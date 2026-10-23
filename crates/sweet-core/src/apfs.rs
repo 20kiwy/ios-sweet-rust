@@ -455,6 +455,19 @@ impl Apfs {
         Ok(cur)
     }
 
+    /// Directory test by inode mode (S_IFDIR). The "has children" heuristic
+    /// misclassifies EMPTY directories — on the real rootfs /dev and /cores
+    /// are empty dirs; /dev is the XNU devfs_kernel_mount mountpoint
+    /// (bsd_init.c), without which launchd dies with
+    /// "failed to reserve stdin descriptor: /dev/null: 2".
+    fn is_dir_fid(&self, fid: u64) -> bool {
+        if let Some(&(mode, ..)) = self.inodes.get(&fid) {
+            return (mode & 0o170000) == 0o040000;
+        }
+        // no inode record: fall back to the children heuristic
+        self.dirs.contains_key(&fid)
+    }
+
     /// Sorted directory listing: (name, fid, is_dir).
     pub fn list_dir(&self, dir: u64) -> Vec<(String, u64, bool)> {
         let mut v: Vec<(String, u64, bool)> = self
@@ -462,7 +475,7 @@ impl Apfs {
             .get(&dir)
             .map(|m| {
                 m.iter()
-                    .map(|(n, f)| (n.clone(), *f, self.dirs.contains_key(f)))
+                    .map(|(n, f)| (n.clone(), *f, self.is_dir_fid(*f)))
                     .collect()
             })
             .unwrap_or_default();
@@ -734,7 +747,9 @@ impl Apfs {
     pub fn walk_meta(&self) -> Vec<(String, u64, bool, u64)> {
         let mut out: Vec<(String, u64, bool, u64)> = Vec::new();
         for (path, fid) in self.walk_all() {
-            let is_dir = !self.list_dir(fid).is_empty();
+            // authoritative: the inode's S_IFDIR bits (empty dirs like /dev
+            // have no children and would otherwise be treated as files)
+            let is_dir = self.is_dir_fid(fid);
             let paddr = self
                 .extents_for(fid)
                 .and_then(|e| e.iter().map(|e| e.pbn).min())

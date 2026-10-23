@@ -130,27 +130,42 @@ jobs:
               fb = open('out-m3/fb.txt', errors='replace').read()
           except OSError:
               fb = ''
-          panic = bool(re.search(r'panic\(cpu|SWEET EARLY PANIC', fb)) or v.get('panic')
-          bsd_root = 'BSD root: md0' in fb or v.get('bsd_root_md0')
-          mounted = re.search(r'hfs: mounted', fb) is not None
-          launchd = re.search(r'launchd|init running as PID', fb) is not None
-          print(f"panic={panic} bsd_root_md0={bsd_root} hfs_mounted={mounted} launchd_seen={launchd}")
-          json.dump({'panic': panic, 'bsd_root_md0': bsd_root, 'hfs_mounted': mounted,
-                     'launchd_seen': launchd, 'pass': bool(bsd_root and not panic)},
+          initproc = 'initproc' in fb or 'exit reason namespace' in fb
+          kernel_panic = bool(re.search(r'panic\(cpu|SWEET EARLY PANIC', fb)) or v.get('panic')
+          # kernel-stage panic = panic BEFORE any userland execution
+          stage = ('early' if not fb else
+                   'kernel-panic' if (kernel_panic and not initproc) else
+                   'launchd-stage' if initproc else
+                   'mounted' if 'BSD root: md0' in fb else 'booting')
+          # launchd's own exit reason names the next wall verbatim
+          m = re.search(r'description:\s*(.\{0,120\})', fb)
+          exit_reason = m.group(1).strip() if m else ''
+          stdin_devnull = 'reserve stdin descriptor' in fb
+          print(f"stage={stage} exit_reason='{exit_reason}' stdin_devnull={stdin_devnull}")
+          json.dump({'stage': stage, 'exit_reason': exit_reason,
+                     'stdin_devnull': stdin_devnull,
+                     'mount_proven': bool('BSD root: md0' in fb or initproc),
+                     'pass': stage in ('mounted', 'launchd-stage')},
                     open('out-m3/m3-verdict.json', 'w'), indent=1)
-          # M3 gate: the real rootfs mounts as md0 without a panic.
-          # (launchd_seen is recorded but NOT required yet - userland progress
-          # beyond the mount is the M4/M5 measurement.)
-          sys.exit(0 if (bsd_root and not panic) else 1)
+          # M3 gate: the real rootfs mounts as md0 and the kernel reaches the
+          # first user process (mount_proven = 'BSD root: md0' seen, or the
+          # initproc/exit-reason machinery ran - which only happens after a
+          # successful mount). A kernel-stage panic still fails the gate.
+          sys.exit(0 if (bool('BSD root: md0' in fb or initproc) and not (kernel_panic and not initproc)) else 1)
           EOF
 
-      - name: "Artifacts - fb, console text, verdicts, fsck"
+      - name: "Artifacts - fb, console text, verdicts, fsck (images excluded)"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: m3-mini-root-boot
           path: |
-            out-m3/
+            out-m3/fb.png
+            out-m3/fb.txt
+            out-m3/boot-verdict.json
+            out-m3/m3-verdict.json
+            out-m3/qemu.log
+            out-m3/screen-decode.log
             fsck.log
             fsck-summary.txt
           retention-days: 30

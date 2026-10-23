@@ -37,19 +37,25 @@ fn mini_keep_sysos(path: &str) -> bool {
 
 /// `mini` profile inclusion (boot-critical closure for launchd).
 fn mini_keep(path: &str, is_dir: bool) -> bool {
-    let top_symlink = !is_dir && !path[1..].contains('/');
+    let top_level = !path[1..].contains('/');
+    let top_symlink = !is_dir && top_level;
+    // top-level real directories ride along empty (dir records are free):
+    // /dev (devfs mountpoint — bsd_init.c devfs_kernel_mount), /cores, /bin…
+    let top_dir = is_dir && top_level;
     let prefixes = [
         "/private/etc/",
         "/System/Library/LaunchDaemons/",
         "/System/Library/xpc/",
+        "/System/Library/CoreServices/",
         "/usr/lib/",
+        "/usr/libexec/",
         "/usr/bin/",
         "/usr/sbin/",
         "/sbin/",
         "/usr/local/",
         "/usr/share/",
     ];
-    prefixes.iter().any(|p| path.starts_with(p)) || top_symlink
+    prefixes.iter().any(|p| path.starts_with(p)) || top_symlink || top_dir
 }
 
 struct Builder<'a> {
@@ -402,6 +408,27 @@ pub fn build(
         b.ensure_dir_path(d, 0, 0, 0o755)?;
     }
 
+    // ---- VFS mountpoints + boot-critical dirs the volume may not carry ----
+    // XNU mounts devfs ON /dev (bsd_init.c devfs_kernel_mount) and launchd
+    // opens /dev/null for fd 0; a missing mountpoint was the M3 wall
+    // ("failed to reserve stdin descriptor: /dev/null: 2"). Upstream's
+    // apfs-fuse + rsync flow synthesized some of these; our writer creates
+    // them explicitly. Idempotent with the walk results.
+    for (d, mode) in [
+        ("/dev", 0o755u16),
+        ("/mnt", 0o755),
+        ("/private/tmp", 0o1777),
+        ("/private/var/tmp", 0o1777),
+        ("/private/var/run", 0o755),
+        ("/private/var/vm", 0o755),
+        ("/private/var/empty", 0o711),
+        ("/private/var/root", 0o750),
+        ("/private/var/db/launchd.db", 0o755),
+        ("/private/var/db/xpc", 0o755),
+    ] {
+        b.ensure_dir_path(d, 0, 0, mode)?;
+    }
+
     plan_files.sort_by_key(|(_, _, p)| *p);
     sys_files.sort_by_key(|(_, _, p)| *p);
     app_files.sort_by_key(|(_, _, p)| *p);
@@ -588,6 +615,13 @@ pub fn build(
         );
     }
 
+    // ---- verify the boot-critical closure BEFORE shipping the image ----
+    // (a missing /dev cost a full CI round-trip to discover)
+    {
+        let cat = b.img.catalog();
+        verify_boot_critical(&cat, sysos.is_some(), &|m| progress(m))?;
+    }
+
     // ---- finalize: catalog + bitmap + volume headers ----
     progress("finish: catalog b-tree");
     let report = Report {
@@ -605,5 +639,75 @@ fn split_parent(path: &str) -> (String, &str) {
     match path.rfind('/') {
         Some(0) | None => ("/".to_string(), &path[1..]),
         Some(i) => (path[..i].to_string(), &path[i + 1..]),
+    }
+}
+
+/// Assert the paths the boot needs (see docs/research/userspace-deps.md and
+/// xnu bsd_init.c / launchd): devfs mountpoint, init program, daemon plists,
+/// SystemVersion, dyld shared cache when a cryptex source was given.
+fn verify_boot_critical(
+    cat: &[crate::hfs::CatEntry],
+    sysos: bool,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    use crate::hfs::CatEntry;
+    let find = |p: &str| cat.iter().find(|e: &&CatEntry| e.path == p);
+    let mut missing: Vec<String> = Vec::new();
+    for d in [
+        "/dev",
+        "/mnt",
+        "/private/var",
+        "/private/etc",
+        "/sbin",
+        "/usr/lib",
+        "/usr/libexec",
+        "/System/Library/LaunchDaemons",
+        "/System/Library/CoreServices",
+        "/System/Library/xpc",
+    ] {
+        match find(d) {
+            Some(e) if e.is_dir => {}
+            Some(_) => missing.push(format!("{d} (exists but is NOT a dir)")),
+            None => missing.push(format!("{d} (missing dir)")),
+        }
+    }
+    for f in ["/sbin/launchd", "/System/Library/CoreServices/SystemVersion.plist"] {
+        if !matches!(find(f), Some(e) if !e.is_dir && e.size > 0) {
+            missing.push(format!("{f} (missing file)"));
+        }
+    }
+    let ndaemons = cat
+        .iter()
+        .filter(|e| !e.is_dir && e.path.starts_with("/System/Library/LaunchDaemons/"))
+        .count();
+    if ndaemons < 100 {
+        missing.push(format!(
+            "/System/Library/LaunchDaemons plists ({ndaemons} < 100)"
+        ));
+    }
+    if sysos {
+        let dsc = cat
+            .iter()
+            .any(|e| {
+                !e.is_dir
+                    && e.path.starts_with("/System/Library/Caches/com.apple.dyld/dyld_shared_cache")
+            });
+        if !dsc {
+            missing.push(
+                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache* (missing DSC)".into(),
+            );
+        }
+    }
+    if missing.is_empty() {
+        progress(&format!(
+            "verify: boot-critical closure OK (dev dir, launchd, {ndaemons} daemons, CoreServices, DSC={})",
+            sysos
+        ));
+        Ok(())
+    } else {
+        Err(crate::Error::Msg(format!(
+            "boot-critical closure INCOMPLETE: {}",
+            missing.join(", ")
+        )))
     }
 }

@@ -21,6 +21,14 @@ pub const BLOCK: u32 = 4096;
 pub const ROOT_PARENT: u32 = 1;
 pub const ROOT_ID: u32 = 2;
 
+/// One catalog entry as reported by [`HfsImage::catalog`].
+pub struct CatEntry {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mode: u16,
+}
+
 const VH_SIG: u16 = 0x4858; // 'HX' — HFSX (case-sensitive variant, per mkfs.hfsplus -s)
 const HFS_VERSION: u16 = 5; // HFSX (case-sensitive)
 const LAST_MOUNTED: u32 = 0x3130_2E31; // '10.1'
@@ -286,6 +294,41 @@ impl HfsImage {
             self.f.write_all(&vec![0u8; pad])?;
         }
         Ok(id)
+    }
+
+    /// In-memory catalog walk: full paths for everything registered so far.
+    /// Post-build verification without a file reader (mkiosroot asserts the
+    /// boot-critical closure — /dev mountpoint, launchd, DSC — before the
+    /// image ships to a 25-minute CI boot).
+    pub fn catalog(&self) -> Vec<CatEntry> {
+        let mut byid: std::collections::HashMap<u32, (u32, &str)> =
+            std::collections::HashMap::new();
+        for n in &self.nodes {
+            byid.insert(n.id, (n.parent, n.name.as_str()));
+        }
+        let mut out: Vec<CatEntry> = Vec::with_capacity(self.nodes.len());
+        for n in &self.nodes {
+            let mut parts: Vec<&str> = vec![n.name.as_str()];
+            let mut p = n.parent;
+            while p != ROOT_ID {
+                match byid.get(&p) {
+                    Some(&(pp, pn)) => {
+                        parts.push(pn);
+                        p = pp;
+                    }
+                    None => break, // dangling parent: shouldn't happen
+                }
+            }
+            parts.reverse();
+            out.push(CatEntry {
+                path: format!("/{}", parts.join("/")),
+                is_dir: matches!(n.kind, Kind::Dir),
+                size: n.size,
+                mode: n.mode,
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
     }
 
     /// Lay down bitmap, B-trees, volume headers. The image is complete

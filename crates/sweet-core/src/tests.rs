@@ -708,3 +708,42 @@ fn plist_roundtrip_real_launchd() {
     let job2 = daemons2.get(first.0).expect("same job in rewritten plist");
     assert_eq!(first.1, job2);
 }
+
+#[test]
+fn hfs_catalog_dev_mountpoint() {
+    // M3 regression: the real rootfs /dev is an EMPTY directory; the reader's
+    // old "has children" rule misclassified it as a file, mkiosroot dropped
+    // it, XNU devfs_kernel_mount("/dev") failed and launchd died with
+    // "failed to reserve stdin descriptor: /dev/null: 2".
+    // The writer must register empty dirs and report them via catalog().
+    let dir = std::env::temp_dir().join("sweet-hfs-catalog-test");
+    let _ = std::fs::create_dir_all(&dir);
+    let img_path = dir.join("cat-test.img");
+    let mut img = crate::hfs::HfsImage::create(&img_path, 64).unwrap();
+    let dev = img.add_dir(crate::hfs::ROOT_ID, "dev", 0, 0, 0o755).unwrap();
+    assert!(dev > 0);
+    let private = img.add_dir(crate::hfs::ROOT_ID, "private", 0, 0, 0o755).unwrap();
+    let etc = img.add_dir(private, "etc", 0, 0, 0o755).unwrap();
+    let ld = img.add_dir(etc, "LaunchDaemons", 0, 0, 0o755).unwrap();
+    let _ = img
+        .add_file(ld, "com.apple.backboardd.plist", 0, 0, 0o644, 8, &mut |s, off, len| {
+            s.write_file_chunk(off, b"<plist/>")
+        })
+        .unwrap();
+    let cat = img.catalog();
+    let dev_e = cat.iter().find(|e| e.path == "/dev").expect("/dev in catalog");
+    assert!(dev_e.is_dir, "/dev must classify as a directory");
+    let ld_e = cat
+        .iter()
+        .find(|e| e.path == "/private/etc/LaunchDaemons")
+        .expect("nested dir path");
+    assert!(ld_e.is_dir);
+    let pl = cat
+        .iter()
+        .find(|e| e.path == "/private/etc/LaunchDaemons/com.apple.backboardd.plist")
+        .expect("nested file path");
+    assert!(!pl.is_dir && pl.size == 8);
+    // finish() must not clobber the catalog contents
+    img.finish("cat").unwrap();
+    let _ = std::fs::remove_file(&img_path);
+}
