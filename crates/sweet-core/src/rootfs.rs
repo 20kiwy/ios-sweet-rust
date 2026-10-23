@@ -148,6 +148,14 @@ struct Builder<'a> {
     /// planned and written bytes (the DSC subcache mystery cost a day)
     skip_log: Vec<(String, String)>,
     tweaks: bool,
+    /// per-daemon plist surgery diagnostics (run 40039029991: the boot
+    /// showed ZERO daemon os_log even after the per-file tweak landed —
+    /// these counters decide whether the tweak applied at all, was bypassed
+    /// by the shared-extent path, or failed to parse)
+    daemon_plists: u32,
+    daemon_shared: u32,
+    daemon_tweaked: Vec<String>,
+    daemon_errors: Vec<String>,
     progress: &'a dyn Fn(&str),
 }
 
@@ -196,6 +204,9 @@ impl<'a> Builder<'a> {
     ) -> Result<()> {
         if let Some(cnid) = self.seen.get(&(tag, fid)) {
             let cnid = *cnid;
+            if path.starts_with("/System/Library/LaunchDaemons/") && path.ends_with(".plist") {
+                self.daemon_shared += 1;
+            }
             let id = self.img.add_file_shared(parent, name, cnid)?;
             self.index.insert(path.to_string(), id);
             return Ok(());
@@ -248,10 +259,21 @@ impl<'a> Builder<'a> {
                 && path.ends_with(".plist")
             {
                 // per-daemon os_log mirror (CONSOLE_LABELS) — the monolithic
-                // tweak matched none of these (see tweak_daemon_plist)
-                match vol.read_file(fid) {
-                    Ok(raw) => tweak_daemon_plist(raw).unwrap_or(None),
-                    Err(_) => None,
+                // tweak matched none of these (see tweak_daemon_plist).
+                // Errors are NOT swallowed: a parse failure must show up in
+                // the CI log (run 40039029991 had zero daemon output and no
+                // way to tell 'tweak never ran' from 'tweak failed').
+                self.daemon_plists += 1;
+                match vol.read_file(fid).and_then(tweak_daemon_plist) {
+                    Ok(Some((bytes, label))) => {
+                        self.daemon_tweaked.push(label);
+                        Some(bytes)
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        self.daemon_errors.push(format!("{path}: {e}"));
+                        None
+                    }
                 }
             } else if path.contains("MediaToolbox.framework")
                 && path.ends_with("SubServerConfiguration.plist")
@@ -414,7 +436,7 @@ fn progress_note(msg: &str) {
 /// produced no console traffic — the invisible-wall problem.
 /// Same surgery as the monolithic tweak, matched on the file's inner
 /// Label (authoritative), so a wrong label name just no-ops.
-fn tweak_daemon_plist(raw: Vec<u8>) -> Result<Option<Vec<u8>>> {
+fn tweak_daemon_plist(raw: Vec<u8>) -> Result<Option<(Vec<u8>, String)>> {
     let p = plist_parse(&raw)?;
     let Some(label) = p
         .as_dict()
@@ -445,7 +467,7 @@ fn tweak_daemon_plist(raw: Vec<u8>) -> Result<Option<Vec<u8>>> {
         env.insert("CFLOG_FORCE_STDERR".into(), Plist::Str("1".into()));
         d.insert("EnvironmentVariables".into(), Plist::Dict(env));
     }
-    Ok(Some(plist_write(&p)?))
+    Ok(Some((plist_write(&p)?, label)))
 }
 
 fn tweak_subserver(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
@@ -594,6 +616,10 @@ pub fn build(
         skipped: 0,
         skip_log: Vec::new(),
         tweaks,
+        daemon_plists: 0,
+        daemon_shared: 0,
+        daemon_tweaked: Vec::new(),
+        daemon_errors: Vec::new(),
         progress,
     };
     b.index.insert("/".into(), ROOT_ID);
@@ -661,6 +687,26 @@ pub fn build(
             let parent = b.ensure_dir_path(&parent, 0, 0, 0o755)?;
             b.put_file(v, 2, *fid, path, parent, name)?;
         }
+    }
+
+    // ---- per-daemon plist surgery report ----
+    // (run 40039029991: zero daemon os_log on the console and NO way to
+    // tell 'tweak never matched' from 'tweak failed to parse' — this line
+    // decides it in the CI log)
+    if tweaks {
+        progress(&format!(
+            "daemon plists: {} seen, {} shared-extent bypasses, {} os_log-mirrored ({}), {} parse failures{}",
+            b.daemon_plists,
+            b.daemon_shared,
+            b.daemon_tweaked.len(),
+            b.daemon_tweaked.join(", "),
+            b.daemon_errors.len(),
+            if b.daemon_errors.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", b.daemon_errors.join("; "))
+            }
+        ));
     }
 
     // ---- DSC cache links (shared extents: zero extra bytes) ----
