@@ -134,6 +134,8 @@ jobs:
           ls -la out-m3
           echo "===== msgbuf console history (head 200 lines) ====="
           head -200 out-m3/msgbuf.txt 2>/dev/null || echo "(msgbuf.txt missing)"
+          echo "===== msgbuf console history (tail 60 lines — early-boot-complete lands here) ====="
+          tail -60 out-m3/msgbuf.txt 2>/dev/null || echo "(msgbuf.txt missing)"
 
       - name: Guest-side logs (launchd + daemons, from the md0 dump)
         # The console only shows kernel panics; launchd and the daemons write
@@ -147,7 +149,7 @@ jobs:
             ls -la "$D"
             # launchd + usermanagerd file logs and any panic-adjacent text
             strings -n 8 "$D" | grep -aE \
-              'launchd|usermanagerd|mobile|getpwnam|libinfo|muser|keybag|persona|UIKitApplication|exit reason|unable to|failed' \
+              'launchd|usermanagerd|mobile|getpwnam|libinfo|muser|keybag|persona|UIKitApplication|exit reason|unable to|failed|xpcproxy|user/501|WILL_SPAWN|Early boot complete' \
               > out-m3/guest-strings.txt || true
             wc -l out-m3/guest-strings.txt || true
             # the launchd log file itself is plaintext: pull its head/tail
@@ -171,41 +173,68 @@ jobs:
           wc -c out-m3/fb.txt || true
           cat out-m3/boot-verdict.json || true
 
-      - name: M3 verdict
+      - name: M3 verdict (v2 — launchd-positive stages)
+        # Run 40018794158 (2026-10-23) redefined success: with the symlink fix,
+        # Apple's real launchd COMPLETED EARLY BOOT ([System Event] boot:
+        # "Early boot complete. Continuing system boot.", msgbuf 33.15s) and
+        # the fbcon flooded with its os_log user-domain spawn cycle
+        # (user/501: SpringBoard, tccd — every spawn dying on the missing
+        # /usr/libexec/xpcproxy trampoline). The kernel messages (BSD root:
+        # md0) scrolled off the LAST fb screen, and the launchd os_log mirror
+        # writes straight to the fbcon WITHOUT entering the kernel msgbuf —
+        # so the two windows are complementary and must be read together:
+        #   fb.txt    = last console screen  = the live launchd log tail
+        #   msgbuf.txt= 128 KiB kernel ring  = boot up to early-boot-complete
+        # Stages, best first:
+        #   user-domain        fb shows launchd spawning in user/501
+        #   launchd-early-boot msgbuf shows "Early boot complete"
+        #   launchd-exec       msgbuf shows "exec launchd" (no completion)
+        #   mounted            BSD root: md0 seen, no launchd yet
+        #   kernel-panic       panic before launchd exec'd
+        #   booting/early      not enough signal yet
         run: |
-          cat out-m3/fb.txt 2>/dev/null | tail -40 || true
+          tail -40 out-m3/fb.txt 2>/dev/null || true
           python3 - <<'EOF'
           import json, re, sys
           v = json.load(open('out-m3/boot-verdict.json'))
-          try:
-              fb = open('out-m3/fb.txt', errors='replace').read()
-          except OSError:
-              fb = ''
-          # the fbcon wraps at ~54 columns, often mid-word ("exit re|ason"):
-          # match verdict stages on the FLATTENED text
+          def read(p):
+              try:
+                  return open(p, errors='replace').read()
+              except OSError:
+                  return ''
+          fb, mb = read('out-m3/fb.txt'), read('out-m3/msgbuf.txt')
           fb_flat = re.sub(r'\s+', ' ', fb)
-          initproc = 'initproc' in fb_flat or 'exit reason namespace' in fb_flat
-          kernel_panic = bool(re.search(r'panic\(cpu|SWEET EARLY PANIC', fb_flat)) or v.get('panic')
-          # kernel-stage panic = panic BEFORE any userland execution
-          stage = ('early' if not fb else
-                   'kernel-panic' if (kernel_panic and not initproc) else
-                   'launchd-stage' if initproc else
-                   'mounted' if 'BSD root: md0' in fb_flat else 'booting')
-          # launchd's own exit reason names the next wall verbatim
-          m = re.search(r'description:\s*(.{0,140}?)(?:handshake|Please go to|$)', fb_flat)
+          mb_flat = re.sub(r'\s+', ' ', mb)
+          both = fb_flat + ' || ' + mb_flat
+          # the fbcon wraps at ~54 columns, often mid-word: match on FLATTENED text
+          execd_launchd = 'exec launchd' in both
+          early_boot = 'Early boot complete' in both
+          user_domain = 'user/501' in fb_flat
+          spawn_cycle = 'WILL_SPAWN' in fb_flat or 'service state: spawning' in fb_flat
+          initproc = 'initproc' in both or 'exit reason namespace' in both
+          kernel_panic = bool(re.search(r'panic\(cpu|SWEET EARLY PANIC', both)) or v.get('panic')
+          stage = ('early' if not (fb or mb) else
+                   'kernel-panic' if (kernel_panic and not execd_launchd) else
+                   'user-domain' if (user_domain and spawn_cycle) else
+                   'launchd-early-boot' if early_boot else
+                   'launchd-exec' if execd_launchd else
+                   'mounted' if 'BSD root: md0' in both else 'booting')
+          # launchd's own exit reason names the next wall verbatim (if it died)
+          m = re.search(r'description:\s*(.{0,140}?)(?:handshake|Please go to|$)', both)
           exit_reason = m.group(1).strip() if m else ''
-          stdin_devnull = 'reserve stdin descriptor' in fb_flat
-          print(f"stage={stage} exit_reason='{exit_reason}' stdin_devnull={stdin_devnull}")
+          mount_proven = 'BSD root: md0' in both or initproc or early_boot
+          print(f"stage={stage} exit_reason='{exit_reason}' early_boot={early_boot} user_domain={user_domain} spawn_cycle={spawn_cycle}")
           json.dump({'stage': stage, 'exit_reason': exit_reason,
-                     'stdin_devnull': stdin_devnull,
-                     'mount_proven': bool('BSD root: md0' in fb_flat or initproc),
-                     'pass': stage in ('mounted', 'launchd-stage')},
+                     'early_boot': early_boot, 'user_domain': user_domain,
+                     'spawn_cycle': spawn_cycle, 'stdin_devnull': 'reserve stdin descriptor' in both,
+                     'mount_proven': mount_proven,
+                     'pass': stage in ('mounted', 'launchd-exec', 'launchd-early-boot', 'user-domain')},
                     open('out-m3/m3-verdict.json', 'w'), indent=1)
-          # M3 gate: the real rootfs mounts as md0 and the kernel reaches the
-          # first user process (mount_proven = 'BSD root: md0' seen, or the
-          # initproc/exit-reason machinery ran - which only happens after a
-          # successful mount). A kernel-stage panic still fails the gate.
-          sys.exit(0 if (bool('BSD root: md0' in fb_flat or initproc) and not (kernel_panic and not initproc)) else 1)
+          # M3 gate: the real rootfs mounts as md0 AND the real launchd execs
+          # (early-boot-complete or user-domain spawning is the proven state);
+          # a kernel-stage panic still fails the gate.
+          ok = mount_proven and execd_launchd and not (kernel_panic and not execd_launchd)
+          sys.exit(0 if ok else 1)
           EOF
 
       - name: "Artifacts - fb, console text, verdicts, fsck, guest logs (images excluded)"

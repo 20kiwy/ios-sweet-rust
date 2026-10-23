@@ -201,6 +201,29 @@ reality beats the original guess.
   path. Fix: strip the full header (xattr_resolved; handles dstream-backed
   targets too). Regression test added. This also un-corrupts /var, /tmp
   and every other symlink the daemons use.
+* **MILESTONE — launchd early boot COMPLETE; the xpcproxy wall (run 40018794158, 2026-10-23).**
+  The symlink fix (907efd0) un-bricked the resolver: the real launchd exec'd
+  at 30.58s, resolved `mobile` (the flat-file module finally read
+  /etc/master.passwd through a clean /etc symlink), ran its real boot tasks
+  (mount-phase/data-protection/restore-datapartition/init-with-data-volume/
+  fips/keybag/usermanagerd/tzinit/prng_seedctl — the absent ones "Skipping
+  boot-task" as designed), listened on TCP 49152 + 62078 (lockdownd's port —
+  the real network stack driven by the real launchd), and at 33.15s printed
+  its own milestone: `[Event: boot] Early boot complete. Continuing system
+  boot.` — then kept running (no exit, no panic for the whole 240 s boot)
+  while cycling the user/501 (mobile) domain: SpringBoard, tccd and friends
+  in WILL_SPAWN/spawn-scheduled/throttle loops. Two observability facts
+  learned: (a) the launchd os_log mirror writes straight to the fbcon
+  WITHOUT entering the kernel msgbuf ring (the ring ends at
+  "Early boot complete"; fb.txt and msgbuf.txt are complementary windows);
+  (b) the kernel messages scroll off the last fb screen once launchd floods
+  the console — the verdict must read BOTH. The next wall names itself in
+  every spawn: `Could not spawn process /usr/libexec/xpcproxy: 2: No such
+  file or directory` — launchd's spawn TRAMPOLINE (launchd -> xpcproxy ->
+  exec target, both domains) is /usr/libexec-resident and the mini profile
+  had excluded the directory. Fix: add `/usr/libexec/xpcproxy` to
+  mini_keep_libexec (+ boot-closure verifier assertion); verdict v2 with
+  launchd-positive stages (user-domain / launchd-early-boot / launchd-exec).
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —

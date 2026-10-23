@@ -41,8 +41,15 @@ fn mini_keep_sysos(path: &str) -> bool {
 /// opendirectoryd/DarwinDirectory/usermanagementd; usermanagerd IS the user
 /// database resolver). Without it launchd dies with
 /// "unable to resolve 'mobile': 114 - The specified username does not exist".
+///
+/// xpcproxy is launchd's spawn TRAMPOLINE: every job spawn (system AND user
+/// domains) goes launchd -> posix_spawn("/usr/libexec/xpcproxy") -> exec
+/// target. Run 40018794158 (launchd early-boot complete) died at the NEXT
+/// wall with "Could not spawn process /usr/libexec/xpcproxy: 2: No such file
+/// or directory" on every service — user/501 SpringBoard + tccd included.
+/// Without it not a single daemon can ever exec.
 fn mini_keep_libexec(path: &str) -> bool {
-    path == "/usr/libexec/usermanagerd"
+    path == "/usr/libexec/usermanagerd" || path == "/usr/libexec/xpcproxy"
 }
 
 /// `mini` profile inclusion (boot-critical closure for launchd).
@@ -755,6 +762,8 @@ fn verify_boot_critical(
         "/sbin/launchd",
         // the libinfo muser backend: getpwnam('mobile') dies without it
         "/usr/libexec/usermanagerd",
+        // the spawn trampoline: every launchd job spawn goes through it
+        "/usr/libexec/xpcproxy",
     ] {
         if !matches!(find(f), Some(e) if !e.is_dir && e.size > 0) {
             missing.push(format!("{f} (missing file)"));
