@@ -71,8 +71,20 @@ struct Builder<'a> {
     files: u64,
     dirs: u64,
     skipped: u64,
+    /// every skip with its reason — CI logs must explain the delta between
+    /// planned and written bytes (the DSC subcache mystery cost a day)
+    skip_log: Vec<(String, String)>,
     tweaks: bool,
     progress: &'a dyn Fn(&str),
+}
+
+impl<'a> Builder<'a> {
+    fn skip(&mut self, path: &str, reason: &str) {
+        self.skipped += 1;
+        if self.skip_log.len() < 200 {
+            self.skip_log.push((path.to_string(), reason.to_string()));
+        }
+    }
 }
 
 impl<'a> Builder<'a> {
@@ -116,7 +128,7 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
         let Some((mode, uid, gid, size)) = vol.stat(fid) else {
-            self.skipped += 1;
+            self.skip(path, "no inode/stat record");
             return Ok(());
         };
         let kind = mode & 0xF000;
@@ -138,12 +150,12 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
         if kind != 0x8000 {
-            self.skipped += 1;
+            self.skip(path, &format!("not a regular file (mode {mode:#o})"));
             return Ok(());
         }
         // excluded: VirtualAudio HAL plugin (mediaserverd crash loop, v12)
         if path.starts_with("/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin") {
-            self.skipped += 1;
+            self.skip(path, "excluded: mediaserverd crash loop (v12)");
             return Ok(());
         }
         // decmpfs algo 14 (LZBITMAP) is not implemented yet: the affected
@@ -153,7 +165,7 @@ impl<'a> Builder<'a> {
             if dec.len() >= 12 && &dec[4..8] == b"fpmc" {
                 let algo = u32::from_le_bytes(dec[8..12].try_into().unwrap());
                 if algo == 14 {
-                    self.skipped += 1;
+                    self.skip(path, "decmpfs algo 14 LZBITMAP not implemented");
                     return Ok(());
                 }
             }
@@ -404,6 +416,7 @@ pub fn build(
         files: 0,
         dirs: 0,
         skipped: 0,
+        skip_log: Vec::new(),
         tweaks,
         progress,
     };
@@ -625,6 +638,14 @@ pub fn build(
     {
         let cat = b.img.catalog();
         verify_boot_critical(&cat, sysos.is_some(), &|m| progress(m))?;
+    }
+
+    // ---- skip report (why planned != written) ----
+    if !b.skip_log.is_empty() {
+        progress(&format!("skip report: {} entries", b.skip_log.len()));
+        for (p, r) in &b.skip_log {
+            progress(&format!("  SKIP {r}: {p}"));
+        }
     }
 
     // ---- finalize: catalog + bitmap + volume headers ----
