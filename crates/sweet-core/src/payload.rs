@@ -178,6 +178,10 @@ pub struct PlacedImage {
     pub boot_args_pa: u64,
     pub entry_pa: u64,
     pub mem_size: u64,
+    /// (phys, size) of the RAMDisk from the payload's ADT
+    /// /chosen/memory-map (present when the payload was built with
+    /// --ramdisk) — lets the boot dump md0's guest RAM post-mortem.
+    pub ramdisk: Option<(u64, u64)>,
 }
 
 /// Parse a SWEETXNU payload and lay it out at physical addresses — port of
@@ -244,12 +248,29 @@ pub fn build_image(payload: &[u8]) -> Result<PlacedImage> {
     }
     img[(ba_pa - phys_base) as usize..(ba_pa - phys_base) as usize + 736]
         .copy_from_slice(&ba);
+    // RAMDisk (phys, size) from the payload's own ADT — the boot needs it
+    // for a post-mortem pmemsave of md0 (launchd's file logs live there).
+    let ramdisk = (|| -> Option<(u64, u64)> {
+        let adt_bytes = &payload[adt_off..adt_off + adt_size];
+        let (root, _) = crate::adt::parse(adt_bytes).ok()?;
+        let chosen = root.children.iter().find(|c| c.name() == "chosen")?;
+        let mmap = chosen.children.iter().find(|c| c.name() == "memory-map")?;
+        let v = mmap.prop("RAMDisk")?;
+        if v.len() < 16 {
+            return None;
+        }
+        Some((
+            u64::from_le_bytes(v[0..8].try_into().ok()?),
+            u64::from_le_bytes(v[8..16].try_into().ok()?),
+        ))
+    })();
     Ok(PlacedImage {
         phys_base,
         image: img,
         boot_args_pa: ba_pa,
         entry_pa: phys_base + (entry_va - virt_base),
         mem_size,
+        ramdisk,
     })
 }
 

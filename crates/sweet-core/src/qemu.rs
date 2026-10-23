@@ -40,6 +40,10 @@ pub struct RunOptions {
     /// NOTES.md 0038 trick). Development kernels do not slide: the nm
     /// address is the runtime VA (upstream verified across boots).
     pub msgbufp: Option<u64>,
+    /// Post-mortem: pmemsave the ADT's RAMDisk (md0) to <outdir>/md0-dump.img
+    /// right before QEMU quits. Launchd and daemons write TEXT logs to files
+    /// on the ramdisk; the console only ever shows kernel panics.
+    pub dump_ramdisk: bool,
 }
 
 impl Default for RunOptions {
@@ -54,6 +58,7 @@ impl Default for RunOptions {
             serial_sock: None,
             ram_file: None,
             msgbufp: None,
+            dump_ramdisk: false,
             qemu_datadir: Vec::new(),
             logo: None,
         }
@@ -633,7 +638,7 @@ pub fn run(
     let out = std::fs::canonicalize(outdir).unwrap_or_else(|_| outdir.to_path_buf());
     std::fs::create_dir_all(&out)?;
 
-    let PlacedImage { phys_base, image: img, boot_args_pa, entry_pa, mem_size } =
+    let PlacedImage { phys_base, image: img, boot_args_pa, entry_pa, mem_size, ramdisk } =
         build_image(&payload)?;
     // QEMU's generic loader rejects files >= 2GiB (get_image_size() is a
     // signed int) - split the image into chunks loaded at consecutive PAs.
@@ -773,6 +778,26 @@ pub fn run(
             match dump_msgbuf(&mut q, mb, "msgbuf.bin") {
                 Ok(()) => eprintln!("msgbuf: dumped 0x20000 bytes to msgbuf.bin"),
                 Err(e) => eprintln!("msgbuf: dump failed: {e}"),
+            }
+        }
+        if opts.dump_ramdisk {
+            if let Some((rd_pa, rd_size)) = ramdisk {
+                let mut args = J::obj();
+                args.set("val", J::n(rd_pa as f64));
+                args.set("size", J::n(rd_size as f64));
+                args.set("filename", J::s(out.join("md0-dump.img").display().to_string()));
+                if let J::Obj(m) = q.call("pmemsave", args)? {
+                    if let Some(J::Obj(e)) = m.get("error") {
+                        eprintln!("qmp pmemsave md0: {e:?}");
+                    } else {
+                        eprintln!(
+                            "md0 dump: {rd_size} bytes @ {rd_pa:#x} -> {}",
+                            out.join("md0-dump.img").display()
+                        );
+                    }
+                }
+            } else {
+                eprintln!("--dump-ramdisk: payload has no RAMDisk entry");
             }
         }
         let _ = p.kill();
@@ -926,7 +951,7 @@ pub fn spawn_session(
     let out = std::fs::canonicalize(outdir).unwrap_or_else(|_| outdir.to_path_buf());
     std::fs::create_dir_all(&out)?;
 
-    let PlacedImage { phys_base, image: img, boot_args_pa, entry_pa, mem_size } =
+    let PlacedImage { phys_base, image: img, boot_args_pa, entry_pa, mem_size, .. } =
         build_image(&payload)?;
     let loader_parts = write_loader_chunks(&out, "ram.bin", &img, phys_base)?;
     let stub_bin = out.join("stub.bin");

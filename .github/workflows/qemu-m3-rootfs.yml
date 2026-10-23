@@ -127,13 +127,36 @@ jobs:
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
-            --highmem --no-logo --secs 240 \
+            --highmem --no-logo --secs 240 --dump-ramdisk \
             --msgbuf-dump "0x$MSGREF" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           ls -la out-m3
           echo "===== msgbuf console history (head 200 lines) ====="
           head -200 out-m3/msgbuf.txt 2>/dev/null || echo "(msgbuf.txt missing)"
+
+      - name: Guest-side logs (launchd + daemons, from the md0 dump)
+        # The console only shows kernel panics; launchd and the daemons write
+        # TEXT logs into files on the md0 ramdisk, which --dump-ramdisk
+        # pmemsave's out of guest RAM before QEMU quits. Grep the raw image
+        # for the log text (small ASCII files are contiguous in the image).
+        if: always()
+        run: |
+          D=out-m3/md0-dump.img
+          if [ -f "$D" ]; then
+            ls -la "$D"
+            # launchd + usermanagerd file logs and any panic-adjacent text
+            strings -n 8 "$D" | grep -aE \
+              'launchd|usermanagerd|mobile|getpwnam|libinfo|muser|keybag|persona|UIKitApplication|exit reason|unable to|failed' \
+              > out-m3/guest-strings.txt || true
+            wc -l out-m3/guest-strings.txt || true
+            # the launchd log file itself is plaintext: pull its head/tail
+            strings -n 8 "$D" | grep -anE 'launchd.log|boot-task|UMD_INIT|com.apple.xpc' | head -80 \
+              > out-m3/guest-launchd-peek.txt || true
+            tail -c 200000 "$D" | strings -n 12 > out-m3/guest-strings-tail.txt || true
+          else
+            echo "no md0 dump (boot exited early?)"
+          fi
 
       - name: Decode the framebuffer console (kernel _iso_font)
         run: |
@@ -185,7 +208,7 @@ jobs:
           sys.exit(0 if (bool('BSD root: md0' in fb_flat or initproc) and not (kernel_panic and not initproc)) else 1)
           EOF
 
-      - name: "Artifacts - fb, console text, verdicts, fsck (images excluded)"
+      - name: "Artifacts - fb, console text, verdicts, fsck, guest logs (images excluded)"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -199,6 +222,9 @@ jobs:
             out-m3/m3-verdict.json
             out-m3/qemu.log
             out-m3/screen-decode.log
+            out-m3/guest-strings.txt
+            out-m3/guest-launchd-peek.txt
+            out-m3/guest-strings-tail.txt
             fsck.log
             fsck-summary.txt
           retention-days: 30

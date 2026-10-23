@@ -1582,6 +1582,7 @@ fn cmd_boot_qemu(args: &[String]) -> Result<()> {
         gdb: f.has("gdb"),
         cpu: f.val("cpu").unwrap_or("cortex-a76").to_string(),
         live_serial: f.has("live-serial"),
+        dump_ramdisk: f.has("dump-ramdisk"),
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()
     };
@@ -1747,6 +1748,7 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         secs,
         cpu: f.val("cpu").unwrap_or("cortex-a76").to_string(),
         live_serial: f.has("live-serial"),
+        dump_ramdisk: f.has("dump-ramdisk"),
         logo: if f.has("no-logo") { None } else { logo_blob.clone() },
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()

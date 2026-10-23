@@ -238,13 +238,30 @@ impl<'a> Builder<'a> {
 }
 
 fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
+    // upstream patch-launchd-plist.py parity: mirror the bring-up-critical
+    // daemons' os_log/stderr to /dev/console (the kernel framebuffer console)
+    // so their output lands in fb.txt; rename _PanicOnCrash so a crashing
+    // daemon does not panic the system; drop CommCenter (baseband).
+    const CONSOLE_LABELS: &[&str] = &[
+        "com.apple.mobile.usermanagerd", // getpwnam/muser: the 'mobile' resolver
+        "com.apple.containermanagerd",   // system containers (backboardd dep)
+        "com.apple.usabilityd",
+        "com.apple.backboardd",
+        "com.apple.keybagd",
+        "com.apple.mediaserverd",
+        "com.apple.lockdown",
+        "com.apple.logd",
+        "com.apple.configd",
+        "com.apple.watchdogd",
+    ];
     let raw = vol.read_file(fid)?;
     let mut p = plist_parse(&raw)?;
     if let Some(d) = p.as_dict_mut() {
         if let Some(Plist::Dict(daemons)) = d.get_mut("LaunchDaemons") {
             let mut renamed = 0usize;
             let mut stdout_renamed = 0usize;
-            for (_, job) in daemons.iter_mut() {
+            let mut consoled = Vec::new();
+            for (label, job) in daemons.iter_mut() {
                 if let Some(jd) = job.as_dict_mut() {
                     if let Some(v) = jd.remove("_PanicOnCrash") {
                         jd.insert("_PanicOnCrasX".into(), v);
@@ -261,6 +278,20 @@ fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
                             stdout_renamed += 1;
                         }
                     }
+                    // upstream patch-launchd-plist.py: mirror os_log to
+                    // stderr for the bring-up-critical daemons so framework
+                    // logs land on the console too (uncaught exceptions,
+                    // BaseBoard/BackBoardServices errors, ...).
+                    if CONSOLE_LABELS.contains(&label.as_str()) {
+                        let mut env = match jd.get("EnvironmentVariables") {
+                            Some(Plist::Dict(e)) => e.clone(),
+                            _ => BTreeMap::new(),
+                        };
+                        env.insert("OS_ACTIVITY_DT_MODE".into(), Plist::Str("YES".into()));
+                        env.insert("CFLOG_FORCE_STDERR".into(), Plist::Str("1".into()));
+                        jd.insert("EnvironmentVariables".into(), Plist::Dict(env));
+                        consoled.push(label.clone());
+                    }
                 }
             }
             let before = daemons.len();
@@ -271,7 +302,9 @@ fn tweak_launchd(vol: &mut Apfs, fid: u64) -> Result<Vec<u8>> {
                     != Some("com.apple.CommCenter")
             });
             progress_note(&format!(
-                "launchd.plist: {renamed} _PanicOnCrash renamed, {stdout_renamed} StandardOut/ErrPath renamed, {} CommCenter jobs removed ({} -> {})",
+                "launchd.plist: {renamed} _PanicOnCrash renamed, {stdout_renamed} StandardOut/ErrPath renamed, {} os_log-mirrored ({}), {} CommCenter jobs removed ({} -> {})",
+                consoled.len(),
+                consoled.join(","),
                 before - daemons.len(),
                 before,
                 daemons.len()
