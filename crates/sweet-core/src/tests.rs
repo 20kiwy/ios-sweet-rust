@@ -899,3 +899,28 @@ fn hmp_x_output_parsing() {
     assert_eq!(qemu::parse_hmp_quads("qemu-system: not a memory dump"), Vec::<u64>::new());
     assert_eq!(qemu::parse_hmp_quad(""), None);
 }
+
+/// Symlink xattr parsing: com.apple.fs.symlink carries a 4-byte j_xattr_val
+/// header ([xflags u16][xdata_len u16]) before the target text. The old
+/// v[2..] slice kept the 2-byte length prefix in the target, corrupting
+/// every HFS+ symlink in the image ("\x0c\x00private/etc") — launchd's
+/// fopen("/etc/master.passwd") then failed and the boot died with
+/// "unable to resolve 'mobile': 114".
+#[test]
+fn symlink_target_strips_full_xattr_header() {
+    // /etc on the real 16.7.16 rootfs: [06 00][0c 00]"private/etc\0"
+    let raw = [
+        0x06, 0x00, 0x0c, 0x00, b'p', b'r', b'i', b'v', b'a', b't', b'e', b'/', b'e', b't', b'c',
+        0x00,
+    ];
+    // the same slice put_file uses now (xattr_resolved's inline path):
+    let xflags = u16::from_le_bytes([raw[0], raw[1]]);
+    let xdata_len = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+    assert_eq!(xflags & 0x1, 0, "inline xattr");
+    let v = &raw[4..(4 + xdata_len).min(raw.len())];
+    let t = String::from_utf8_lossy(v).trim_end_matches('\0').to_string();
+    assert_eq!(t, "private/etc", "target must be clean");
+    // the old buggy slice for contrast:
+    let old = String::from_utf8_lossy(&raw[2..]).trim_end_matches('\0').to_string();
+    assert_ne!(old, "private/etc", "old slice must be the corrupt form");
+}

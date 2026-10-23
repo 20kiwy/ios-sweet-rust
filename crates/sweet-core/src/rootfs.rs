@@ -144,10 +144,16 @@ impl<'a> Builder<'a> {
         let kind = mode & 0xF000;
         if kind == 0xA000 {
             // APFS stores the symlink target in the com.apple.fs.symlink
-            // xattr (value = u16 flags + target text)
-            let t = match vol.xattr(fid, "com.apple.fs.symlink") {
-                Some(v) if v.len() >= 2 => {
-                    String::from_utf8_lossy(&v[2..]).trim_end_matches('\0').to_string()
+            // xattr: [j_xattr_val header: xflags u16 | xdata_len u16] + the
+            // target text (+ NUL). The old v[2..] slice kept the 2-byte
+            // length prefix in the target ("\x0c\x00private/etc"), so every
+            // symlink in the image resolved to a garbage path in the guest —
+            // fopen("/etc/master.passwd") failed and launchd died with
+            // "unable to resolve 'mobile': 114". Strip the full 4-byte
+            // header (xattr_resolved also handles dstream-backed targets).
+            let t = match vol.xattr_resolved(fid, "com.apple.fs.symlink") {
+                Ok(Some(v)) if !v.is_empty() => {
+                    String::from_utf8_lossy(&v).trim_end_matches('\0').to_string()
                 }
                 _ => {
                     let target = vol.read_file(fid)?;

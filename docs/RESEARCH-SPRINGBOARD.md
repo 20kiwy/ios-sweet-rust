@@ -186,6 +186,21 @@ reality beats the original guess.
   usermanagerd's own plist would not have parsed). Verified on hosts,
   group, backboardd/configd/usermanagerd plists; unit test added; both the
   marker and marker-less forms decode verbatim now.
+* **THE 'mobile' wall — corrupted symlink targets (run 40015518091, 2026-10-23).**
+  With usermanagerd present the wall survived; the new msgbuf console-ring
+  dump showed launchd exec'd at 30.5s, mapped the DSC (45x "not in trust
+  cache" warnings the SWEET kernel tolerates), brought up lo0 — and died at
+  31.45s, ~0.9s after exec, BEFORE any daemon could spawn (usermanagerd
+  never had a chance; the muser lookup could not answer). The resolver
+  chain falls through to the flat-file module (/etc/master.passwd — present
+  in the image), which also failed: **put_file sliced the
+  com.apple.fs.symlink xattr at v[2..], keeping the 2-byte length prefix
+  from the 4-byte j_xattr_val header ([xflags u16][xlen u16]) — every HFS+
+  symlink in the image carried the target "\x0c\x00private/etc" instead of
+  "private/etc"**, so fopen("/etc/master.passwd") resolved to a garbage
+  path. Fix: strip the full header (xattr_resolved; handles dstream-backed
+  targets too). Regression test added. This also un-corrupts /var, /tmp
+  and every other symlink the daemons use.
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —
