@@ -104,3 +104,104 @@ mod tests {
         );
     }
 }
+
+
+/// Streaming SHA-256 (image/manifest hashing without whole-file buffers).
+pub struct Sha256 {
+    h: [u32; 8],
+    buf: Vec<u8>,
+    len: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    pub fn new() -> Self {
+        Self {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: Vec::new(),
+            len: 0,
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.len += data.len() as u64;
+        self.buf.extend_from_slice(data);
+        let mut off = 0;
+        while self.buf.len() - off >= 64 {
+            let block: [u8; 64] = self.buf[off..off + 64].try_into().unwrap();
+            sha256_compress(&mut self.h, &block);
+            off += 64;
+        }
+        self.buf.drain(..off);
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bitlen = self.len.wrapping_mul(8);
+        let mut msg = std::mem::take(&mut self.buf);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bitlen.to_be_bytes());
+        for chunk in msg.chunks(64) {
+            sha256_compress(&mut self.h, chunk.try_into().unwrap());
+        }
+        let mut out = [0u8; 32];
+        for (i, w) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out
+    }
+}
+
+fn sha256_compress(h: &mut [u32; 8], chunk: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([
+            chunk[i * 4],
+            chunk[i * 4 + 1],
+            chunk[i * 4 + 2],
+            chunk[i * 4 + 3],
+        ]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let mut v = *h;
+    for i in 0..64 {
+        let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+        let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+        let t1 = v[7]
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+        let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+        let t2 = s0.wrapping_add(maj);
+        v[7] = v[6];
+        v[6] = v[5];
+        v[5] = v[4];
+        v[4] = v[3].wrapping_add(t1);
+        v[3] = v[2];
+        v[2] = v[1];
+        v[1] = v[0];
+        v[0] = t1.wrapping_add(t2);
+    }
+    for i in 0..8 {
+        h[i] = h[i].wrapping_add(v[i]);
+    }
+}

@@ -212,6 +212,9 @@ fn dispatch(args: &[String]) -> Result<()> {
         "ipsw-find" => cmd_ipsw_find(rest),
         "ipsw-file" => cmd_ipsw_file(rest),
         "ipsw-stat" => cmd_ipsw_stat(rest),
+        "rootfs-plan" => cmd_rootfs_plan(rest),
+        "mkiosroot" => cmd_mkiosroot(rest),
+        "screen-decode" => cmd_screen_decode(rest),
         "macho-deps" => cmd_macho_deps(rest),
         "kc-kexts" => cmd_kc_kexts(rest),
         "adt-dump" => cmd_adt_dump(rest),
@@ -256,6 +259,9 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "fb-render" => vec!["w", "h", "logo-scale"],
         "demo-kernel" => vec!["color", "strip", "png"],
         "hello-extract" => vec!["lang", "ipsw"],
+        "mkiosroot" => vec!["os", "systemos", "appos", "profile", "out"],
+        "rootfs-plan" => vec![],
+        "screen-decode" => vec!["kernel", "payload", "nm"],
         "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp"],
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
@@ -411,6 +417,150 @@ fn cmd_ipsw_file(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// rootfs-plan: walk the OS volume and print the full-parity size plan
+/// (file/dir counts, uncompressed bytes, block-rounded data, catalog
+/// estimate) — the input for mkiosroot sizing.
+fn cmd_rootfs_plan(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("rootfs-plan"));
+    let Some(src) = f.rest.first() else { bail!("usage: rootfs-plan <IPSW|URL|DMG>") };
+    let (_member, mut vol) = open_system_volume(src)?;
+    let mut files = 0u64;
+    let mut dirs = 0u64;
+    let mut bytes = 0u64;
+    let mut rounded = 0u64;
+    let mut compressed = 0u64;
+    for (path, fid) in vol.walk_all() {
+        let is_dir = !vol.list_dir(fid).is_empty();
+        if is_dir {
+            dirs += 1;
+            continue;
+        }
+        if let Some((mode, _uid, _gid, size)) = vol.stat(fid) {
+            files += 1;
+            bytes += size;
+            rounded += size.div_ceil(4096) * 4096;
+            if vol.xattr(fid, "com.apple.decmpfs").is_some() {
+                compressed += 1;
+            }
+        }
+        let _ = path;
+    }
+    println!(
+        "OS volume plan: {files} files, {dirs} dirs, uncompressed {bytes} ({} GiB), block-rounded {rounded} ({} GiB), decmpfs-compressed {compressed}",
+        bytes / 2 ^ 30.min(1),
+        rounded / 2 ^ 30.min(1)
+    );
+    Ok(())
+}
+
+/// mkiosroot: build the real iOS HFS+ root image (root-free; the pure-Rust
+/// parity of upstream mkiosroot.sh + sweet-root-tweaks.py).
+///
+///   mkiosroot --os <IPSW|URL|DMG> --out OUT.img [--systemos FILE]
+///             [--appos FILE] [--profile mini|full] [--no-tweaks]
+fn cmd_mkiosroot(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("mkiosroot"));
+    let Some(os_src) = f.val("os") else { bail!("--os <IPSW|URL|DMG> required") };
+    let Some(out) = f.val("out") else { bail!("--out OUT.img required") };
+    let profile = f.val("profile").unwrap_or_else(|| "mini".into());
+    let tweaks = !f.has("no-tweaks");
+    if profile != "mini" && profile != "full" {
+        bail!("--profile must be mini or full");
+    }
+    let (_member, mut os) = open_system_volume(&os_src)?;
+    let mut sysos = match f.val("systemos") {
+        Some(p) => Some(sc::apfs::Apfs::open(sc::dmg::Dmg::open_auto(
+            Box::new(sc::dmg::FileSource::open(std::path::Path::new(&p))?),
+            std::fs::metadata(&p)?.len(),
+        )?)?),
+        None => None,
+    };
+    let mut appos = match f.val("appos") {
+        Some(p) => Some(sc::apfs::Apfs::open(sc::dmg::Dmg::open_auto(
+            Box::new(sc::dmg::FileSource::open(std::path::Path::new(&p))?),
+            std::fs::metadata(&p)?.len(),
+        )?)?),
+        None => None,
+    };
+    let t0 = std::time::Instant::now();
+    let unlink = if f.has("unlink-systemos") {
+        f.val("systemos").map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    let sys_ref = sysos
+        .as_mut()
+        .map(|v| (&mut *v, unlink));
+    let app_ref = appos.as_mut();
+    let report = sc::rootfs::build(
+        &mut os,
+        sys_ref,
+        app_ref,
+        std::path::Path::new(&out),
+        &profile,
+        tweaks,
+        &|msg| eprintln!("[mkiosroot] {msg}"),
+    )?;
+    let sha = {
+        use std::io::Read;
+        let mut h = sc::hash::Sha256::new();
+        let mut fh = std::fs::File::open(&out)?;
+        let mut buf = vec![0u8; 4 << 20];
+        loop {
+            let n = fh.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        sc::hash::hex(&h.finalize())
+    };
+    println!(
+        "[ok] {out}: profile={profile} files={} dirs={} data={:.2} GiB skipped={} blocks={} time={:?} sha256 {sha}",
+        report.files,
+        report.dirs,
+        report.bytes as f64 / (1 << 30) as f64,
+        report.skipped,
+        report.image_blocks,
+        t0.elapsed()
+    );
+    Ok(())
+}
+
+/// screen-decode: turn a booted fb.png back into console text using the
+/// kernel's _iso_font glyph table (exact decode_screen port; needs llvm-nm
+/// on the unstripped kernel + the payload.bin that was booted).
+fn cmd_screen_decode(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("screen-decode"));
+    let Some(png_path) = f.rest.first() else {
+        bail!("usage: screen-decode --kernel K --payload P <fb.png> [--nm llvm-nm]");
+    };
+    let kernel = f.val("kernel").ok_or_else(|| sc::Error::Msg("--kernel required".into()))?;
+    let payload = f.val("payload").ok_or_else(|| sc::Error::Msg("--payload required".into()))?;
+    let nm = f.val("nm").unwrap_or_else(|| "llvm-nm".into());
+    let font = sc::qemu::extract_font(
+        std::path::Path::new(&kernel),
+        &std::fs::read(payload)?,
+        &nm,
+    )?;
+    let img = sc::png::decode(&std::fs::read(png_path)?)?;
+    let mut raw = vec![0u8; (FB_STRIDE_US * FB_H) as usize];
+    for y in 0..img.height.min(FB_H) {
+        for x in 0..img.width.min(FB_W) {
+            let [r, g, b, a] = img.pixel(x, y);
+            let o = (y as usize * FB_STRIDE_US as usize) + x as usize * 4;
+            raw[o] = b;
+            raw[o + 1] = g;
+            raw[o + 2] = r;
+            raw[o + 3] = a;
+        }
+    }
+    let (screen, unknown) = sc::qemu::decode_screen(&raw, &font);
+    print!("{screen}");
+    eprintln!("[screen-decode] unknown glyphs: {unknown}");
+    Ok(())
+}
+
 /// ipsw-stat: diagnostics for one path (fid, mode/uid/gid/size, inode val
 /// length, extents, decmpfs presence) — used to debug rootfs assembly.
 fn cmd_ipsw_stat(args: &[String]) -> Result<()> {
@@ -425,7 +575,49 @@ fn cmd_ipsw_stat(args: &[String]) -> Result<()> {
     println!("inode_val_len {:?}", vol.inode_val_len(fid));
     let xs = vol.xattr(fid, "com.apple.decmpfs").is_some();
     println!("decmpfs: {xs}");
-    if let Some(raw) = vol.inode_raw(fid) {
+    println!("xattrs: {:?}", vol.xattr_names(fid));
+    let exts = vol.extent_list(fid);
+    println!("extents: {} (covered {} bytes)", exts.len(), exts.iter().map(|e| e.2).sum::<u64>());
+    for (i, (la, pb, ln)) in exts.iter().take(4).enumerate() {
+        println!("  ext{i}: laddr={la} pbn={pb} len={ln}");
+    }
+    if let Some(dec) = vol.xattr(fid, "com.apple.decmpfs") {
+        if dec.len() >= 20 {
+            let algo = u32::from_le_bytes([dec[8], dec[9], dec[10], dec[11]]);
+            if algo == 4 || algo == 12 {
+                if let Some(r) = vol.xattr(fid, "com.apple.ResourceFork") {
+                    if r.len() >= 20 {
+                        let oid = u64::from_le_bytes(r[4..12].try_into().unwrap()) & 0x0FFF_FFFF_FFFF_FFFF;
+                        let exts = vol.extent_list(oid);
+                        println!("xattr oid {oid:#x}: {} extents", exts.len());
+                        for (i, (la, pb, ln)) in exts.iter().enumerate() {
+                            println!("  ext{i}: laddr={la} pbn={pb} len={ln}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for n in vol.xattr_names(fid) {
+        if n == "com.apple.ResourceFork" || n == "com.apple.fs.symlink" {
+            if let Some(v) = vol.xattr(fid, &n) {
+                println!("  {n}: {} bytes head={:02x?}", v.len(), &v[..v.len().min(24)]);
+            }
+        }
+    }
+    if let Some(dec) = vol.xattr(fid, "com.apple.decmpfs") {
+        println!(
+            "decmpfs hdr: flags={:#x} len={} magic={:?} algo={} usize={}",
+            u16::from_le_bytes([dec[0], dec[1]]),
+            u16::from_le_bytes([dec[2], dec[3]]),
+            &dec[4..8],
+            u32::from_le_bytes([dec[8], dec[9], dec[10], dec[11]]),
+            u64::from_le_bytes(dec[12..20].try_into().unwrap())
+        );
+        println!("cmpf payload {} bytes", dec.len() - 4 - u16::from_le_bytes([dec[2], dec[3]]) as usize + 0);
+    }
+    if std::env::var("SWEET_INODE_DUMP").is_ok() {
+        if let Some(raw) = vol.inode_raw(fid) {
         println!("inode_val ({} bytes):", raw.len());
         for (i, b) in raw.chunks(8).enumerate() {
             let mut hexs = String::new();
@@ -438,6 +630,7 @@ fn cmd_ipsw_stat(args: &[String]) -> Result<()> {
                 le = format!("u64={v} ({v:#x})");
             }
             println!("  +{:03}: {hexs} {le}", i * 8);
+        }
         }
     }
     Ok(())
@@ -974,7 +1167,18 @@ fn cmd_ipsw_extract(args: &[String]) -> Result<()> {
     let mut n = 0;
     for m in &members {
         for e in idx.entries.iter().filter(|e| e.name == *m || e.name.contains(m.as_str())) {
-            let data = ipsw::extract(src, e)?;
+            let mut data = ipsw::extract(src, e)?;
+            // dmg/img3 members are IM4P-wrapped (LZFSE): unwrap so the raw
+            // APFS / payload bytes land on disk ready for Dmg::open_auto.
+            if sc::im4p::looks_im4p(&data) {
+                match sc::im4p::unwrap(&data) {
+                    Ok((raw, info)) => {
+                        eprintln!("  im4p: {} {} -> {} bytes", info.kind, info.desc, raw.len());
+                        data = raw;
+                    }
+                    Err(e) => eprintln!("  im4p unwrap failed ({e}); saving wrapped"),
+                }
+            }
             let dest = out.join(e.name.replace('/', "_"));
             ipsw::save(&dest, &data)?;
             println!("{} -> {} ({} bytes)", e.name, dest.display(), data.len());
@@ -1214,7 +1418,7 @@ fn cmd_place_image(args: &[String]) -> Result<()> {
 fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("ipsw-boot"));
     if f.rest.is_empty() {
-        bail!("usage: ipsw-boot --ipsw IPSW|URL <OUTDIR> [--kernel K | --demo] [--ramdisk R] [--cmdline ...] [--secs 120]");
+        bail!("usage: ipsw-boot --ipsw IPSW|URL <OUTDIR> [--kernel K | --demo] [--ramdisk R] [--highmem] [--cmdline ...] [--secs 120]");
     }
     let ipsw_src = f.val("ipsw").ok_or_else(|| sc::Error::Msg("--ipsw required".into()))?;
     let outdir = PathBuf::from(f.rest[0]);
@@ -1292,6 +1496,10 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
     }).transpose()?;
     let phys_override = if f.has("lowmem") {
         Some((mkadt::LOW_PHYS_BASE, mkadt::LOW_MEM_SIZE))
+    } else if f.has("highmem") {
+        // multi-GB md0 (real rootfs) needs the upper DDR bank: ramdisk PA =
+        // kernel_end must stay inside [phys_base, phys_base+mem_size).
+        Some((mkadt::HIGH_PHYS_BASE, mkadt::HIGH_MEM_SIZE))
     } else {
         None
     };
@@ -1355,6 +1563,30 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         .map(|img| img.pixel(0, 0) == [0x30, 0xc0, 0x40, 255])
         .unwrap_or(false);
     let mut pass = demo_marker || kernel_ran || bsd_root || pid1;
+    if f.val("kernel").is_some() {
+        // REAL SWEET kernel boot: the console goes to the framebuffer
+        // (serial stays empty), so the meaningful gate is "no panic + the
+        // kernel produced visible console output / reached BSD root". The
+        // workflow layer re-checks the decoded fb text (screen-decode) for
+        // the actual milestone markers (BSD root: md0, launchd, ...).
+        let fb_active = fb_png.as_ref()
+            .map(|img| {
+                let mut lit = 0u64;
+                for y in (0..img.height.min(FB_H)).step_by(4) {
+                    for x in (0..img.width.min(FB_W)).step_by(4) {
+                        let [r, g, b, _] = img.pixel(x, y);
+                        if r + g + b > 60 {
+                            lit += 1;
+                        }
+                    }
+                }
+                let samples = ((img.height.min(FB_H) / 4) * (img.width.min(FB_W) / 4)) as f64;
+                lit as f64 / samples.max(1.0)
+            })
+            .unwrap_or(0.0);
+        verdict.set("fb_console_fraction", J::n(fb_active));
+        pass = !panic && (bsd_root || pid1 || fb_active > 0.0005);
+    }
     if let Some(img) = &fb_png {
         // reconstruct the BGRA canvas from the decoded PNG to analyze it
         let mut fb = vec![0u8; (FB_W * 4 * FB_H) as usize];

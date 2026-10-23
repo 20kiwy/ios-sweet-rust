@@ -13,6 +13,7 @@
 //!   com.apple.ResourceFork xattr value.
 
 use crate::dmg::Dmg;
+use crate::error::Error;
 use crate::{bail, Result};
 use std::collections::HashMap;
 
@@ -71,6 +72,11 @@ pub struct Apfs {
     inode_val_lens: HashMap<u64, u64>,
     /// raw inode_val bytes (SWEET_INODE_DUMP diagnostics only)
     inode_raw: HashMap<u64, Vec<u8>>,
+    /// catalog kid -> inode private_id (fext tree key)
+    priv_ids: HashMap<u64, u64>,
+    /// SEALED volumes: file extents live in the fext tree
+    /// (private_id -> extents); the catalog has only data-hash records.
+    fext: HashMap<u64, Vec<Extent>>,
     /// id -> extents (files and dstreams)
     extents: HashMap<u64, Vec<Extent>>,
     /// id -> { xattr name -> raw j_xattr_val value }
@@ -97,6 +103,8 @@ impl Apfs {
             xattrs: HashMap::new(),
             inode_val_lens: HashMap::new(),
             inode_raw: HashMap::new(),
+            priv_ids: HashMap::new(),
+            fext: HashMap::new(),
         };
 
         // container omap -> volume superblock oids
@@ -113,7 +121,7 @@ impl Apfs {
                 vol_oids.push(v);
             }
         }
-        let mut fs_roots = Vec::new();
+        let mut fs_roots: Vec<(u64, u64, u64)> = Vec::new(); // (omap, root, apsb_paddr)
         for voi in vol_oids {
             let apsb_p = match ap.omap_lookup(cot, voi) {
                 Ok(p) => p,
@@ -125,7 +133,7 @@ impl Apfs {
             }
             let vol_omap_oid = u64le(&v, 0x80);
             let root_tree_oid = u64le(&v, 0x88);
-            fs_roots.push((vol_omap_oid, root_tree_oid));
+            fs_roots.push((vol_omap_oid, root_tree_oid, apsb_p));
         }
         // Fallback: walk the container omap B-tree leaves and resolve every
         // mapping; volumes are whatever validates as APSB. Checkpoint chains
@@ -142,7 +150,7 @@ impl Apfs {
             }
             let vol_omap_oid = u64le(&v, 0x80);
             let root_tree_oid = u64le(&v, 0x88);
-            fs_roots.push((vol_omap_oid, root_tree_oid));
+            fs_roots.push((vol_omap_oid, root_tree_oid, paddr));
         }
         if fs_roots.is_empty() {
             bail!("no APFS volumes found");
@@ -151,7 +159,13 @@ impl Apfs {
         // candidates as long as one volume indexes.
         let mut indexed = 0usize;
         let mut last_err = None;
-        for (vol_omap_oid, root_tree_oid) in fs_roots {
+        let mut live_apsb: Option<u64> = None;
+        let mut tried: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        for (vol_omap_oid, root_tree_oid, apsb_p) in fs_roots {
+            if !tried.insert((vol_omap_oid, root_tree_oid)) {
+                continue; // same volume enumerated twice — indexing it twice
+                          // would duplicate every extent record
+            }
             let vom = match ap.blk(vol_omap_oid) {
                 Ok(v) if u32le(&v, 0x18) & 0xFFFF == T_OMAP => v,
                 _ => continue, // stale checkpoint: not a live omap
@@ -165,17 +179,102 @@ impl Apfs {
                 }
             };
             match ap.index_tree(root, vot, root_tree_oid) {
-                Ok(()) => indexed += 1,
+                Ok(()) => {
+                    indexed += 1;
+                    // remember the live volume superblock (fext tree oid)
+                    live_apsb = Some(apsb_p);
+                }
                 Err(e) => last_err = Some(e),
             }
         }
+
         if indexed == 0 {
             bail!(
                 "no APFS volume indexed: {}",
                 last_err.map(|e| e.to_string()).unwrap_or_default()
             );
         }
+        // SEALED volumes: file extents live in the fext tree (physical root,
+        // fixed keys (private_id, laddr) -> (len_and_flags, paddr)).
+        if let Some(apsb_p) = live_apsb {
+            let apsb = ap.blk(apsb_p)?;
+            let fext_oid = u64le(&apsb, 0x408);
+            if fext_oid != 0 {
+                match ap.index_fext_tree(fext_oid) {
+                    Ok(n) => {
+                        if n > 0 {
+                            eprintln!("[apfs] sealed volume: {} fext extents", n);
+                        }
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
         Ok(ap)
+    }
+
+    /// Index the sealed-volume fext tree (physical root, FIXED keys).
+    fn index_fext_tree(&mut self, root_paddr: u64) -> Result<usize> {
+        let mut n = 0usize;
+        let mut stack = vec![root_paddr];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(p) = stack.pop() {
+            if !seen.insert(p) {
+                continue;
+            }
+            let b = self.blk(p)?;
+            let (flags, level, nkeys) = parse_node_hdr(&b);
+            let ents = node_entries(&b, flags, nkeys, self.bs)?;
+            if level > 0 {
+                for e in ents.iter() {
+                    stack.push(u64le(&b, e.2));
+                }
+                continue;
+            }
+            for e in ents.iter() {
+                let priv_id = u64le(&b, e.0) & OBJ_ID_MASK;
+                let _laddr = u64le(&b, e.0 + 8);
+                let len_flags = u64le(&b, e.2);
+                let pbn = u64le(&b, e.2 + 8);
+                let ext = Extent {
+                    laddr: _laddr,
+                    len: len_flags & 0x00FF_FFFF_FFFF_FFFF,
+                    pbn,
+                    crypto: 0,
+                    flag: len_flags >> 56,
+                };
+                let list = self.fext.entry(priv_id).or_default();
+                if !list
+                    .iter()
+                    .any(|x| x.laddr == ext.laddr && x.pbn == ext.pbn && x.len == ext.len)
+                {
+                    list.push(ext);
+                    n += 1;
+                }
+            }
+        }
+        for list in self.fext.values_mut() {
+            list.sort_by_key(|e| e.laddr);
+        }
+        Ok(n)
+    }
+
+    /// Extents for a file id: catalog records first, then the sealed-volume
+    /// fext tree (keyed by the inode's private_id).
+    pub fn extents_for(&self, fid: u64) -> Option<Vec<Extent>> {
+        if let Some(v) = self.extents.get(&fid) {
+            if !v.is_empty() {
+                return Some(v.clone());
+            }
+        }
+        // xattr dstream files have no inode: their oid IS the fext key
+        if let Some(v) = self.fext.get(&fid) {
+            if !v.is_empty() {
+                return Some(v.clone());
+            }
+        }
+        let priv_id = self.priv_ids.get(&fid).copied()?;
+        self.fext.get(&priv_id).cloned()
     }
 
     fn blk(&mut self, paddr: u64) -> Result<Vec<u8>> {
@@ -296,19 +395,29 @@ impl Apfs {
                         let end = (e.2 + e.3).min(b.len());
                         self.inode_raw.insert(kid, b[e.2..end].to_vec());
                         self.inodes.insert(kid, (mode, owner, group, size));
+                        // private_id (hardlink-shared stream id; fext key)
+                        let priv_id = u64le(&b, e.2 + 8) & OBJ_ID_MASK;
+                        self.priv_ids.insert(kid, priv_id);
                     }
                     J_FILE_EXTENT => {
                         let laddr = u64le(&b, e.0 + 8);
                         let len_flags = u64le(&b, e.2);
                         let pbn = u64le(&b, e.2 + 8);
                         let crypto = u64le(&b, e.2 + 16);
-                        self.extents.entry(kid).or_default().push(Extent {
+                        let ext = Extent {
                             laddr,
                             len: len_flags & 0x00FF_FFFF_FFFF_FFFF,
                             pbn,
                             crypto,
                             flag: len_flags >> 56,
-                        });
+                        };
+                        let list = self.extents.entry(kid).or_default();
+                        // guard against duplicate catalog visits
+                        if !list.iter().any(|x| {
+                            x.laddr == ext.laddr && x.pbn == ext.pbn && x.len == ext.len
+                        }) {
+                            list.push(ext);
+                        }
                     }
                     J_XATTR => {
                         let nl = u16le(&b, e.0 + 8) as usize;
@@ -319,10 +428,10 @@ impl Apfs {
                         .next()
                         .unwrap_or("")
                         .to_string();
-                        if name == XS_DECMPFS || name == XS_RSRC {
-                            let val = b[e.2..(e.2 + e.3).min(b.len())].to_vec();
-                            self.xattrs.entry(kid).or_default().insert(name, val);
-                        }
+                        // capture every xattr (decmpfs sizes, resource
+                        // forks, com.apple.fs.symlink targets, ...)
+                        let val = b[e.2..(e.2 + e.3).min(b.len())].to_vec();
+                        self.xattrs.entry(kid).or_default().insert(name, val);
                     }
                     _ => {}
                 }
@@ -384,6 +493,59 @@ impl Apfs {
     /// coverage (extents / decmpfs) over the catalog inode field, which is
     /// 0 for files whose inode_val omits the optional uncompressed-size
     /// field (observed on WallpaperKit HEIC assets in 16.7.16).
+    /// Extent table (paddr, len) for a file id (diagnostics + mkiosroot).
+    pub fn extent_list(&self, fid: u64) -> Vec<(u64, u64, u64)> {
+        self.extents_for(fid)
+            .map(|v| v.iter().map(|e| (e.laddr, e.pbn, e.len)).collect())
+            .unwrap_or_default()
+    }
+
+    /// All xattr names for a file id.
+    pub fn xattr_names(&self, fid: u64) -> Vec<String> {
+        self.xattrs
+            .get(&fid)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Resolve an xattr's CONTENT: inline values come straight from the
+    /// catalog record; data-stream values (huge rsrc forks) reference a
+    /// separate file (oid + size in the dstream) whose extents live in the
+    /// same catalog.
+    pub fn xattr_resolved(&mut self, fid: u64, name: &str) -> Result<Option<Vec<u8>>> {
+        const XATTR_DATA_STREAM: u16 = 0x1;
+        let Some(raw) = self.xattrs.get(&fid).and_then(|m| m.get(name)).cloned() else {
+            return Ok(None);
+        };
+        if raw.len() < 4 {
+            return Ok(Some(raw));
+        }
+        let xflags = u16le(&raw, 0);
+        let xdata_len = u16le(&raw, 2) as usize;
+        if xflags & XATTR_DATA_STREAM == 0 {
+            return Ok(Some(raw[4..(4 + xdata_len).min(raw.len())].to_vec()));
+        }
+        let d = &raw[4..(4 + xdata_len).min(raw.len())];
+        if d.len() < 16 {
+            bail!("sized xattr {name}: dstream too small");
+        }
+        let oid = u64le(d, 0) & OBJ_ID_MASK;
+        let size = u64le(d, 8);
+        let exts = self
+            .extents_for(oid)
+            .ok_or_else(|| Error::Msg(format!("sized xattr {name}: no extents for oid {oid:#x}")))?;
+        let covered: u64 = exts.iter().map(|e| e.len).sum();
+        let data = self.read_extents(&exts, size)?;
+        if data.len() as u64 != size {
+            bail!(
+                "sized xattr {name}: got {} bytes, want {size} (exts={} covered={covered})",
+                data.len(),
+                exts.len()
+            );
+        }
+        Ok(Some(data))
+    }
+
     /// Raw inode_val length for a file id (diagnostics).
     pub fn inode_val_len(&self, fid: u64) -> Option<u64> {
         self.inode_val_lens.get(&fid).copied()
@@ -415,13 +577,16 @@ impl Apfs {
                 return u64le(dec, 12); // cmpf header: u16 flags, u16 len, magic, algo u32, usize u64
             }
         }
-        if let Some((mode, _, _, size, vlen)) = self.inode_full(fid) {
-            let _ = mode;
+        if let Some((_, _, _, size, vlen)) = self.inode_full(fid) {
             if vlen == 92 {
-                return size;
+                // plain inode: uncompressed_size at +84 is exact
+                if size > 0 {
+                    return size;
+                }
             }
             if vlen > 92 {
-                if let Some(sz) = self.inode_xfield_hardlink_size(fid) {
+                // xfield inode: the dstream xfield carries the exact size
+                if let Some(sz) = self.inode_dstream_size(fid) {
                     return sz;
                 }
             }
@@ -441,34 +606,143 @@ impl Apfs {
         Some((m, o, g, s, vlen))
     }
 
-    /// Size from the hardlink-info xfield (id 2) of a long inode_val:
-    /// [u16 a][u16 namelen][u32 flags][name][pad8][u64 size ...]. Requires
-    /// SWEET_INODE_DUMP=1 (raw inode capture); falls back to None otherwise.
-    fn inode_xfield_hardlink_size(&self, fid: u64) -> Option<u64> {
+    /// Parse the xfield blob at the end of a long inode_val:
+    /// xf_blob { u16 num_exts, u16 used_data } then ALL descriptors
+    /// (u8 type, u8 flags, u16 size), then the values (each padded to 8).
+    /// Returns (type, flags, value) triples.
+    pub fn inode_xfields(&self, fid: u64) -> Option<Vec<(u8, u8, Vec<u8>)>> {
         let raw = self.inode_raw.get(&fid)?;
-        // xfield chain right after the standard 92-byte inode_val base:
-        // (u16 id, u16 len, data)... terminated by (0,0), 4-byte aligned
-        let mut o = 92usize;
-        while o + 4 <= raw.len() {
-            let id = u16le(raw, o);
-            let len = u16le(raw, o + 2) as usize;
-            if id == 0 && len == 0 {
-                break;
+        if raw.len() < 96 {
+            return None;
+        }
+        let num = u16le(raw, 92) as usize;
+        let mut descs = Vec::with_capacity(num);
+        for i in 0..num {
+            let o = 96 + i * 4;
+            if o + 4 > raw.len() {
+                return None;
             }
-            if id == 2 && o + 4 + len <= raw.len() {
-                let d = &raw[o + 4..o + 4 + len];
-                if d.len() >= 8 {
-                    let namelen = u16le(d, 2) as usize;
-                    let sz_off = 8 + namelen.div_ceil(8) * 8;
-                    if sz_off + 8 <= d.len() {
-                        return Some(u64le(d, sz_off));
-                    }
-                }
+            descs.push((raw[o], raw[o + 1], u16le(raw, o + 2) as usize));
+        }
+        let mut vo = 96 + num * 4;
+        let mut out = Vec::with_capacity(num);
+        for (t, f, sz) in descs {
+            if vo + sz > raw.len() {
+                return None;
             }
-            o += 4 + len;
-            o = o.div_ceil(8) * 8;
+            out.push((t, f, raw[vo..vo + sz].to_vec()));
+            vo += (sz + 7) & !7;
+        }
+        Some(out)
+    }
+
+    /// Logical size from the DSTREAM xfield (type 8): first u64 = file size.
+    fn inode_dstream_size(&self, fid: u64) -> Option<u64> {
+        for (t, _, d) in self.inode_xfields(fid)? {
+            if t == 8 && d.len() >= 8 {
+                return Some(u64le(&d, 0));
+            }
         }
         None
+    }
+
+    /// Stream a file's logical bytes to `sink` (16 MiB chunks). decmpfs
+    /// files are decompressed whole; plain files stream extent-by-extent.
+    /// Returns the bytes produced.
+    pub fn copy_file(&mut self, fid: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<u64> {
+        let size = self.file_size(fid);
+        if size == 0 {
+            return Ok(0);
+        }
+        if self.xattrs.get(&fid).and_then(|m| m.get(XS_DECMPFS)).is_some() {
+            let whole = self.read_file(fid)?;
+            sink(&whole)?;
+            return Ok(whole.len() as u64);
+        }
+        if let Some(exts) = self.extents_for(fid) {
+            let mut left = size;
+            for e in &exts {
+                if left == 0 {
+                    break;
+                }
+                let mut off = 0u64;
+                while off < e.len && left > 0 {
+                    let take = (e.len - off).min(left).min(16 << 20);
+                    let b = self.dmg.read(
+                        (e.pbn * self.bs as u64) + off,
+                        take as usize,
+                    )?;
+                    sink(&b)?;
+                    off += take;
+                    left -= take;
+                }
+            }
+            if left > 0 {
+                bail!("copy_file: extents short by {left}");
+            }
+            return Ok(size);
+        }
+        bail!("copy_file: no extents for inode {fid}");
+    }
+
+    /// Read [off, off+len) of a PLAIN file's logical bytes into out.
+    /// (Compressed files must go through read_file.)
+    pub fn read_range(&mut self, fid: u64, off: u64, out: &mut [u8]) -> Result<usize> {
+        if self.xattrs.get(&fid).and_then(|m| m.get(XS_DECMPFS)).is_some() {
+            bail!("read_range: inode {fid} is decmpfs-compressed");
+        }
+        let exts = self
+            .extents_for(fid)
+            .ok_or_else(|| Error::Msg(format!("read_range: no extents for {fid}")))?;
+        let mut filled = 0usize;
+        let mut pos = off;
+        let want = out.len();
+        for e in &exts {
+            if filled == want {
+                break;
+            }
+            let e_end = e.laddr + e.len;
+            if pos >= e_end {
+                continue;
+            }
+            let take_end = e_end.min(off + want as u64);
+            if pos < e.laddr {
+                // gap (sparse) — zero fill
+                let gap = (e.laddr - pos).min((want - filled) as u64) as usize;
+                out[filled..filled + gap].fill(0);
+                filled += gap;
+                pos += gap as u64;
+                if filled == want {
+                    break;
+                }
+                continue;
+            }
+            let from = pos - e.laddr;
+            let n = (take_end - pos) as usize;
+            let b = self
+                .dmg
+                .read(e.pbn * self.bs as u64 + from, n)?;
+            out[filled..filled + n].copy_from_slice(&b);
+            filled += n;
+            pos += n as u64;
+        }
+        Ok(filled)
+    }
+
+    /// Walk with everything mkiosroot needs: (path, fid, is_dir, first
+    /// physical block) — sorted lexically (parents before children).
+    pub fn walk_meta(&self) -> Vec<(String, u64, bool, u64)> {
+        let mut out: Vec<(String, u64, bool, u64)> = Vec::new();
+        for (path, fid) in self.walk_all() {
+            let is_dir = !self.list_dir(fid).is_empty();
+            let paddr = self
+                .extents_for(fid)
+                .and_then(|e| e.iter().map(|e| e.pbn).min())
+                .unwrap_or(u64::MAX);
+            out.push((path, fid, is_dir, paddr));
+        }
+        out.sort();
+        out
     }
 
     /// decmpfs raw record for a file id (for provenance diagnostics).
@@ -486,7 +760,7 @@ impl Apfs {
         if size == 0 {
             bail!("no data for inode {fid}");
         }
-        if let Some(exts) = self.extents.get(&fid).cloned() {
+        if let Some(exts) = self.extents_for(fid) {
             return self.read_extents(&exts, size);
         }
         // transparent compression via decmpfs (+ resource fork dstream)
@@ -496,7 +770,7 @@ impl Apfs {
             .and_then(|m| m.get(XS_DECMPFS))
             .cloned()
             .ok_or_else(|| crate::Error::Msg(format!("no data for inode {fid}")))?;
-        let rsrc = self.xattrs.get(&fid).and_then(|m| m.get(XS_RSRC)).cloned();
+        // decmpfs record (j_xattr_val header at 0, fpmc header at 4)
         let (xflags, xlen) = (u16le(&dec, 0), u16le(&dec, 2) as usize);
         let payload = &dec[4..(4 + xlen).min(dec.len())];
         if payload.len() < 16 || &payload[0..4] != b"fpmc" {
@@ -505,26 +779,8 @@ impl Apfs {
         let algo = u32le(payload, 4);
         let usize_ = u64le(payload, 8);
         let _ = xflags;
-        let rsrc_data = match rsrc {
-            Some(rf) => {
-                let (rflags, rlen) = (u16le(&rf, 0), u16le(&rf, 2) as usize);
-                let xdata = &rf[4..(4 + rlen).min(rf.len())];
-                if xdata.len() == 48 {
-                    // j_xattr_dstream_t { obj_id u64, dstream { size u64, .. } }
-                    let oid = u64le(xdata, 0);
-                    let dsize = u64le(xdata, 8);
-                    let exts = self
-                        .extents
-                        .get(&oid)
-                        .cloned()
-                        .ok_or_else(|| crate::Error::Msg("rsrc dstream has no extents".into()))?;
-                    Some(self.read_extents(&exts, dsize)?)
-                } else {
-                    Some(xdata.to_vec())
-                }
-            }
-            None => None,
-        };
+        // rsrc content, already resolved (inline or via the dstream file)
+        let rsrc_data = self.xattr_resolved(fid, XS_RSRC)?;
         decompress(algo, usize_ as usize, &payload[16..], rsrc_data.as_deref())
     }
 
@@ -614,6 +870,16 @@ fn decompress(algo: u32, usize_: usize, inline: &[u8], rsrc: Option<&[u8]>) -> R
             if algo == 4 {
                 // RsrcForkHeader (BE) + CmpfRsrc { entries u32le, [off,size] u32le }
                 let data_offset = be32(rsrc, 0);
+                if std::env::var("SWEET_DECOMP_DEBUG").is_ok() {
+                    let b0 = data_offset as usize + 4;
+                    eprintln!(
+                        "algo4: rsrc {} bytes, data_offset={data_offset:#x} entries@{b0}={} first_entry={:02x?} chunk0={:02x?}",
+                        rsrc.len(),
+                        u32le(rsrc, b0),
+                        &rsrc[b0 + 4..b0 + 12],
+                        &rsrc[b0 + u32le(rsrc, b0 + 4) as usize..b0 + u32le(rsrc, b0 + 4) as usize + 8]
+                    );
+                }
                 let base = data_offset as usize + 4;
                 let entries = u32le(rsrc, base) as usize;
                 let mut out = vec![0u8; (usize_ + 0xFFFF) & !0xFFFF];
@@ -623,9 +889,18 @@ fn decompress(algo: u32, usize_: usize, inline: &[u8], rsrc: Option<&[u8]>) -> R
                         (u32le(rsrc, o) as usize, u32le(rsrc, o + 4) as usize)
                     };
                     let src = &rsrc[base + off..(base + off + ln).min(rsrc.len())];
-                    let dst = &mut out[k * 0x10000..(k + 1) * 0x10000];
+                    // the last chunk inflates to fewer than 64K
+                    let left = usize_ - k * 0x10000;
+                    let dcap = left.min(0x10000);
+                    let dst = &mut out[k * 0x10000..k * 0x10000 + dcap];
                     if src[0] == 0x78 {
-                        crate::ipsw::inflate_into(src, dst)?;
+                        if let Err(e) = crate::ipsw::inflate_into(src, dst) {
+                            if std::env::var("SWEET_DECOMP_DEBUG").is_ok() {
+                                eprintln!("algo4: chunk {k} failed: {e} (src {ln}B, rsrcoff {:#x})", base + off);
+                                continue;
+                            }
+                            bail!("zlib chunk {k} (src {ln}B): {e}");
+                        }
                     } else if src[0] & 0x0F == 0x0F {
                         dst[..src.len() - 1].copy_from_slice(&src[1..]);
                     } else {
@@ -689,5 +964,8 @@ extern "C" {
 }
 
 fn be32(b: &[u8], o: usize) -> u32 {
+    if o + 4 > b.len() {
+        panic!("be32 out of range: len {} at {}", b.len(), o);
+    }
     u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }

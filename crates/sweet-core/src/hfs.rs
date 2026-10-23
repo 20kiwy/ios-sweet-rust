@@ -21,7 +21,7 @@ pub const BLOCK: u32 = 4096;
 pub const ROOT_PARENT: u32 = 1;
 pub const ROOT_ID: u32 = 2;
 
-const VH_SIG: u16 = 0x482B; // 'H+'
+const VH_SIG: u16 = 0x4858; // 'HX' — HFSX (case-sensitive variant, per mkfs.hfsplus -s)
 const HFS_VERSION: u16 = 5; // HFSX (case-sensitive)
 const LAST_MOUNTED: u32 = 0x3130_2E31; // '10.1'
 const VOL_UNMOUNTED: u32 = 0x0000_0100; // clean
@@ -34,6 +34,7 @@ const REC_FILE_THREAD: u16 = 4;
 const KEY_BINARY: u8 = 0xBC; // kHFSBinaryCompare (case-sensitive HFSX)
 const NODE_LEAF: i8 = -1;
 const NODE_INDEX: i8 = 0;
+const NODE_MAP: i8 = 2;
 const NODE_HEADER: i8 = 1;
 const HFS_EPOCH_OFFSET: u64 = 2_082_844_800; // unix -> HFS (1904)
 
@@ -66,6 +67,9 @@ struct Node {
 
 pub struct HfsImage {
     f: std::fs::File,
+    cur_data_start: u64,
+    cur_left: u64,
+    out_path: std::path::PathBuf,
     pub total_blocks: u32,
     next_block: u32,
     next_cnid: u32,
@@ -78,6 +82,10 @@ pub struct HfsImage {
 impl HfsImage {
     /// Create (truncate) the image file sized `total_blocks` * 4096.
     pub fn create(path: &std::path::Path, total_blocks: u32) -> Result<Self> {
+        // 32 KiB alignment (8 blocks): fsck_hfs reads the volume tail in
+        // 32 KiB chunks and bails on a short final read (rc=8) otherwise.
+        let total_blocks = total_blocks.div_ceil(8) * 8;
+        let out_path = path.to_path_buf();
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -92,8 +100,16 @@ impl HfsImage {
             + HFS_EPOCH_OFFSET as u32;
         Ok(Self {
             f,
+            cur_data_start: 0,
+            cur_left: 0,
+            out_path,
             total_blocks,
-            next_block: 0,
+            // blocks 0-1: boot area + volume header (VH at byte 1024);
+            // blocks 2..2+bmap+1: allocation bitmap + extents-overflow tree
+            // (finish() writes them there — data must not overlap!)
+            next_block: 2
+                + (total_blocks as usize).div_ceil(8).div_ceil(BLOCK as usize) as u32
+                + 1,
             next_cnid: 16, // 1..15 reserved by the format
             nodes: Vec::new(),
             files_written: 0,
@@ -154,9 +170,10 @@ impl HfsImage {
         self.new_node(parent, name, Kind::Dir, uid, gid, mode, 0)
     }
 
-    /// Add a file by streaming `size` bytes from `src` (called once per chunk
-    /// by the closure; every byte must be written). Data blocks are
-    /// contiguous. Returns the cnid.
+    /// Add a file by streaming `size` bytes: the closure receives
+    /// (self, file-relative offset, chunk length) and must emit exactly the
+    /// requested slice via [`HfsImage::write_file_chunk`] (or leave zeros
+    /// with [`HfsImage::skip_chunk`]). Data blocks are contiguous.
     pub fn add_file(
         &mut self,
         parent: u32,
@@ -173,17 +190,41 @@ impl HfsImage {
         let node = &mut self.nodes[id as usize - 16];
         node.extents = vec![ForkExt { start, count: blocks }];
         drop(node);
-        // stream the content into the freshly allocated blocks
-        self.f.seek(SeekFrom::Start(start as u64 * BLOCK as u64))?;
+        self.cur_data_start = start as u64 * BLOCK as u64;
+        self.cur_left = size;
         let mut left = size;
         while left > 0 {
-            let chunk = left.min(8 << 20);
+            let chunk = left.min(16 << 20);
             src(self, size - left, chunk)?;
             left -= chunk;
+        }
+        if self.cur_left > 0 {
+            bail!("add_file {name}: closure wrote {size} bytes short");
         }
         self.files_written += 1;
         self.bytes_written += size;
         Ok(id)
+    }
+
+    /// Write a chunk of the file currently being added (booked by add_file).
+    pub fn write_file_chunk(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        let abs = self.cur_data_start + off;
+        self.f.seek(SeekFrom::Start(abs))?;
+        self.f.write_all(data)?;
+        self.cur_left = self.cur_left.saturating_sub(data.len() as u64);
+        Ok(())
+    }
+
+    /// Zero-fill (skip) a chunk of the current file.
+    pub fn skip_chunk(&mut self, off: u64, len: u64) -> Result<()> {
+        let abs = self.cur_data_start + off;
+        self.f.seek(SeekFrom::Start(abs))?;
+        // sparse: the file was truncated to size; unwritten extents read as
+        // zeros on HFS+?? NO — we must physically zero: ext4 holes only help
+        // on disk, but XNU reads the md0 from RAM — the payload builder reads
+        // the image file bytes, so holes become real zeros at read time.
+        self.cur_left = self.cur_left.saturating_sub(len);
+        Ok(())
     }
 
     /// Zero-fill a hole of `size` bytes for an empty/sparse file.
@@ -196,14 +237,7 @@ impl HfsImage {
         mode: u16,
         size: u64,
     ) -> Result<u32> {
-        self.add_file(parent, name, uid, gid, mode, size, &mut |s, off, len| {
-            s.f.seek(SeekFrom::Start(
-                s.nodes[s.nodes.len() - 1].extents[0].start as u64 * BLOCK as u64 + off,
-            ))?;
-            let zeros = vec![0u8; len as usize];
-            s.f.write_all(&zeros)?;
-            Ok(())
-        })
+        self.add_file(parent, name, uid, gid, mode, size, &mut |s, _off, _len| Ok(()))
     }
 
     /// Register a file whose content REUSES another file's blocks (the DSC
@@ -270,21 +304,20 @@ impl HfsImage {
         let bmap_bytes = (total as usize).div_ceil(8);
         let mut bmap = vec![0u8; bmap_bytes.div_ceil(BLOCK as usize) * BLOCK as usize];
         let setbit = |bm: &mut [u8], b: u32| bm[(b / 8) as usize] |= 0x80 >> (b % 8);
-        // reserved blocks: 0 (boot), 1 (VH), bitmap itself, extents tree, data, catalog
         let bmap_blocks = bmap.len() as u32 / BLOCK;
         let ext_start = 2 + bmap_blocks;
         let ext_blocks = 1u32; // empty extents tree: one header node
         for b in 0..2 + bmap_blocks + ext_blocks {
             setbit(&mut bmap, b);
         }
+        // data extents (allocated sequentially from ext_start + ext_blocks)
         let mut cursor = ext_start + ext_blocks;
-        // re-derive data allocations from the nodes (they were allocated
-        // sequentially starting right after the extents tree)
         for n in &self.nodes {
             for e in &n.extents {
                 for b in e.start..e.start + e.count {
                     setbit(&mut bmap, b);
                 }
+                cursor = cursor.max(e.start + e.count);
             }
         }
         for b in cat_start..cat_start + cat_blocks {
@@ -292,20 +325,22 @@ impl HfsImage {
         }
         setbit(&mut bmap, total - 2); // alt VH
         setbit(&mut bmap, total - 1); // reserved
-        cursor = cursor.max(if self.nodes.is_empty() {
-            cursor
-        } else {
-            let max_end = self
-                .nodes
-                .iter()
-                .flat_map(|n| n.extents.iter())
-                .map(|e| e.start + e.count)
-                .max()
-                .unwrap_or(cursor);
-            max_end
-        });
-        let used = cursor.max(cat_start + cat_blocks).max(total);
-        let free = total - used;
+        // Free-block bookkeeping must match fsck_hfs' formula: it sums the
+        // extent blocks of EVERY record (hard-link shared extents are
+        // therefore counted once per claiming record — the volume bitmap
+        // itself still marks them once; XNU allocates from the bitmap, so a
+        // conservative VH free count is safe).
+        let claimed: u64 = self
+            .nodes
+            .iter()
+            .map(|n| n.extents.iter().map(|e| e.count as u64).sum::<u64>())
+            .sum();
+        let sys_blocks = (2 + bmap_blocks + ext_blocks) as u64 + cat_blocks as u64;
+        // (the alternate volume header + reserved trailing blocks are NOT
+        // part of fsck's expected-used accounting — verified by exact match)
+        let free = (total as u64 - claimed - sys_blocks) as u32;
+        let used = cursor.max(cat_start + cat_blocks).max(2 + bmap_blocks + ext_blocks);
+        let _ = used;
 
         // write bitmap
         self.f
@@ -313,7 +348,9 @@ impl HfsImage {
         self.f.write_all(&bmap)?;
 
         // ---- extents overflow tree: single empty header node ----
-        let ext_node = empty_btree_header_node(4096, 516);
+        // max key length for the extents B-tree is 10
+        // (kHFSMaxExtentKeyLength = sizeof(key) - 2)
+        let ext_node = empty_btree_header_node(4096, 10);
         self.f.seek(SeekFrom::Start(ext_start as u64 * BLOCK as u64))?;
         self.f.write_all(&ext_node)?;
 
@@ -328,12 +365,12 @@ impl HfsImage {
             .iter()
             .filter(|n| matches!(n.kind, Kind::File | Kind::Symlink(_)))
             .count() as u32;
+        // fsck_hfs counts folder records EXCLUDING the root folder
         let folder_count = self
             .nodes
             .iter()
             .filter(|n| matches!(n.kind, Kind::Dir))
-            .count() as u32
-            + 1; // root folder itself
+            .count() as u32;
         let vh = volume_header(&VhArgs {
             total_blocks: total,
             free_blocks: free,
@@ -356,19 +393,15 @@ impl HfsImage {
             name: volume_name,
             now: self.now,
         });
-        self.f.seek(SeekFrom::Start(BLOCK as u64))?;
+        // the volume header lives at BYTE offset 1024 (inside block 0);
+        // the alternate VH = the second-to-last 512-byte sector
+        self.f.seek(SeekFrom::Start(1024))?;
         self.f.write_all(&vh)?;
-        self.f
-            .seek(SeekFrom::Start((total as u64 - 2) * BLOCK as u64))?;
+        let alt = total as u64 * BLOCK as u64 - 1024;
+        self.f.seek(SeekFrom::Start(alt))?;
         self.f.write_all(&vh)?;
 
-        let path = self.f_path();
-        Ok(path)
-    }
-
-    fn f_path(&self) -> std::path::PathBuf {
-        // best-effort path via /proc/self/fd is overkill; caller knows it
-        std::path::PathBuf::new()
+        Ok(self.out_path)
     }
 }
 
@@ -400,7 +433,10 @@ fn fork_data(size: u64, extents: &[ForkExt]) -> [u8; 80] {
     fd[0..8].copy_from_slice(&size.to_be_bytes());
     fd[8..12].copy_from_slice(&BLOCK.to_be_bytes()); // clump
     fd[12..16].copy_from_slice(&(size.div_ceil(BLOCK as u64) as u32).to_be_bytes());
-    for (i, e) in extents.iter().take(8).enumerate() {
+    // zero-length files carry NO extents (a {start, 0} entry is flagged
+    // "Invalid extent entry" by fsck_hfs)
+    let used: Vec<&ForkExt> = extents.iter().filter(|e| e.count > 0).take(8).collect();
+    for (i, e) in used.iter().enumerate() {
         let o = 16 + i * 8;
         fd[o..o + 4].copy_from_slice(&e.start.to_be_bytes());
         fd[o + 4..o + 8].copy_from_slice(&e.count.to_be_bytes());
@@ -431,21 +467,25 @@ fn volume_header(a: &VhArgs) -> [u8; 512] {
     v[0x3C..0x40].copy_from_slice(&BLOCK.to_be_bytes()); // data clump
     v[0x40..0x44].copy_from_slice(&a.next_catalog_id.to_be_bytes());
     v[0x44..0x48].copy_from_slice(&1u32.to_be_bytes()); // writeCount
-    v[0x48] = 1; // encodingsBitmap: bit 0 = Mac Roman
-    v[0x50..0x54].copy_from_slice(b"iOS"); // finderInfo[0..2] = volume name hints
-    // allocation file
+    v[0x4F] = 1; // encodingsBitmap (BE64): bit 0 (Mac Roman) = LSB of last byte
+    // finderInfo stays zero (mkfs.hfsplus uses it for the HFS name wrap only)
+    // allocation file: logicalSize u64, clumpSize u32, totalBlocks u32,
+    // extents[8] { startBlock u32, blockCount u32 }
     v[0x70..0x78].copy_from_slice(&(a.bmap_blocks as u64 * BLOCK as u64).to_be_bytes());
-    v[0x78..0x82].copy_from_slice(&a.bmap_blocks.to_be_bytes());
+    v[0x78..0x7C].copy_from_slice(&BLOCK.to_be_bytes());
+    v[0x7C..0x80].copy_from_slice(&a.bmap_blocks.to_be_bytes());
     v[0x80..0x84].copy_from_slice(&a.bmap_start.to_be_bytes());
     v[0x84..0x88].copy_from_slice(&a.bmap_blocks.to_be_bytes());
     // extents file
     v[0xC0..0xC8].copy_from_slice(&(a.ext_blocks as u64 * BLOCK as u64).to_be_bytes());
-    v[0xC8..0xCC].copy_from_slice(&a.ext_blocks.to_be_bytes());
+    v[0xC8..0xCC].copy_from_slice(&BLOCK.to_be_bytes());
+    v[0xCC..0xD0].copy_from_slice(&a.ext_blocks.to_be_bytes());
     v[0xD0..0xD4].copy_from_slice(&a.ext_start.to_be_bytes());
     v[0xD4..0xD8].copy_from_slice(&a.ext_blocks.to_be_bytes());
     // catalog file
     v[0x110..0x118].copy_from_slice(&(a.cat_blocks as u64 * BLOCK as u64).to_be_bytes());
-    v[0x118..0x11C].copy_from_slice(&a.cat_blocks.to_be_bytes());
+    v[0x118..0x11C].copy_from_slice(&BLOCK.to_be_bytes());
+    v[0x11C..0x120].copy_from_slice(&a.cat_blocks.to_be_bytes());
     v[0x120..0x124].copy_from_slice(&a.cat_start.to_be_bytes());
     v[0x124..0x128].copy_from_slice(&a.cat_blocks.to_be_bytes());
     // attributes + startup: zero forks (absent)
@@ -465,11 +505,11 @@ fn unistr(name: &str) -> Vec<u8> {
 }
 
 fn cat_key_bytes(parent: u32, name: &str) -> Vec<u8> {
-    // [keyLen u16][parent u32][uniStr]; keyLen = 6 + 2*chars (excludes itself)
+    // KEY CONTENT ONLY: [parentID u32][HFSUniStr255]. The leaf/index record
+    // stores [keyLength u16][content]; keyLength EXCLUDES itself (TN1150,
+    // verified vs Linux hfsplus_cat_key: key_len = 6 + 2*chars).
     let uni = unistr(name);
-    let keylen = (6 + uni.len() - 2) as u16; // 4 + 2 + 2*chars
-    let mut out = Vec::with_capacity(2 + 4 + uni.len());
-    out.extend_from_slice(&keylen.to_be_bytes());
+    let mut out = Vec::with_capacity(4 + uni.len());
     out.extend_from_slice(&parent.to_be_bytes());
     out.extend_from_slice(&uni);
     out
@@ -495,7 +535,9 @@ fn folder_record(n: &Node, valence: u32) -> Vec<u8> {
     r[24..28].copy_from_slice(&n.modify.to_be_bytes()); // access
     r[32..36].copy_from_slice(&n.uid.to_be_bytes()); // bsd owner
     r[36..40].copy_from_slice(&n.gid.to_be_bytes()); // group
-    r[44..46].copy_from_slice(&n.mode.to_be_bytes()); // mode (admin/owner flags 0)
+    // mode carries S_IFDIR: fsck_hfs rejects folder records whose BSD mode
+    // lacks the directory type bits ("Invalid BSD file type")
+    r[42..44].copy_from_slice(&(n.mode | 0o40_000).to_be_bytes());
     r
 }
 
@@ -510,14 +552,15 @@ fn file_record(n: &Node, data_extents: &[ForkExt]) -> Vec<u8> {
     r[24..28].copy_from_slice(&n.modify.to_be_bytes());
     r[32..36].copy_from_slice(&n.uid.to_be_bytes());
     r[36..40].copy_from_slice(&n.gid.to_be_bytes());
-    r[44..46].copy_from_slice(&n.mode.to_be_bytes());
+    // mode carries S_IFREG (no-op for symlinks: 0xA000 already has it);
+    // fsck_hfs rejects file records whose BSD mode lacks type bits
+    r[42..44].copy_from_slice(&(n.mode | 0o100_000).to_be_bytes());
     match &n.kind {
         Kind::Symlink(_) => {
-            // finderInfo: type 'slnk' creator 'rhap' at userInfo+? — the file
-            // record has userInfo (8B @56) + finderInfo (8B @64); symlinks
-            // store the type/creator in the *first* 8 bytes (userInfo).
-            r[56..60].copy_from_slice(b"slnk");
-            r[60..64].copy_from_slice(b"rhap");
+            // FInfo.user_info @48: fdType 'slnk' + fdCreator 'rhap'
+            // (verified against hfs_common.h: usrinfo @48, fdType @+0)
+            r[48..52].copy_from_slice(b"slnk");
+            r[52..56].copy_from_slice(b"rhap");
         }
         _ => {}
     }
@@ -568,8 +611,11 @@ fn build_catalog(
         modify: 0,
     };
     recs.push((
-        sort_key(ROOT_PARENT, ""),
-        cat_key_bytes(ROOT_PARENT, ""),
+        // mkfs.hfsplus convention (verified): the root FOLDER record's key is
+        // (parent 1, volume name). fsck_hfs CatHChk searches (1, "") and
+        // REQUIRES btNotFound — an empty-name root record trips E_CatRec.
+        sort_key(ROOT_PARENT, volume_name),
+        cat_key_bytes(ROOT_PARENT, volume_name),
         folder_record(&root, root_children),
     ));
     recs.push((
@@ -613,6 +659,8 @@ fn build_catalog(
                 offs.clear();
             }
             let off = data_end as usize;
+            // record = [keyLength u16][key content][data]; keyLength excludes
+            // itself — key here is CONTENT ONLY, so key.len() is exact.
             buf[off..off + 2].copy_from_slice(&(key.len() as u16).to_be_bytes());
             buf[off + 2..off + 2 + key.len()].copy_from_slice(key);
             buf[off + 2 + key.len()..off + 2 + key.len() + dat.len()].copy_from_slice(dat);
@@ -680,7 +728,7 @@ fn build_catalog(
             .map(|(i, n)| (first_key_of(n), base + i as u32))
             .collect();
     }
-    let depth = index_height as u16 + 1; // leaves are height 1
+    let depth = index_height as u16; // leaves are height 1; index levels above
     let root_node = next_no - 1;
     let total_nodes = 1 + all_nodes.len() as u32;
 
@@ -700,27 +748,71 @@ fn build_catalog(
         }
     }
 
-    // ---- assemble: node 0 = header, leaves, index levels ----
+    // ---- assemble: node 0 = header, leaves, index levels, map nodes ----
+    // Node-usage bitmap: 128 bytes live in the header map record; beyond
+    // that, HFS B-trees chain MAP NODES (kind 2) via the header's fLink.
+    // Iterate to a fixed point: map nodes themselves occupy nodes.
+    let mut n_map = 0usize;
+    let mut map_bytes;
+    loop {
+        let total_now = 1 + all_nodes.len() + n_map;
+        map_bytes = total_now.div_ceil(8);
+        let need = map_bytes.saturating_sub(128).div_ceil(NODE - DESC - 2);
+        if need == n_map {
+            break;
+        }
+        n_map = need;
+    }
+    let total_nodes = (1 + all_nodes.len() + n_map) as u32;
+    let mut used = vec![0u8; map_bytes];
+    for i in 0..total_nodes as usize {
+        used[i / 8] |= 0x80 >> (i % 8);
+    }
+    let first_map_no = 1 + all_nodes.len() as u32; // map nodes come last
+    let per_node_bits = (NODE - DESC - 2) * 8;
+    let mut map_nodes: Vec<Vec<u8>> = Vec::new();
+    for k in 0..n_map {
+        let mut m = vec![0u8; NODE];
+        let next = if k + 1 < n_map { first_map_no + k as u32 + 1 } else { 0 };
+        m[0..4].copy_from_slice(&next.to_be_bytes());
+        m[8] = NODE_MAP as u8; // kind 2: map node
+        m[10..12].copy_from_slice(&1u16.to_be_bytes()); // one record: the bitmap
+        // record offset 14 (DESC) at the tail, free space = node end
+        m[4092..4094].copy_from_slice(&((NODE - 2) as u16).to_be_bytes());
+        m[4094..4096].copy_from_slice(&(DESC as u16).to_be_bytes());
+        // bitmap continues the header map record's bit numbering
+        let bit_base = 1024 + k * per_node_bits;
+        let end = (bit_base + per_node_bits).min(total_nodes as usize);
+        for i in bit_base..end {
+            m[DESC + (i - 1024) / 8] |= 0x80 >> ((i - 1024) % 8);
+        }
+        map_nodes.push(m);
+    }
     let mut out: Vec<u8> = Vec::with_capacity(total_nodes as usize * NODE);
     let mut h = empty_btree_header_node(NODE, 516);
-    patch_header(
-        &mut h,
-        depth,
-        root_node,
-        leaf_records,
-        first_leaf,
-        last_leaf,
-        total_nodes,
-    );
+    patch_header(&mut h, depth, root_node, leaf_records, first_leaf, last_leaf, total_nodes);
+    // header map record (offset 248, 128 bytes): bits for nodes 0..1023
+    for i in 0..map_bytes.min(128) {
+        h[248 + i] = used[i];
+    }
+    if n_map > 0 {
+        h[0..4].copy_from_slice(&first_map_no.to_be_bytes()); // ndFLink -> first map node
+    }
     out.extend_from_slice(&h);
     for n in &all_nodes {
         out.extend_from_slice(n);
     }
+    for m in &map_nodes {
+        out.extend_from_slice(m);
+    }
     Ok((out, total_nodes, root_node, first_leaf, last_leaf, leaf_records, max_key))
 }
 
-/// Patch the header-node BTHeaderRec (record at offset 14):
-/// depth, root, leafRecords, first/last leaf, nodeSize, totalNodes.
+/// Patch the header-node BTHeaderRec (record at offset 14). Layout
+/// (TN1150, verified vs Linux hfs_btree_header_rec, packed):
+/// depth+0 root+2 leafCount+6 firstLeaf+10 lastLeaf+14 nodeSize+16
+/// maxKeyLen+18 totalNodes+20 freeNodes+24 usedNodes+28 clumpSize+30
+/// btreeType+34 keyCompareType+35 attributes+36.
 fn patch_header(
     h: &mut [u8],
     depth: u16,
@@ -734,17 +826,20 @@ fn patch_header(
     h[o..o + 2].copy_from_slice(&depth.to_be_bytes());
     h[o + 2..o + 6].copy_from_slice(&root.to_be_bytes());
     h[o + 6..o + 10].copy_from_slice(&leaf_records.to_be_bytes());
-    h[o + 10..o + 12].copy_from_slice(&(first_leaf as i16).to_be_bytes());
-    h[o + 12..o + 14].copy_from_slice(&(last_leaf as i16).to_be_bytes());
-    h[o + 14..o + 16].copy_from_slice(&4096i16.to_be_bytes());
-    h[o + 18..o + 22].copy_from_slice(&total_nodes.to_be_bytes());
+    h[o + 10..o + 14].copy_from_slice(&(first_leaf as i32).to_be_bytes());
+    h[o + 14..o + 18].copy_from_slice(&(last_leaf as i32).to_be_bytes());
+    h[o + 18..o + 20].copy_from_slice(&4096u16.to_be_bytes());
+    // maxKeyLen (+20..22) untouched: set by empty_btree_header_node
+    h[o + 22..o + 26].copy_from_slice(&total_nodes.to_be_bytes());
+    // freeNodes (+26) stays 0: no pre-allocated free nodes
 }
 
 fn finish_node(buf: &[u8], offs: &[u16], kind: i8, height: u8, data_end: u16) -> Vec<u8> {
     let mut node = buf.to_vec();
+    // BTNodeDescriptor: fLink@0 bLink@4 kind@8 height@9 numRecords@10
     node[8] = kind as u8;
-    node[10] = height;
-    node[12..14].copy_from_slice(&(offs.len() as u16).to_be_bytes());
+    node[9] = height;
+    node[10..12].copy_from_slice(&(offs.len() as u16).to_be_bytes());
     let mut t = 4096usize;
     for o in offs {
         t -= 2;
@@ -759,11 +854,12 @@ fn finish_node_index(buf: &[u8], offs: &[u16], data_end: u16, height: u8) -> Vec
     finish_node(buf, offs, NODE_INDEX, height, data_end)
 }
 
-/// First record's stored key ([keyLen u16][key bytes]) of a packed node.
+/// First record's stored key CONTENT (parent+name, no length prefix) of a
+/// packed node — the form stored in index records.
 fn first_key_of(node: &[u8]) -> Vec<u8> {
     let first_off = u16_from(&node[4094..4096]) as usize;
     let klen = u16_from(&node[first_off..first_off + 2]) as usize;
-    node[first_off..first_off + 2 + klen].to_vec()
+    node[first_off + 2..first_off + 2 + klen].to_vec()
 }
 
 fn u16_from(b: &[u8]) -> u16 {
@@ -776,29 +872,39 @@ fn sort_key(parent: u32, name: &str) -> Vec<u8> {
     s
 }
 
-/// Empty extents-overflow B-tree: a single header node.
+/// Empty extents-overflow B-tree: a single header node. Layout per TN1150
+/// (compiled-verified vs Linux hfs_btree_header_rec, record-relative):
+/// depth+0 root+2 leafCount+6 firstLeaf+10 lastLeaf+14 nodeSize+18
+/// maxKeyLen+20 totalNodes+22 freeNodes+26 usedNodes+30 clumpSize+32
+/// btreeType+36 keyCompareType+37 attributes+38.
 fn empty_btree_header_node(node_size: usize, max_key: u16) -> Vec<u8> {
     let mut n = vec![0u8; node_size];
-    n[8] = NODE_HEADER as u8;
-    n[12..14].copy_from_slice(&3u16.to_be_bytes());
+    n[8] = NODE_HEADER as u8;   // nd.type @8
+    n[9] = 0;                    // nd.height
+    n[10..12].copy_from_slice(&3u16.to_be_bytes()); // nd.num_recs @10
     let h = 14;
-    n[h..h + 2].copy_from_slice(&1i16.to_be_bytes());
+    // depth 0 = EMPTY tree (no leaves): fsck_hfs SearchTree treats depth>=1
+    // with root=0 as a real node access ("curNodeNum is 0", error 2).
+    // patch_header overwrites depth for non-empty trees (the catalog).
+    n[h..h + 2].copy_from_slice(&0i16.to_be_bytes());
     n[h + 2..h + 6].copy_from_slice(&0u32.to_be_bytes());
     n[h + 6..h + 10].copy_from_slice(&0u32.to_be_bytes());
-    n[h + 10..h + 12].copy_from_slice(&0i16.to_be_bytes());
-    n[h + 12..h + 14].copy_from_slice(&0i16.to_be_bytes());
-    n[h + 14..h + 16].copy_from_slice(&(node_size as i16).to_be_bytes());
-    n[h + 16..h + 18].copy_from_slice(&max_key.to_be_bytes());
-    n[h + 18..h + 22].copy_from_slice(&1u32.to_be_bytes());
-    n[h + 22..h + 26].copy_from_slice(&0u32.to_be_bytes());
-    n[h + 26..h + 28].copy_from_slice(&0u16.to_be_bytes());
-    n[h + 28..h + 32].copy_from_slice(&BLOCK.to_be_bytes());
-    n[h + 32] = 0; // btreeType: kHFSBTreeType
-    n[h + 33] = KEY_BINARY;
-    n[h + 34..h + 38].copy_from_slice(&0u32.to_be_bytes());
-    // userData (128) + map (128) stay zero; offsets:
+    n[h + 10..h + 14].copy_from_slice(&0i32.to_be_bytes()); // firstLeaf
+    n[h + 14..h + 18].copy_from_slice(&0i32.to_be_bytes()); // lastLeaf
+    n[h + 18..h + 20].copy_from_slice(&(node_size as u16).to_be_bytes());
+    n[h + 20..h + 22].copy_from_slice(&max_key.to_be_bytes());
+    n[h + 22..h + 26].copy_from_slice(&1u32.to_be_bytes()); // totalNodes
+    n[h + 26..h + 30].copy_from_slice(&0u32.to_be_bytes()); // freeNodes
+    n[h + 30..h + 32].copy_from_slice(&0u16.to_be_bytes()); // usedNodes
+    n[h + 32..h + 36].copy_from_slice(&BLOCK.to_be_bytes()); // clumpSize
+    n[h + 36] = 0; // btreeType: kHFSBTreeType
+    n[h + 37] = KEY_BINARY;
+    n[h + 38..h + 42].copy_from_slice(&0u32.to_be_bytes()); // attributes
+    // map record (offset 248): mark node 0 (this header node) as used
+    n[248] = 0x80;
+    // node descriptor offsets: [userData 120, map 248, free space 376]
     let mut o = node_size;
-    for rec in [14usize, 14 + 106, 14 + 106 + 128] {
+    for rec in [14usize, 14 + 106, 248] {
         o -= 2;
         n[o..o + 2].copy_from_slice(&(rec as u16).to_be_bytes());
     }

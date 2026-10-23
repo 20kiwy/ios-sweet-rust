@@ -38,6 +38,7 @@ pub mod kexts;
 pub mod macho;
 pub mod mkadt;
 pub mod png;
+pub mod rootfs;
 pub mod payload;
 pub mod plist;
 pub mod qemu;
