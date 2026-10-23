@@ -50,7 +50,7 @@ jobs:
         run: |
           cargo build --release
           cargo test --release
-          sha256sum -c kernel/SHA256SUMS
+          (cd kernel && sha256sum -c SHA256SUMS)
 
       - name: Resolve the IPSW URL
         run: |
