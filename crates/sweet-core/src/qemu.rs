@@ -44,6 +44,14 @@ pub struct RunOptions {
     /// right before QEMU quits. Launchd and daemons write TEXT logs to files
     /// on the ramdisk; the console only ever shows kernel panics.
     pub dump_ramdisk: bool,
+    /// When set (seconds), pmemsave the framebuffer to fb-NNNN.png every N
+    /// seconds WHILE THE GUEST RUNS. fb.png is only the LAST console screen;
+    /// launchd's os_log mirror floods it in a spawn-retry cycle, so a single
+    /// end-of-boot screenshot loses everything but the tail. Interval snaps
+    /// give the launchd log a TIMELINE in artifacts (each decodes to text
+    /// via screen-decode --kernel). No QMP conflicts: each snap is a fresh
+    /// sequential connection, closed before the next.
+    pub snap_every: Option<f64>,
 }
 
 impl Default for RunOptions {
@@ -59,6 +67,7 @@ impl Default for RunOptions {
             ram_file: None,
             msgbufp: None,
             dump_ramdisk: false,
+            snap_every: None,
             qemu_datadir: Vec::new(),
             logo: None,
         }
@@ -615,6 +624,30 @@ fn stream_serial(serial_path: &Path, file_pos: &mut u64, out: &mut impl Write) {
 // The boot itself
 // ---------------------------------------------------------------------------
 
+/// Live-interval framebuffer snapshot: fresh sequential QMP connection,
+/// pmemsave the FB (no VM stop — the guest keeps running), encode PNG.
+fn snap_fb(mon: &Transport, out: &Path, at_secs: u64) -> Result<PathBuf> {
+    let mut q = Qmp::connect(mon)?;
+    q.handshake()?;
+    let raw_name = format!("fb-{at_secs:04}.raw");
+    let mut args = J::obj();
+    args.set("val", J::n(FB_BASE as f64));
+    args.set("size", J::n((FB_STRIDE * FB_H) as f64));
+    args.set("filename", J::s(out.join(&raw_name).display().to_string()));
+    if let J::Obj(m) = q.call("pmemsave", args)? {
+        if let Some(J::Obj(e)) = m.get("error") {
+            return Err(crate::Error::Msg(format!("qmp pmemsave: {e:?}")));
+        }
+    }
+    drop(q);
+    let raw = std::fs::read(out.join(&raw_name))?;
+    let png = crate::png::encode_fb(FB_W, FB_H, &raw)?;
+    let png_path = out.join(format!("fb-{at_secs:04}.png"));
+    std::fs::write(&png_path, &png)?;
+    let _ = std::fs::remove_file(out.join(&raw_name));
+    Ok(png_path)
+}
+
 pub struct BootOutputs {
     pub fb_png: PathBuf,
     pub regs_txt: PathBuf,
@@ -736,9 +769,21 @@ pub fn run(
     let mut p: Child = cmd.spawn()?;
     let t0 = Instant::now();
     let mut stdout = std::io::stdout();
+    let mut last_snap = 0f64;
     while p.try_wait()?.is_none() && t0.elapsed() < Duration::from_secs_f64(opts.secs) {
         if opts.live_serial {
             stream_serial(&serial_path, &mut serial_pos, &mut stdout);
+        }
+        if let Some(every) = opts.snap_every {
+            let el = t0.elapsed().as_secs_f64();
+            // leave the last `every` seconds to the end-of-boot screenshot
+            if el - last_snap >= every && el < opts.secs - every {
+                last_snap = el;
+                match snap_fb(&mon, &out, el as u64) {
+                    Ok(path) => eprintln!("snap: {}", path.display()),
+                    Err(e) => eprintln!("snap failed: {e}"),
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
     }

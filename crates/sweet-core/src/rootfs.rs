@@ -48,8 +48,29 @@ fn mini_keep_sysos(path: &str) -> bool {
 /// wall with "Could not spawn process /usr/libexec/xpcproxy: 2: No such file
 /// or directory" on every service — user/501 SpringBoard + tccd included.
 /// Without it not a single daemon can ever exec.
+///
+/// The FIRST WAVE (run 40021272762: xpcproxy execs, 68 spawns wave through,
+/// mediaserverd/fairplayd.H2/bluetoothd/WirelessRadioManagerd — all
+/// /usr/sbin — exec and live): the bring-up-critical daemons the launchd
+/// plist tweak already mirrors to the console (CONSOLE_LABELS) + tccd, the
+/// first user-domain service the fb log caught. backboardd owns
+/// com.apple.backboard.display.services + com.apple.iohideventsystem — the
+/// M5/M6 gates (launchd-spawn-map.md).
 fn mini_keep_libexec(path: &str) -> bool {
-    path == "/usr/libexec/usermanagerd" || path == "/usr/libexec/xpcproxy"
+    const FIRST_WAVE: &[&str] = &[
+        "/usr/libexec/usermanagerd",   // muser: getpwnam('mobile')
+        "/usr/libexec/xpcproxy",       // the spawn trampoline
+        "/usr/libexec/backboardd",     // M5: display services gate owner
+        "/usr/libexec/containermanagerd",
+        "/usr/libexec/usabilityd",
+        "/usr/libexec/keybagd",
+        "/usr/libexec/lockdownd",
+        "/usr/libexec/logd",
+        "/usr/libexec/configd",
+        "/usr/libexec/watchdogd",
+        "/usr/libexec/tccd",
+    ];
+    FIRST_WAVE.contains(&path)
 }
 
 /// `mini` profile inclusion (boot-critical closure for launchd).

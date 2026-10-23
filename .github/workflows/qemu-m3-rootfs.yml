@@ -128,6 +128,7 @@ jobs:
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
             --highmem --no-logo --secs 240 --dump-ramdisk \
+            --snap-every 20 \
             --msgbuf-dump "0x$MSGREF" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
@@ -171,6 +172,18 @@ jobs:
           set -e
           echo "screen-decode rc=$rc"
           wc -c out-m3/fb.txt || true
+          # the interval snapshots (fb-NNNN.png, --snap-every 20): decode each
+          # to text — together they are the launchd os_log TIMELINE (the
+          # single end-of-boot fb.png only holds the last console screen)
+          for p in out-m3/fb-[0-9]*.png; do
+            [ -f "$p" ] || continue
+            t="${p%.png}.txt"
+            ./target/release/sweet-rust screen-decode \
+              --kernel kernel/kernel.development.sweet \
+              --payload out-m3/payload.bin \
+              "$p" > "$t" 2>/dev/null || true
+            echo "--- $t ($(wc -c < "$t") bytes)"
+          done
           cat out-m3/boot-verdict.json || true
 
       - name: M3 verdict (v2 — launchd-positive stages)
@@ -195,7 +208,7 @@ jobs:
         run: |
           tail -40 out-m3/fb.txt 2>/dev/null || true
           python3 - <<'EOF'
-          import json, re, sys
+          import glob, json, re, sys
           v = json.load(open('out-m3/boot-verdict.json'))
           def read(p):
               try:
@@ -203,7 +216,10 @@ jobs:
               except OSError:
                   return ''
           fb, mb = read('out-m3/fb.txt'), read('out-m3/msgbuf.txt')
-          fb_flat = re.sub(r'\s+', ' ', fb)
+          # the interval snapshots: the launchd log TIMELINE (fb.txt is only
+          # the last console screen)
+          snaps = ''.join(read(p) for p in sorted(glob.glob('out-m3/fb-*.txt')))
+          fb_flat = re.sub(r'\s+', ' ', fb + '\n' + snaps)
           mb_flat = re.sub(r'\s+', ' ', mb)
           both = fb_flat + ' || ' + mb_flat
           # the fbcon wraps at ~54 columns, often mid-word: match on FLATTENED text
@@ -245,6 +261,8 @@ jobs:
           path: |
             out-m3/fb.png
             out-m3/fb.txt
+            out-m3/fb-*.png
+            out-m3/fb-*.txt
             out-m3/msgbuf.bin
             out-m3/msgbuf.txt
             out-m3/boot-verdict.json

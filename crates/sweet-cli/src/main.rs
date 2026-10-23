@@ -99,6 +99,7 @@ COMMANDS:
         running QEMU - for debugging loaders.
 
     boot-qemu <PAYLOAD> <OUTDIR> [--secs 20] [--cpu cortex-a76] [--gdb]
+        [--snap-every N]  # interval fb screenshots while the guest runs
         [--logo LOGO.bin | --logo-ipsw IPSW] [--live-serial] [--qemu-datadir D]
         [--check-env]
         Boot the payload in QEMU virt; writes fb.png / regs.txt / serial.txt /
@@ -106,7 +107,7 @@ COMMANDS:
 
     ipsw-boot --ipsw IPSW|URL <OUTDIR> [--kernel K | --demo] [--ramdisk IMAGE]
         [--cmdline \"...\"] [--secs 120] [--product FILE.adt] [--logo-scale 33]
-        [--cpu MODEL] [--no-logo] [--live-serial]
+        [--cpu MODEL] [--no-logo] [--live-serial] [--snap-every N]
         The full pipeline in one command: IPSW -> logo asset + (kernelcache |
         demo kernel) -> payload -> logo injection -> QEMU -> fb.png +
         boot-verdict.json. Verdict checks: logo visible, serial marker,
@@ -269,11 +270,11 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "decmp-dump" => vec!["member", "out", "bytes", "scan", "rsrc"],
         "rootfs-plan" => vec![],
         "screen-decode" => vec!["kernel", "payload", "nm"],
-        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp"],
+        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "snap-every"],
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
             "logo-scale", "cpu", "w", "h", "qemu-datadir", "hello-lang",
-            "hmp", "msgbuf-dump",
+            "hmp", "msgbuf-dump", "snap-every",
         ],
         _ => vec![],
     }
@@ -1583,6 +1584,7 @@ fn cmd_boot_qemu(args: &[String]) -> Result<()> {
         cpu: f.val("cpu").unwrap_or("cortex-a76").to_string(),
         live_serial: f.has("live-serial"),
         dump_ramdisk: f.has("dump-ramdisk"),
+        snap_every: f.val("snap-every").and_then(|v| v.parse().ok()),
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()
     };
@@ -1749,6 +1751,7 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         cpu: f.val("cpu").unwrap_or("cortex-a76").to_string(),
         live_serial: f.has("live-serial"),
         dump_ramdisk: f.has("dump-ramdisk"),
+        snap_every: f.val("snap-every").and_then(|v| v.parse().ok()),
         logo: if f.has("no-logo") { None } else { logo_blob.clone() },
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()
