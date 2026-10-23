@@ -166,6 +166,26 @@ reality beats the original guess.
   added. mkiosroot no longer skips anything for algo 14: the mini root now
   carries the COMPLETE dyld shared cache, so dyld can resolve
   `/usr/lib/libSystem.B.dylib` for launchd.
+* **The user-database wall — 'mobile' unresolved (run 40002930779, 2026-10-23).**
+  With the complete DSC, the real launchd loaded libSystem from the dyld
+  cache, ran as PID 1 with 5 threads and `OS release type: User`, then
+  exited with its own reason: `unable to resolve 'mobile': 114 - The
+  specified username does not exist`. iOS 16.7 ships NO opendirectoryd, NO
+  DarwinDirectory framework and NO usermanagementd — the user resolver is
+  **usermanagerd** (`/usr/libexec/usermanagerd`), which registers
+  `com.apple.system.libinfo.muser`, the exact Mach service libinfo's muser
+  module needs for getpwnam. Its plist was already in the mini root; the
+  binary was not. Fix: add `/usr/libexec/usermanagerd` to the mini profile
+  (+ the boot-closure verifier now asserts it).
+* **The algo-9 corruption fix (found while chasing the same wall).**
+  decmpfs algo 9 (uncompressed-inline) on APFS carries a 1-byte marker
+  (0xCC) between the fpmc header and the raw bytes — payload length is
+  `uncompressed_size + 1`. The old verbatim copy kept the marker and dropped
+  the final byte, silently corrupting every algo-9 file in the image
+  (135,724 files volume-wide; LaunchDaemons plists among them —
+  usermanagerd's own plist would not have parsed). Verified on hosts,
+  group, backboardd/configd/usermanagerd plists; unit test added; both the
+  marker and marker-less forms decode verbatim now.
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —

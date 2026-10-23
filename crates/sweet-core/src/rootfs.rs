@@ -35,6 +35,16 @@ fn mini_keep_sysos(path: &str) -> bool {
     path.starts_with("/System/Library/Caches/com.apple.dyld/")
 }
 
+/// `mini` profile: boot-critical /usr/libexec binaries, added one wall at a
+/// time. usermanagerd serves `com.apple.system.libinfo.muser` — the Mach
+/// service libinfo's muser module needs for getpwnam (iOS 16.7 has no
+/// opendirectoryd/DarwinDirectory/usermanagementd; usermanagerd IS the user
+/// database resolver). Without it launchd dies with
+/// "unable to resolve 'mobile': 114 - The specified username does not exist".
+fn mini_keep_libexec(path: &str) -> bool {
+    path == "/usr/libexec/usermanagerd"
+}
+
 /// `mini` profile inclusion (boot-critical closure for launchd).
 fn mini_keep(path: &str, is_dir: bool) -> bool {
     let top_level = !path[1..].contains('/');
@@ -60,7 +70,7 @@ fn mini_keep(path: &str, is_dir: bool) -> bool {
         "/usr/local/",
         "/usr/share/",
     ];
-    prefixes.iter().any(|p| path.starts_with(p)) || top_symlink || top_dir
+    prefixes.iter().any(|p| path.starts_with(p)) || top_symlink || top_dir || mini_keep_libexec(path)
 }
 
 struct Builder<'a> {
@@ -690,7 +700,11 @@ fn verify_boot_critical(
             None => missing.push(format!("{d} (missing dir)")),
         }
     }
-    for f in ["/sbin/launchd"] {
+    for f in [
+        "/sbin/launchd",
+        // the libinfo muser backend: getpwnam('mobile') dies without it
+        "/usr/libexec/usermanagerd",
+    ] {
         if !matches!(find(f), Some(e) if !e.is_dir && e.size > 0) {
             missing.push(format!("{f} (missing file)"));
         }

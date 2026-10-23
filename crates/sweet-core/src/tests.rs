@@ -849,3 +849,35 @@ fn decmpfs_algo14_zbitmap_roundtrip() {
     let got2 = crate::apfs::decompress_for_test(14, raw_src.len(), &[], Some(&rsrc2)).unwrap();
     assert_eq!(got2, raw_src, "raw chunk round-trip mismatch");
 }
+
+/// decmpfs algo 9 (uncompressed-inline): APFS records carry a 1-byte marker
+/// (0xCC observed on the real 16.7.16 IPSW) between the fpmc header and the
+/// raw bytes — payload length == usize + 1. The old verbatim copy produced
+/// files shifted by one byte (marker kept, last byte dropped), corrupting
+/// every algo-9 file (LaunchDaemons plists among them). Both the marker and
+/// the marker-less form must decode verbatim.
+#[test]
+fn decmpfs_algo9_marker_skip() {
+    let body: Vec<u8> = (0..50u32).map(|i| b"A"[0] + (i % 26) as u8).collect();
+
+    // marker form: payload = 0xCC + body
+    let mut dec = Vec::new();
+    dec.extend_from_slice(&0u16.to_le_bytes()); // xflags
+    dec.extend_from_slice(&((16 + 1 + body.len()) as u16).to_le_bytes()); // xlen
+    dec.extend_from_slice(b"fpmc");
+    dec.extend_from_slice(&9u32.to_le_bytes());
+    dec.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    dec.push(0xCC);
+    dec.extend_from_slice(&body);
+    // decmp-dump-style record: the reader slices [4..4+xlen] as the fpmc
+    // payload, so emulate the full xattr layout: 4-byte j_xattr_val header
+    // then the record — decompress() receives (algo, usize, payload[16..]).
+    let payload = &dec[4..];
+    let usize_ = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+    let got = crate::apfs::decompress_for_test(9, usize_, &payload[16..], None).unwrap();
+    assert_eq!(got, body, "algo 9 with marker must skip it");
+
+    // marker-less form: payload = body verbatim
+    let got2 = crate::apfs::decompress_for_test(9, body.len(), &body, None).unwrap();
+    assert_eq!(got2, body, "algo 9 without marker must be verbatim");
+}

@@ -889,7 +889,20 @@ fn node_entries(b: &[u8], flags: u16, nkeys: u32, bs: usize) -> Result<Vec<Ent>>
 fn decompress(algo: u32, usize_: usize, inline: &[u8], rsrc: Option<&[u8]>) -> Result<Vec<u8>> {
     match algo {
         3 => crate::ipsw::zlib_inflate(inline, usize_),
-        9 => Ok(inline[..usize_.min(inline.len())].to_vec()),
+        9 => {
+            // APFS uncompressed-inline. Observed on the real 16.7.16 IPSW:
+            // the payload after the 16-byte fpmc header carries a 1-byte
+            // marker (0xCC) before the raw bytes (payload == usize_ + 1);
+            // the previous verbatim copy shifted every algo-9 file by one
+            // byte (0xCC prefix, last byte dropped). Handle both forms.
+            if inline.len() == usize_ {
+                Ok(inline.to_vec())
+            } else if inline.len() == usize_ + 1 {
+                Ok(inline[1..].to_vec())
+            } else {
+                bail!("algo 9 payload {} bytes, want {usize_} (+1)", inline.len());
+            }
+        }
         11 => crate::im4p::lzfse_exact(inline, usize_),
         4 | 12 => {
             let rsrc = rsrc.ok_or_else(|| crate::Error::Msg("algo needs resource fork".into()))?;
