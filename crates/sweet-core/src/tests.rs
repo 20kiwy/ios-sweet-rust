@@ -680,3 +680,31 @@ fn macho_fat_slice_and_dylibs() {
     assert_eq!(off2, 0);
     assert_eq!(m2.dylibs.len(), 2);
 }
+
+#[test]
+fn plist_roundtrip_real_launchd() {
+    // real /System/Library/xpc/launchd.plist from the 16.7.16 IPSW
+    let path = std::path::Path::new("/tmp/research/launchd.plist");
+    if !path.exists() {
+        return; // asset not present in this environment
+    }
+    let raw = std::fs::read(path).unwrap();
+    let p = match crate::plist::parse(&raw) { Ok(p) => p, Err(e) => panic!("parse failed: {e}") };
+    let d = p.as_dict().unwrap();
+    let daemons = d
+        .get("LaunchDaemons")
+        .and_then(|x| x.as_dict())
+        .expect("LaunchDaemons dict");
+    assert!(daemons.len() > 300, "expected ~491 daemons, got {}", daemons.len());
+    // serialize + reparse must preserve the daemon count
+    let out = crate::plist::write(&p).unwrap();
+    std::fs::write("/tmp/research/launchd.rewritten.plist", &out).unwrap();
+    let p2 = crate::plist::parse(&out).unwrap();
+    let d2 = p2.as_dict().unwrap();
+    let daemons2 = d2["LaunchDaemons"].as_dict().unwrap();
+    assert_eq!(daemons.len(), daemons2.len());
+    // spot-check one job dict
+    let first = daemons.iter().next().unwrap();
+    let job2 = daemons2.get(first.0).expect("same job in rewritten plist");
+    assert_eq!(first.1, job2);
+}

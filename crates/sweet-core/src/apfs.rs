@@ -66,7 +66,11 @@ pub struct Apfs {
     /// parent dir id -> { name -> file id }
     pub dirs: HashMap<u64, HashMap<String, u64>>,
     /// id -> (mode, size)
-    inodes: HashMap<u64, (u16, u64)>,
+    inodes: HashMap<u64, (u16, u32, u32, u64)>,
+    /// inode_val raw value length (diagnostics: optional-field presence)
+    inode_val_lens: HashMap<u64, u64>,
+    /// raw inode_val bytes (SWEET_INODE_DUMP diagnostics only)
+    inode_raw: HashMap<u64, Vec<u8>>,
     /// id -> extents (files and dstreams)
     extents: HashMap<u64, Vec<Extent>>,
     /// id -> { xattr name -> raw j_xattr_val value }
@@ -91,6 +95,8 @@ impl Apfs {
             inodes: HashMap::new(),
             extents: HashMap::new(),
             xattrs: HashMap::new(),
+            inode_val_lens: HashMap::new(),
+            inode_raw: HashMap::new(),
         };
 
         // container omap -> volume superblock oids
@@ -145,19 +151,12 @@ impl Apfs {
         // candidates as long as one volume indexes.
         let mut indexed = 0usize;
         let mut last_err = None;
-        if std::env::var("SWEET_APFS_DEBUG").is_ok() {
-            eprintln!("apfs: {} candidates", fs_roots.len());
-            for (vo, rt) in &fs_roots { eprintln!("  cand: vol-omap={vo:#x} root-tree={rt:#x}"); }
-        }
         for (vol_omap_oid, root_tree_oid) in fs_roots {
             let vom = match ap.blk(vol_omap_oid) {
                 Ok(v) if u32le(&v, 0x18) & 0xFFFF == T_OMAP => v,
                 _ => continue, // stale checkpoint: not a live omap
             };
             let vot = u64le(&vom, 0x30);
-            if std::env::var("SWEET_APFS_DEBUG").is_ok() {
-                eprintln!("  try: vol-omap={vol_omap_oid:#x} vot={vot:#x} root={root_tree_oid:#x}");
-            }
             let root = match ap.omap_lookup(vot, root_tree_oid) {
                 Ok(r) => r,
                 Err(e) => {
@@ -284,11 +283,19 @@ impl Apfs {
                         self.dirs.entry(kid).or_default().insert(name, file_id);
                     }
                     J_INODE => {
-                        if e.3 >= 92 {
-                            let mode = u16le(&b, e.2 + 80);
-                            let size = u64le(&b, e.2 + 84);
-                            self.inodes.insert(kid, (mode, size));
-                        }
+                        // apfs_inode_val: owner u32 @72, group u32 @76,
+                        // mode u16 @80, pad u16 @82, optional
+                        // uncompressed_size u64 @84 (present iff val >= 92)
+                        let mode = if e.3 >= 82 { u16le(&b, e.2 + 80) } else { 0 };
+                        let owner = if e.3 >= 76 { u32le(&b, e.2 + 72) } else { 0 };
+                        let group = if e.3 >= 80 { u32le(&b, e.2 + 76) } else { 0 };
+                        let size = if e.3 >= 92 { u64le(&b, e.2 + 84) } else { 0 };
+                        self.inode_val_lens.insert(kid, e.3 as u64);
+                        // keep raw inode_val: xfield chains (hardlink sizes)
+                        // are needed for exact file sizes at build time
+                        let end = (e.2 + e.3).min(b.len());
+                        self.inode_raw.insert(kid, b[e.2..end].to_vec());
+                        self.inodes.insert(kid, (mode, owner, group, size));
                     }
                     J_FILE_EXTENT => {
                         let laddr = u64le(&b, e.0 + 8);
@@ -377,27 +384,91 @@ impl Apfs {
     /// coverage (extents / decmpfs) over the catalog inode field, which is
     /// 0 for files whose inode_val omits the optional uncompressed-size
     /// field (observed on WallpaperKit HEIC assets in 16.7.16).
-    pub fn stat(&self, fid: u64) -> Option<(u16, u64)> {
-        let size = self.file_size(fid);
-        let mode = self.inodes.get(&fid).map(|(m, _)| *m)?;
-        Some((mode, size))
+    /// Raw inode_val length for a file id (diagnostics).
+    pub fn inode_val_len(&self, fid: u64) -> Option<u64> {
+        self.inode_val_lens.get(&fid).copied()
     }
 
-    /// Best-effort logical file size: extent coverage -> decmpfs record ->
-    /// inode size field.
+    /// Raw inode_val bytes (requires SWEET_INODE_DUMP=1 at open).
+    pub fn inode_raw(&self, fid: u64) -> Option<&[u8]> {
+        self.inode_raw.get(&fid).map(|v| v.as_slice())
+    }
+
+    /// (mode, uid, gid, size) for a file id, if indexed. Size prefers real
+    /// data coverage (extents / decmpfs) over the catalog inode field, which
+    /// is 0 for files whose inode_val omits the optional uncompressed-size
+    /// field (observed on WallpaperKit HEIC assets in 16.7.16).
+    pub fn stat(&self, fid: u64) -> Option<(u16, u32, u32, u64)> {
+        let size = self.file_size(fid);
+        let (mode, uid, gid) = self.inodes.get(&fid).map(|(m, o, g, _)| (*m, *o, *g))?;
+        Some((mode, uid, gid, size))
+    }
+
+    /// Exact logical file size. Order matters: decmpfs record (exact) ->
+    /// inode uncompressed_size at +84 (present only in 92-byte inode_vals) ->
+    /// xfield hardlink-info size (longer inode_vals) -> extent coverage
+    /// (block-rounded LAST-RESORT — a rounded size corrupts binary-plist
+    /// trailers, so it is only used when nothing exact exists).
     fn file_size(&self, fid: u64) -> u64 {
+        if let Some(dec) = self.xattrs.get(&fid).and_then(|m| m.get(XS_DECMPFS)) {
+            if dec.len() >= 20 {
+                return u64le(dec, 12); // cmpf header: u16 flags, u16 len, magic, algo u32, usize u64
+            }
+        }
+        if let Some((mode, _, _, size, vlen)) = self.inode_full(fid) {
+            let _ = mode;
+            if vlen == 92 {
+                return size;
+            }
+            if vlen > 92 {
+                if let Some(sz) = self.inode_xfield_hardlink_size(fid) {
+                    return sz;
+                }
+            }
+        }
         if let Some(exts) = self.extents.get(&fid) {
             let m = exts.iter().map(|e| e.laddr + e.len).max().unwrap_or(0);
             if m > 0 {
                 return m;
             }
         }
-        if let Some(dec) = self.xattrs.get(&fid).and_then(|m| m.get(XS_DECMPFS)) {
-            if dec.len() >= 20 {
-                return u64le(dec, 12); // cmpf header: u16 flags, u16 len, magic, algo u32, usize u64
+        0
+    }
+
+    fn inode_full(&self, fid: u64) -> Option<(u16, u32, u32, u64, u64)> {
+        let (m, o, g, s) = self.inodes.get(&fid).copied()?;
+        let vlen = self.inode_val_lens.get(&fid).copied()?;
+        Some((m, o, g, s, vlen))
+    }
+
+    /// Size from the hardlink-info xfield (id 2) of a long inode_val:
+    /// [u16 a][u16 namelen][u32 flags][name][pad8][u64 size ...]. Requires
+    /// SWEET_INODE_DUMP=1 (raw inode capture); falls back to None otherwise.
+    fn inode_xfield_hardlink_size(&self, fid: u64) -> Option<u64> {
+        let raw = self.inode_raw.get(&fid)?;
+        // xfield chain right after the standard 92-byte inode_val base:
+        // (u16 id, u16 len, data)... terminated by (0,0), 4-byte aligned
+        let mut o = 92usize;
+        while o + 4 <= raw.len() {
+            let id = u16le(raw, o);
+            let len = u16le(raw, o + 2) as usize;
+            if id == 0 && len == 0 {
+                break;
             }
+            if id == 2 && o + 4 + len <= raw.len() {
+                let d = &raw[o + 4..o + 4 + len];
+                if d.len() >= 8 {
+                    let namelen = u16le(d, 2) as usize;
+                    let sz_off = 8 + namelen.div_ceil(8) * 8;
+                    if sz_off + 8 <= d.len() {
+                        return Some(u64le(d, sz_off));
+                    }
+                }
+            }
+            o += 4 + len;
+            o = o.div_ceil(8) * 8;
         }
-        self.inodes.get(&fid).map(|(_, s)| *s).unwrap_or(0)
+        None
     }
 
     /// decmpfs raw record for a file id (for provenance diagnostics).
@@ -408,7 +479,7 @@ impl Apfs {
     /// Full file bytes, transparently decompressing decmpfs content.
     pub fn read_file(&mut self, fid: u64) -> Result<Vec<u8>> {
         let (mode, size) = (
-            self.inodes.get(&fid).map(|(m, _)| *m).unwrap_or(0),
+            self.inodes.get(&fid).map(|(m, _, _, _)| *m).unwrap_or(0),
             self.file_size(fid),
         );
         let _ = mode;

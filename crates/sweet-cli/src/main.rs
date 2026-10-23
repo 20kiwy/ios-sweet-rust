@@ -211,6 +211,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "ipsw-ls" => cmd_ipsw_ls(rest),
         "ipsw-find" => cmd_ipsw_find(rest),
         "ipsw-file" => cmd_ipsw_file(rest),
+        "ipsw-stat" => cmd_ipsw_stat(rest),
         "macho-deps" => cmd_macho_deps(rest),
         "kc-kexts" => cmd_kc_kexts(rest),
         "adt-dump" => cmd_adt_dump(rest),
@@ -353,12 +354,12 @@ fn cmd_ipsw_ls(args: &[String]) -> Result<()> {
             if is_dir {
                 println!("d {name}/");
             } else {
-                let size = vol.stat(fid).map(|(_, s)| s).unwrap_or(0);
+                let size = vol.stat(fid).map(|(.., s)| s).unwrap_or(0);
                 println!("  {name}  ({size} bytes, id {fid})");
             }
         }
     } else {
-        let (mode, size) = vol.stat(dir).unwrap_or((0, 0));
+        let (mode, .., size) = vol.stat(dir).unwrap_or((0, 0, 0, 0));
         println!("{path}: not a directory (mode {mode:#o}, {size} bytes)");
     }
     Ok(())
@@ -375,7 +376,7 @@ fn cmd_ipsw_find(args: &[String]) -> Result<()> {
     let mut hits = 0;
     for (path, fid) in vol.walk_all() {
         if path.to_lowercase().contains(&needle_l) {
-            let size = vol.stat(fid).map(|(_, s)| s).unwrap_or(0);
+            let size = vol.stat(fid).map(|(.., s)| s).unwrap_or(0);
             println!("{path}  ({size} bytes)");
             hits += 1;
         }
@@ -407,6 +408,38 @@ fn cmd_ipsw_file(args: &[String]) -> Result<()> {
         "[ok] {path} <- {member}: {} bytes, sha256 {sha}",
         bytes.len()
     );
+    Ok(())
+}
+
+/// ipsw-stat: diagnostics for one path (fid, mode/uid/gid/size, inode val
+/// length, extents, decmpfs presence) — used to debug rootfs assembly.
+fn cmd_ipsw_stat(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("ipsw-stat"));
+    let Some(src) = f.rest.first() else { bail!("usage: ipsw-stat <IPSW|URL|DMG> <PATH>") };
+    let Some(path) = f.rest.get(1) else { bail!("usage: ipsw-stat <IPSW|URL|DMG> <PATH>") };
+    let (member, mut vol) = open_system_volume(src)?;
+    let fid = vol.resolve(path)?;
+    let st = vol.stat(fid);
+    println!("path {path} <- {member}");
+    println!("fid {fid} stat {st:?}");
+    println!("inode_val_len {:?}", vol.inode_val_len(fid));
+    let xs = vol.xattr(fid, "com.apple.decmpfs").is_some();
+    println!("decmpfs: {xs}");
+    if let Some(raw) = vol.inode_raw(fid) {
+        println!("inode_val ({} bytes):", raw.len());
+        for (i, b) in raw.chunks(8).enumerate() {
+            let mut hexs = String::new();
+            for x in b {
+                hexs += &format!("{x:02x} ");
+            }
+            let mut le = String::new();
+            if b.len() == 8 {
+                let v = u64::from_le_bytes(b.try_into().unwrap());
+                le = format!("u64={v} ({v:#x})");
+            }
+            println!("  +{:03}: {hexs} {le}", i * 8);
+        }
+    }
     Ok(())
 }
 

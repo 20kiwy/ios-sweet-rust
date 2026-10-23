@@ -30,6 +30,7 @@ pub mod dmg;
 pub mod fblogo;
 pub mod hash;
 pub mod hello;
+pub mod hfs;
 pub mod ibootim;
 pub mod im4p;
 pub mod ipsw;
@@ -38,6 +39,7 @@ pub mod macho;
 pub mod mkadt;
 pub mod png;
 pub mod payload;
+pub mod plist;
 pub mod qemu;
 
 mod error;
