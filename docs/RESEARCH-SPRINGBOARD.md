@@ -118,6 +118,41 @@ IPSW into the real framebuffer; verdict gains `springboard_visible=true`,
 
 ---
 
+## 3b. Milestone execution log (what actually happened)
+
+The plan above was written before the boot experiments; the real walls came in
+a different order than predicted. This log is kept because the honest map of
+reality beats the original guess.
+
+* **M2 result — the first wall was not IOKit.** The SWEET-patched kernel boots
+  on QEMU virt with zero panics; IOKit matching is cleared by the existing 81
+  patches. The wall was the rootfs: `md0` needs a real iOS HFS+ root
+  (`cannot mount root, errno=19` retry loop). Evidence: `fb-wall.png`, real
+  console text decoded via the kernel's own `_iso_font`.
+* **M3 (rootfs) — built and booted.** `mkiosroot` (pure-Rust HFS+ writer,
+  fsck_hfs-validated) assembles the real root from the live IPSW over HTTP;
+  CI boots it as `md0` with upstream boot-args. Run 39954870630: **the root
+  mounted and Apple's real launchd (from the dyld shared cache) executed**,
+  then exited with its own exit reason:
+  `failed to reserve stdin descriptor: /dev/null: 2` — the kernel's
+  `devfs_kernel_mount("/dev")` (bsd_init.c) needs a real `/dev` DIRECTORY as
+  mountpoint; `devfs_init()` then provides `/dev/null` (3,2) itself.
+* **The /dev fix.** The real rootfs `/dev` is an empty directory (mode
+  0o40755, verified via `ipsw-stat` on the OS volume); our APFS reader
+  misclassified empty dirs as files, so the writer never created the
+  mountpoint. Fixed by classifying from the inode `S_IFDIR` bits + an
+  explicit VFS mountpoint set + a pre-ship boot-critical-closure verifier
+  (`mkiosroot` now asserts `/dev`, `/sbin/launchd`, 491 daemon plists,
+  `SystemVersion.plist`, DSC before the image ships).
+* **Where this lands us:** stage = `launchd` bring-up. Each further wall is
+  expected inside userland (daemon exec/dyld, Mach bootstrap services,
+  `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —
+  the M5/M6 gates from `docs/research/userspace-deps.md`). The QEMU device
+  milestones (AIC/PMGR/DART/disp0 above) stay on the map for anything the
+  SWEET kernel patches do not already clear on `virt`.
+
+---
+
 ## 4. Risks (stated plainly)
 
 * **Scale:** Corellium took a company years. M3–M5 are the hard core; each may
