@@ -33,6 +33,7 @@ pub mod hello;
 pub mod ibootim;
 pub mod im4p;
 pub mod ipsw;
+pub mod kexts;
 pub mod macho;
 pub mod mkadt;
 pub mod png;

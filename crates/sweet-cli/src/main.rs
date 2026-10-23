@@ -48,6 +48,11 @@ COMMANDS:
         Parse the arm64 slice of a (FAT or thin) Mach-O: cputype, segments,
         and every LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB.
 
+    kc-kexts <KERNELCACHE.macho> [--out FILE.md]
+        Parse the prelinked kernelcache __PRELINK_INFO plist: every kext
+        (bundle id, path, load addr) + IOKitPersonalities (IONameMatch,
+        IOProviderClass) - the driver-vs-hardware matching table.
+
     adt-dump <DeviceTree.im4p> [--out FILE.md] [--table]
         Parse the real ADT from an IPSW DeviceTree im4p: full tree dump,
         optionally one line per device node (path, compatible, reg base/size).
@@ -207,6 +212,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "ipsw-find" => cmd_ipsw_find(rest),
         "ipsw-file" => cmd_ipsw_file(rest),
         "macho-deps" => cmd_macho_deps(rest),
+        "kc-kexts" => cmd_kc_kexts(rest),
         "adt-dump" => cmd_adt_dump(rest),
         "emu-boot" => cmd_emu_boot(rest),
         "emu-peek" => cmd_emu_peek(rest),
@@ -234,6 +240,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "ipsw-extract" => vec!["member", "out"],
         "ipsw-file" => vec!["out"],
         "macho-deps" => vec![],
+        "kc-kexts" => vec!["out"],
         "adt-dump" => vec!["out"],
         "emu-boot" => vec![
             "ipsw", "wallpaper", "wallpaper-manifest", "send", "secs", "cpu",
@@ -425,6 +432,56 @@ fn cmd_macho_deps(args: &[String]) -> Result<()> {
     println!("dylibs ({}):", m.dylibs.len());
     for d in &m.dylibs {
         println!("  {d}");
+    }
+    Ok(())
+}
+
+/// kc-kexts: kext + IOKit personality inventory of a prelinked kernelcache.
+fn cmd_kc_kexts(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("kc-kexts"));
+    let Some(path) = f.rest.first() else {
+        bail!("usage: kc-kexts <KERNELCACHE.macho> [--out FILE.md]");
+    };
+    let buf = std::fs::read(path)?;
+    let mut kexts = sc::kexts::prelink_kexts(&buf)?;
+    kexts.sort_by(|a, b| a.bundle_id.cmp(&b.bundle_id));
+    let nper: usize = kexts.iter().map(|k| k.personalities.len()).sum();
+    println!("kexts            : {}", kexts.len());
+    println!("personalities    : {nper}");
+    let with_match: usize =
+        kexts.iter().filter(|k| k.personalities.iter().any(|p| !p.io_name_match.is_empty())).count();
+    println!("with IONameMatch : {with_match}");
+    let mut md = String::new();
+    md.push_str(&format!(
+        "# Kernelcache kext inventory (real IPSW)\n\n| # | CFBundleIdentifier | bundle path | personalities | IONameMatch |\n|---|---|---|---|---|\n"
+    ));
+    for (i, k) in kexts.iter().enumerate() {
+        let per: Vec<String> = k
+            .personalities
+            .iter()
+            .map(|p| {
+                let m = if p.io_name_match.is_empty() {
+                    p.io_provider_class.clone().unwrap_or_default()
+                } else {
+                    p.io_name_match.join(" / ")
+                };
+                format!("{}: {}", p.name, m)
+            })
+            .collect();
+        let per = if per.is_empty() { "-".into() } else { per.join("<br>") };
+        println!("{:3} {:<58} {}", i + 1, k.bundle_id, k.path);
+        md.push_str(&format!(
+            "| {} | `{}` | `{}` | {} | {} |\n",
+            i + 1,
+            k.bundle_id,
+            k.path,
+            k.personalities.len(),
+            per.replace('|', "\\|")
+        ));
+    }
+    if let Some(out) = f.val("out") {
+        std::fs::write(out, &md)?;
+        eprintln!("[ok] wrote {out}");
     }
     Ok(())
 }
@@ -908,7 +965,7 @@ fn cmd_kernel_unpack(args: &[String]) -> Result<()> {
         "{}: {:?} {} -> {} bytes (encrypted={})",
         args[0], info.kind, info.desc, payload.len(), info.encrypted
     );
-    let m = sc::macho::parse(&payload)?;
+    let m = sc::macho::parse_best(&payload)?.0;
     eprintln!("macho: cputype={:#x} segs={} entry={:#x}", m.cputype, m.segments.len(), m.entry);
     Ok(())
 }

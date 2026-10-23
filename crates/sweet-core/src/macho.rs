@@ -15,10 +15,20 @@ pub const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018; // (0x18 | LC_REQ_DYLD)
 pub const LC_LOAD_UPWARD_DYLIB: u32 = 0x8000_0023; // (0x23 | LC_REQ_DYLD)
 pub const LC_REEXPORT_DYLIB: u32 = 0x8000_001f; // (0x1f | LC_REQ_DYLD)
 pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+pub const LC_FILESET_ENTRY: u32 = 0x8000_0035;
 pub const MH_MAGIC_64: u32 = 0xfeedfacf;
 pub const MH_CIGAM_FAT: u32 = 0xbeba_feca; // FAT_MAGIC 0xcafebabe, read LE
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 pub const CPU_TYPE_ARM64E: u32 = 0x0200_000c;
+
+#[derive(Debug, Clone)]
+pub struct Section {
+    pub name: String,
+    pub segname: String,
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -27,6 +37,7 @@ pub struct Segment {
     pub vmsize: u64,
     pub fileoff: u64,
     pub filesize: u64,
+    pub sections: Vec<Section>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +51,15 @@ pub struct Macho {
     pub fixups: Option<(u32, u32)>,
     /// Linked libraries: LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB.
     pub dylibs: Vec<String>,
+    /// LC_FILESET_ENTRY entries (kernel collections).
+    pub fileset: Vec<FilesetEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilesetEntry {
+    pub id: String,
+    pub vmaddr: u64,
+    pub fileoff: u64,
 }
 
 /// (offset, size, cputype) of the arm64 slice of a FAT Mach-O (thin files
@@ -93,8 +113,15 @@ pub fn parse(buf: &[u8]) -> Result<Macho> {
     let cputype = u32le(buf, 4);
     let cpusub = u32le(buf, 8) & 0xff;
     let ncmds = u32le(buf, 16) as usize;
-    let mut m =
-        Macho { cputype, cpusub, segments: Vec::new(), entry: 0, fixups: None, dylibs: Vec::new() };
+    let mut m = Macho {
+        cputype,
+        cpusub,
+        segments: Vec::new(),
+        entry: 0,
+        fixups: None,
+        dylibs: Vec::new(),
+        fileset: Vec::new(),
+    };
     let mut off = 32usize;
     for _ in 0..ncmds {
         if off + 8 > buf.len() {
@@ -115,12 +142,38 @@ pub fn parse(buf: &[u8]) -> Result<Macho> {
                     .take_while(|&&c| c != 0)
                     .map(|&c| c as char)
                     .collect::<String>();
+                let nsects = u32le(buf, off + 64) as usize;
+                let mut sections = Vec::new();
+                for i in 0..nsects {
+                    let so = off + 72 + i * 80;
+                    if so + 80 > buf.len() {
+                        bail!("section header out of bounds");
+                    }
+                    let sname: String = buf[so..so + 16]
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as char)
+                        .collect();
+                    let sgname: String = buf[so + 16..so + 32]
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as char)
+                        .collect();
+                    sections.push(Section {
+                        name: sname,
+                        segname: sgname,
+                        addr: u64le(buf, so + 32),
+                        size: u64le(buf, so + 40),
+                        offset: u32le(buf, so + 48),
+                    });
+                }
                 m.segments.push(Segment {
                     name,
                     vmaddr: u64le(buf, off + 24),
                     vmsize: u64le(buf, off + 32),
                     fileoff: u64le(buf, off + 40),
                     filesize: u64le(buf, off + 48),
+                    sections,
                 });
             }
             LC_UNIXTHREAD => {
@@ -154,6 +207,27 @@ pub fn parse(buf: &[u8]) -> Result<Macho> {
                 if !name.is_empty() {
                     m.dylibs.push(name);
                 }
+            }
+            LC_FILESET_ENTRY => {
+                // fileset_entry_command: cmd, cmdsize, vmaddr, fileoff,
+                // entry_id (string offset), reserved
+                if size < 32 {
+                    bail!("short LC_FILESET_ENTRY");
+                }
+                let id_off = off + u32le(buf, off + 24) as usize;
+                if id_off >= buf.len() || id_off >= off + size {
+                    bail!("fileset entry_id offset out of bounds");
+                }
+                let id: String = buf[id_off..off + size]
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as char)
+                    .collect();
+                m.fileset.push(FilesetEntry {
+                    id,
+                    vmaddr: u64le(buf, off + 8),
+                    fileoff: u64le(buf, off + 16),
+                });
             }
             _ => {}
         }
