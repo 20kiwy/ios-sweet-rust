@@ -319,6 +319,10 @@ impl Session {
         let serial = match &spawned.serial_sock {
             #[cfg(unix)]
             Some(p) => SerialLink::connect_unix(p)?,
+            // exhaustiveness on non-unix hosts (spawn_session only sets the
+            // unix socket on unix; the marker file below carries the port)
+            #[cfg(not(unix))]
+            Some(_) => unreachable!("serial_sock is never Some on non-unix"),
             None => {
                 // Windows path passes the TCP port through the out dir marker
                 let port_file = spawned.out.join("serial.tcp");
