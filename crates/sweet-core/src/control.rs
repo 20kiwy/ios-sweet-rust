@@ -167,11 +167,13 @@ pub struct SerialLink {
 }
 
 enum SerialStream {
+    #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
     Tcp(TcpStream),
 }
 
 impl SerialLink {
+    #[cfg(unix)]
     fn connect_unix(p: &Path) -> Result<Self> {
         let t0 = Instant::now();
         loop {
@@ -223,6 +225,7 @@ impl SerialLink {
         let mut tmp = [0u8; 65536];
         loop {
             let n = match &mut self.stream {
+                #[cfg(unix)]
                 SerialStream::Unix(s) => match s.read(&mut tmp) {
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -254,6 +257,7 @@ impl SerialLink {
     /// Send bytes INTO the guest UART (RX side).
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
         match &mut self.stream {
+            #[cfg(unix)]
             SerialStream::Unix(s) => {
                 s.set_nonblocking(false)?;
                 s.write_all(bytes)?;
@@ -313,6 +317,7 @@ impl Session {
     pub fn boot(payload: &Path, outdir: &Path, opts: &RunOptions, gdb_port: u16) -> Result<Self> {
         let spawned = crate::qemu::spawn_session(payload, outdir, opts, gdb_port)?;
         let serial = match &spawned.serial_sock {
+            #[cfg(unix)]
             Some(p) => SerialLink::connect_unix(p)?,
             None => {
                 // Windows path passes the TCP port through the out dir marker

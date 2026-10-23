@@ -349,6 +349,7 @@ pub enum Transport {
     Tcp(String, u16),
 }
 
+#[cfg(unix)]
 pub struct Qmp {
     reader: BufReader<std::os::unix::net::UnixStream>,
     writer: std::os::unix::net::UnixStream,
@@ -381,14 +382,6 @@ fn connect(t: &Transport) -> Result<Qmp> {
     Ok(Qmp { reader: BufReader::new(stream.try_clone()?), writer: stream })
 }
 
-#[cfg(not(windows))]
-impl Qmp {
-    pub fn connect(t: &Transport) -> Result<Qmp> {
-        connect(t)
-    }
-}
-
-#[cfg(windows)]
 impl Qmp {
     pub fn connect(t: &Transport) -> Result<Qmp> {
         connect(t)
