@@ -103,13 +103,19 @@ jobs:
           test "$invalid" -eq 0
 
       - name: Boot md0 = mini-root with the real SWEET kernel (highmem)
+        # ncl=49152 pins the mbuf pool to the 96MB table row (mem < 4GB).
+        # The 4GiB highmem bank crosses xnu's ncl_table into the 128MB row,
+        # and this DEVELOPMENT kernel VERIFY-panics in mbinit
+        # (uipc_mbuf.c:1743 m_total(MC_BIGCL)==0 && m_minlimit!=0) with the
+        # larger pool. 49152 clusters is exactly what the launchd-reaching
+        # boots computed; revisit the >=4GB mbinit path as its own item.
         run: |
           ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW_URL" out-m3 \
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
             --highmem --no-logo --secs 240 \
-            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1' \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           ls -la out-m3
 
