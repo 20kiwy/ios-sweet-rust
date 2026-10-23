@@ -224,6 +224,23 @@ reality beats the original guess.
   had excluded the directory. Fix: add `/usr/libexec/xpcproxy` to
   mini_keep_libexec (+ boot-closure verifier assertion); verdict v2 with
   launchd-positive stages (user-domain / launchd-early-boot / launchd-exec).
+* **xpcproxy execs — the spawn machine runs (run 40021272762, 2026-10-23).**
+  With the trampoline present the M3 verdict v2 PASSED at stage
+  `user-domain`: launchd completed early boot again, 68 xpcproxy spawns
+  waved through both domains, and the PRESENT daemons exec'd for real —
+  mediaserverd, fairplayd.H2, bluetoothd, WirelessRadioManagerd (all
+  /usr/sbin) running as processes with memorystatus priorities, zero
+  kernel panics for the whole boot. xpcproxy turned into the wall
+  inventory machine: `Missing executable detected. Job: '...'
+  Executable: '/path'` — plus xpc's own `0x6f` init failures for the
+  targets it can't set up. The first wave (launchd-spawn-map.md order)
+  joins the mini root: backboardd (M5/M6 Mach-service gate owner),
+  containermanagerd, usabilityd, keybagd, lockdownd, logd, configd,
+  watchdogd, tccd. Observability: launchd's os_log mirror bypasses the
+  kernel msgbuf and floods the last fb screen, so the CLI gained
+  `--snap-every N` — interval framebuffer screenshots (fresh sequential
+  QMP connections, guest keeps running) that screen-decode turns into
+  the launchd log TIMELINE in artifacts.
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —
