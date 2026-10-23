@@ -242,7 +242,10 @@ fn dispatch(args: &[String]) -> Result<()> {
 fn value_flags(cmd: &str) -> Vec<&'static str> {
     match cmd {
         "ipsw-extract" => vec!["member", "out"],
-        "ipsw-file" => vec!["out"],
+        "ipsw-file" => vec!["out", "member"],
+        "ipsw-ls" => vec!["member"],
+        "ipsw-find" => vec!["member"],
+        "ipsw-stat" => vec!["member"],
         "macho-deps" => vec![],
         "kc-kexts" => vec!["out"],
         "adt-dump" => vec!["out"],
@@ -313,6 +316,13 @@ fn rootfs_member(source: &str) -> Result<String> {
 /// file) -> UDIF blkx chunks (lzfse/zlib via vendored Apple code) -> APFS
 /// catalog walk. Returns the provenance member name and the indexed volume.
 fn open_system_volume(source: &str) -> Result<(String, sc::apfs::Apfs)> {
+    open_system_volume_member(source, None)
+}
+
+/// `--member NAME` selects a non-default zip member (e.g. the SystemOS
+/// cryptex 087-86593-047.dmg) — same windowed HTTP-range dmg reader as the
+/// rootfs path, so the cryptex is browsable without extracting 2.7GB.
+fn open_system_volume_member(source: &str, member_override: Option<&str>) -> Result<(String, sc::apfs::Apfs)> {
     // raw local dmg (koly trailer, no zip EOCD) vs full IPSW zip
     let (member, boxed, size): (String, Box<dyn sc::dmg::ByteSource>, u64) =
         if !source.starts_with("http") && local_is_raw_dmg(source)? {
@@ -324,7 +334,16 @@ fn open_system_volume(source: &str) -> Result<(String, sc::apfs::Apfs)> {
                 .unwrap_or_else(|| "rootfs.dmg".into());
             (member, Box::new(sc::dmg::FileSource::open(std::path::Path::new(source))?), size)
         } else {
-            let m = rootfs_member(source)?;
+            let m = match member_override {
+                Some(name) => {
+                    let idx = ipsw::index(source)?;
+                    if !idx.entries.iter().any(|e| e.name == name) {
+                        bail!("member {name} not found in IPSW");
+                    }
+                    name.to_string()
+                }
+                None => rootfs_member(source)?,
+            };
             let ms = sc::dmg::MemberSource::open(source, &m)?;
             let size = ms.size;
             (m, Box::new(ms) as Box<dyn sc::dmg::ByteSource>, size)
@@ -350,10 +369,10 @@ fn hello_json_from_ipsw(source: &str, lang: &str) -> Result<(Vec<u8>, String, St
 fn cmd_ipsw_ls(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("ipsw-ls"));
     let Some(src) = f.rest.first() else {
-        bail!("usage: ipsw-ls <IPSW|URL|DMG> [PATH]");
+        bail!("usage: ipsw-ls <IPSW|URL|DMG> [PATH] [--member NAME]");
     };
     let path = f.rest.get(1).copied().unwrap_or("/");
-    let (_member, vol) = open_system_volume(src)?;
+    let (_member, vol) = open_system_volume_member(src, f.val("member").as_deref())?;
     let dir = if path == "/" { 2u64 } else { vol.resolve(path)? };
     if !vol.list_dir(dir).is_empty() || path == "/" {
         for (name, fid, is_dir) in vol.list_dir(dir) {

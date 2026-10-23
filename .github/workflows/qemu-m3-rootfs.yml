@@ -71,6 +71,11 @@ jobs:
           ./target/release/sweet-rust ipsw-extract "$IPSW_URL" \
             --member DeviceTree.d22ap.im4p --out dt
           ls -la cryptex dt
+          # diagnostic: the full dyld cache directory of the cryptex —
+          # the dyld "Library not loaded: /usr/lib/libSystem.B.dylib" wall
+          # needs the real file list (main cache, subcaches, companions)
+          ./target/release/sweet-rust ipsw-ls cryptex/087-86593-047.dmg \
+            /System/Library/Caches/com.apple.dyld || true
 
       - name: Build the mini HFS+ root (real files, root-free writer)
         run: |
