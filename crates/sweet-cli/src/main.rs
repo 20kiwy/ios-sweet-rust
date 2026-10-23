@@ -212,6 +212,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "ipsw-find" => cmd_ipsw_find(rest),
         "ipsw-file" => cmd_ipsw_file(rest),
         "ipsw-stat" => cmd_ipsw_stat(rest),
+        "ipsw-check-paths" => cmd_ipsw_check_paths(rest),
         "decmp-dump" => cmd_decmp_dump(rest),
         "rootfs-plan" => cmd_rootfs_plan(rest),
         "mkiosroot" => cmd_mkiosroot(rest),
@@ -247,6 +248,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "ipsw-ls" => vec!["member"],
         "ipsw-find" => vec!["member"],
         "ipsw-stat" => vec!["member"],
+        "ipsw-check-paths" => vec!["paths"],
         "macho-deps" => vec![],
         "kc-kexts" => vec!["out"],
         "adt-dump" => vec!["out"],
@@ -438,6 +440,56 @@ fn cmd_ipsw_file(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// ipsw-check-paths: resolve many paths against ONE volume open (batch
+/// existence/size check). stdin or --paths FILE: one absolute path per line.
+/// Output: "PATH\tEXISTS|MISSING|DIR\tsize" + a stderr summary. This is the
+/// research driver behind docs/research/launchd-spawn-map.md (which of
+/// launchd's 532 declared binaries are real files vs DSC-resident).
+fn cmd_ipsw_check_paths(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("ipsw-check-paths"));
+    let Some(src) = f.rest.first() else {
+        bail!("usage: ipsw-check-paths <IPSW|URL|DMG> [--paths FILE] [< LIST]")
+    };
+    let (_member, mut vol) = open_system_volume(src)?;
+    let text = match f.val("paths") {
+        Some(p) => std::fs::read_to_string(p)?,
+        None => {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        }
+    };
+    let mut ok = 0usize;
+    let mut missing = 0usize;
+    let mut dirs = 0usize;
+    for line in text.lines() {
+        let path = line.trim();
+        if path.is_empty() || path.starts_with('#') {
+            continue;
+        }
+        match vol.resolve(path) {
+            Ok(fid) => {
+                let is_dir = !vol.list_dir(fid).is_empty();
+                let size = vol.stat(fid).map(|(.., s)| s).unwrap_or(0);
+                if is_dir {
+                    dirs += 1;
+                    println!("{path}\tDIR\t{size}");
+                } else {
+                    ok += 1;
+                    println!("{path}\tEXISTS\t{size}");
+                }
+            }
+            Err(_) => {
+                missing += 1;
+                println!("{path}\tMISSING\t0");
+            }
+        }
+    }
+    eprintln!("checked: {} exists, {} missing, {} dirs", ok, missing, dirs);
+    Ok(())
+}
+
 /// rootfs-plan: walk the OS volume and print the full-parity size plan
 /// (file/dir counts, uncompressed bytes, block-rounded data, catalog
 /// estimate) — the input for mkiosroot sizing.
@@ -467,9 +519,9 @@ fn cmd_rootfs_plan(args: &[String]) -> Result<()> {
         let _ = path;
     }
     println!(
-        "OS volume plan: {files} files, {dirs} dirs, uncompressed {bytes} ({} GiB), block-rounded {rounded} ({} GiB), decmpfs-compressed {compressed}",
-        bytes / 2 ^ 30.min(1),
-        rounded / 2 ^ 30.min(1)
+        "OS volume plan: {files} files, {dirs} dirs, uncompressed {bytes} ({:.2} GiB), block-rounded {rounded} ({:.2} GiB), decmpfs-compressed {compressed}",
+        bytes as f64 / (1 << 30) as f64,
+        rounded as f64 / (1 << 30) as f64
     );
     Ok(())
 }
