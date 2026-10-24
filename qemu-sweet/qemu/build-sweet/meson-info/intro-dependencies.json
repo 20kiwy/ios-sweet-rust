@@ -1,0 +1,251 @@
+[
+  {
+    "name": "threads",
+    "type": "system",
+    "version": "unknown",
+    "compile_args": [
+      "-pthread"
+    ],
+    "link_args": [
+      "-pthread"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "threads"
+    ]
+  },
+  {
+    "name": "glib-2.0",
+    "type": "pkgconfig",
+    "version": "2.84.4",
+    "compile_args": [
+      "-I/usr/include/glib-2.0",
+      "-I/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+      "-I/usr/include/sysprof-6",
+      "-pthread"
+    ],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libglib-2.0.a",
+      "/usr/lib/gcc/x86_64-linux-gnu/14/libatomic.a",
+      "-lm",
+      "-pthread",
+      "/usr/lib/x86_64-linux-gnu/libsysprof-capture-4.a",
+      "-pthread",
+      "/usr/lib/x86_64-linux-gnu/libpcre2-8.a"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "glib_static"
+    ]
+  },
+  {
+    "name": "gmodule-no-export-2.0",
+    "type": "pkgconfig",
+    "version": "2.84.4",
+    "compile_args": [
+      "-I/usr/include/glib-2.0",
+      "-I/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+      "-I/usr/include/sysprof-6",
+      "-pthread"
+    ],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libgmodule-2.0.so",
+      "-pthread",
+      "/usr/lib/x86_64-linux-gnu/libglib-2.0.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "gmodule"
+    ]
+  },
+  {
+    "name": "gio-2.0",
+    "type": "pkgconfig",
+    "version": "2.84.4",
+    "compile_args": [
+      "-I/usr/include/glib-2.0",
+      "-I/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+      "-I/usr/include/sysprof-6",
+      "-I/usr/include/libmount",
+      "-I/usr/include/blkid",
+      "-pthread"
+    ],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libgio-2.0.so",
+      "/usr/lib/x86_64-linux-gnu/libgobject-2.0.so",
+      "/usr/lib/x86_64-linux-gnu/libglib-2.0.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": []
+  },
+  {
+    "name": "gio-unix-2.0",
+    "type": "pkgconfig",
+    "version": "2.84.4",
+    "compile_args": [
+      "-I/usr/include/gio-unix-2.0",
+      "-I/usr/include/glib-2.0",
+      "-I/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+      "-I/usr/include/sysprof-6",
+      "-I/usr/include/libmount",
+      "-I/usr/include/blkid",
+      "-pthread"
+    ],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libgio-2.0.so",
+      "/usr/lib/x86_64-linux-gnu/libgobject-2.0.so",
+      "/usr/lib/x86_64-linux-gnu/libglib-2.0.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "gio_unix"
+    ]
+  },
+  {
+    "name": "pixman-1",
+    "type": "pkgconfig",
+    "version": "0.44.0",
+    "compile_args": [
+      "-I/usr/include/pixman-1"
+    ],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libpixman-1.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "pixman"
+    ]
+  },
+  {
+    "name": "zlib",
+    "type": "pkgconfig",
+    "version": "1.3.1",
+    "compile_args": [],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libz.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "zlib"
+    ]
+  },
+  {
+    "name": "libzstd",
+    "type": "pkgconfig",
+    "version": "1.5.7",
+    "compile_args": [],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libzstd.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "zstd"
+    ]
+  },
+  {
+    "name": "gmp",
+    "type": "pkgconfig",
+    "version": "6.3.0",
+    "compile_args": [],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libgmp.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "gmp"
+    ]
+  },
+  {
+    "name": "libpng",
+    "type": "pkgconfig",
+    "version": "1.6.48",
+    "compile_args": [
+      "-I/usr/include/libpng16"
+    ],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libpng16.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "png"
+    ]
+  },
+  {
+    "name": "libselinux",
+    "type": "pkgconfig",
+    "version": "3.8.1",
+    "compile_args": [],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libselinux.so"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "selinux"
+    ]
+  },
+  {
+    "name": "sysprof-capture-4",
+    "type": "pkgconfig",
+    "version": "48.0",
+    "compile_args": [
+      "-I/usr/include/sysprof-6",
+      "-pthread"
+    ],
+    "link_args": [
+      "/usr/lib/x86_64-linux-gnu/libsysprof-capture-4.a",
+      "-pthread"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "sysprof"
+    ]
+  }
+]

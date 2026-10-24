@@ -49,33 +49,62 @@ pointers at the nonexistent AIC — dangling phandles are a crash risk.
 ## Build
 
 ```sh
-sh qemu-sweet/build.sh          # QEMU_SRC=/home/z/qemu-src (v10.0.0 clone)
+sh qemu-sweet/build.sh          # source is VENDORED at qemu-sweet/qemu/ (v10.0.0)
 # -> qemu-prefix-sweet/bin/qemu-system-aarch64
 ```
 
-* `build.sh` is idempotent: it resets every source path it touches to
-  pristine, re-copies `overlay/`, re-applies
-  `0001-sweet-wire-device-models.patch` (meson/Kconfig/HMP wiring only),
-  configures a fresh `build-sweet/`, builds `qemu-system-aarch64`
-  (aarch64-softmmu only) and installs it into `$QEMU_PREFIX/bin`.
+* **The QEMU v10.0.0 source ships in this repo** at `qemu-sweet/qemu/`
+  (pristine upstream tag, byte-verified at vendor time, marked
+  `linguist-vendored`). No network clone is needed: clone, run, done.
+  `QEMU_SRC=/path/to/another/v10.0.0` still works for external clones.
+* `build.sh` is idempotent: it resets every source path it touches
+  (git checkout for a standalone clone; reverse-apply of the wiring patch
+  for the vendored no-.git tree), re-copies `overlay/`, re-applies
+  `0001-sweet-wire-device-models.patch` (meson/Kconfig/HMP wiring only —
+  the device sources come from `overlay/`), configures a fresh
+  `build-sweet/`, builds `qemu-system-aarch64` (aarch64-softmmu only) and
+  installs it into `$QEMU_PREFIX/bin`. A hard post-apply gate fails the
+  build if the wiring did not land (a silent no-op apply once produced a
+  stock-QEMU binary with zero diagnostics).
+* `FAST=1 sh qemu-sweet/build.sh` resumes an interrupted long build
+  (reuses the configured `build-sweet/`; ninja continues incrementally).
 * Sandbox (no root): the system needs `gcc`, `pkg-config`, `glib-2.0` and
   `pixman-1` development files; `tools/install-qemu-prefix.sh` shows the
   dpkg -x pattern for obtaining them without root. Meson/ninja can come
   from pip (`pip install meson ninja`).
 * CI: `ubuntu-latest` + `libglib2.0-dev libpixman-1-dev zlib1g-dev libfdt-dev`
-  (see `.github/workflows/qemu-m5-display.yml`, which also caches the
-  pristine source clone).
+  (see `.github/workflows/qemu-m5-display.yml` — no source cache needed
+  any more, the source is the checkout).
 
 ## Run
 
 ```sh
 export PATH="$PWD/qemu-prefix-sweet/bin:$PATH"
 sweet-rust make-adt out/m5.adt --qemu --display
+# empty cpio (TRAILER!!! only): WITHOUT a RAMDisk the kernel parks in
+# _cpu_idle before IOKit output (measured) — md0 must exist even empty.
+python3 - <<'PY'
+def hdr(ino, mode, nlink=1, mtime=0, filesize=0, dmaj=0, dmin=0, rmaj=0, rmin=0, namesize=0, chksum=0):
+    return ''.join(f'{f:08X}' if isinstance(f, int) else f for f in ['070701', ino, mode, nlink, mtime, filesize, dmaj, dmin, rmaj, rmin, namesize, chksum]).encode()
+name = b'TRAILER!!!\x00'
+h = hdr(0, 0, namesize=len(name))
+pad = lambda b, n: b + b'\x00' * ((-len(b)) % n)
+open('empty.cpio', 'wb').write(h + name + pad(h + name, 4))
+PY
+# debug=0x8 is DB_KDB (the kernel waits for a KDB connection forever);
+# the proven value is debug=0xc:
 sweet-rust make-payload kernel/kernel.development.sweet out/m5.adt out/payload.bin \
-  --cmdline 'debug=0x8 serial=3 cpus=1 keepsyms=1 -noprogress wdt=-1'
+  --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 -noprogress wdt=-1' \
+  --ramdisk empty.cpio
 sweet-rust boot-qemu out/payload.bin out/m5 --secs 150 --sweet-devices
 grep 'sweet-' out/m5/qemu.log      # every device register access, in order
 ```
+
+Measured verdict of exactly this recipe (vendored-source build, sandbox):
+all three devices realized at the D22AP bases, disp0 DMA rooted at the
+DART IOMMU, boot survives IOKit matching with the display subtree and
+dies at the M2 wall (`cannot mount root, errno = 19` + the `mount(20)
+failed` retry loop) — see `RESEARCH-SPRINGBOARD.md` §3b.
 
 `boot-qemu --sweet-devices` expands to:
 

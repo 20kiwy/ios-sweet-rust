@@ -61,20 +61,9 @@ jobs:
           prefix-key: "v1-rust"
           cache-targets: true
 
-      - name: Cache pristine QEMU v10.0.0 source
-        uses: actions/cache@v4
-        with:
-          path: qemu-src
-          key: qemu-v10.0.0-src
-          # restore-keys omitted: the tree must be exactly the pristine tag
-          # (build.sh resets only the paths it touches, so a stale extra file
-          # would survive — a fresh clone on cache miss is the safe path).
-
-      - name: Clone QEMU v10.0.0 (cache miss)
-        run: |
-          if [ ! -d qemu-src ]; then
-            git clone --depth 1 --branch v10.0.0 https://github.com/qemu/qemu.git qemu-src
-          fi
+      # QEMU v10.0.0 source is VENDORED in the repo at qemu-sweet/qemu/ —
+      # no clone, no source cache; build.sh wires the overlay + patch and
+      # builds straight from the checkout.
 
       - name: Build + unit tests (Rust)
         run: |

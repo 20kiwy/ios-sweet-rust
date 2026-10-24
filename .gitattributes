@@ -1,0 +1,6 @@
+# Vendored pristine QEMU v10.0.0 source (qemu-sweet/qemu/): keep it out of
+# GitHub's language statistics and code navigation -- it is upstream code,
+# not this project's.
+qemu-sweet/qemu/** linguist-vendored=true
+qemu-sweet/qemu/** -linguist-detectable
+qemu-sweet/qemu/vendor/* linguist-vendored=true

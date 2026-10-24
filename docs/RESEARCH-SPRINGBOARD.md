@@ -372,6 +372,52 @@ reality beats the original guess.
   milestones (AIC/PMGR/DART/disp0 above) stay on the map for anything the
   SWEET kernel patches do not already clear on `virt`.
 
+* **QEMU source vendored into the repo + the full boot check re-run on the
+  vendored build — the M2 wall reproduces byte-for-byte (2026-10-24, second
+  sandbox session).**
+  * **Vendor step:** `qemu-sweet/qemu/` now IS the pristine QEMU v10.0.0
+    tree (11,430 files, byte-identical to the upstream tag — `diff -rq`
+    against the clone = 0; `linguist-vendored` in `.gitattributes`). No
+    network clone is needed any more: clone → `sh qemu-sweet/build.sh` →
+    fork binary. `build.sh` was reworked for a no-`.git` tree: git reset
+    only for a STANDALONE clone, `patch(1)` (zero repo awareness) for the
+    vendored tree, a wiring patch stripped to wiring-only (the device
+    sources ride in `overlay/`), `FAST=1` resume for long builds, and a
+    HARD post-apply gate.
+  * **The gate earned its keep immediately:** the first vendored build
+    silently produced a STOCK QEMU — `git -C <vendored-tree> apply`
+    climbs into the outer project repo and reported success while
+    touching nothing (a no-op apply with rc=0 and zero diagnostics; the
+    3065 "sweet" grep hits in build.ninja were just the `build-sweet`
+    directory name in absolute paths). Two further measured lessons:
+    GNU `patch --forward` exits 1 when it SKIPS already-present files
+    (the patch therefore no longer carries the overlay files at all),
+    and the post-apply gate must grep `config SWEET` case-insensitively
+    (the Kconfig symbol is uppercase). After the rework: 2011 targets,
+    clean link, and `-device help` lists all three sweet devices.
+  * **Full boot check on the vendored build (real kernel, display
+    subtree, `--sweet-devices`, debug=0xc, empty md0):** all three
+    devices realized at the D22AP bases; disp0 DMA rooted at the DART
+    IOMMU; boot survives IOKit matching and dies at the M2 wall —
+    decoded console shows `hfs_ValidateHFSPlusVolumeHeader: unknown
+    Volume Signature : 0`, `hfs_mount: hfs_mountfs returned error=22`,
+    `cannot mount root, errno = 19` and the `mount(20) failed` /
+    `BSD root: md0, major 1, minor 0` retry loop. Register traffic on
+    the three devices is still ZERO (unchanged, expected — W2 wall).
+  * **Tooling wall measured on the way:** `screen-decode` shells out to
+    `llvm-nm` and fails with a bare "No such file or directory" when it
+    is absent — the sandbox has it only under
+    `/home/z/dev-prefix/usr/bin` (dpkg -x pattern); empty decodes in
+    this session were that, not blank screens (the fb PNGs were
+    94–103 KB, the content-rich class). All M5-era artifact dirs were
+    re-decoded with the same result — their screens were always fine.
+  * **Roadmap:** `docs/PLAN-FULL-BOOT.md` now sequences the road to a
+    full boot: W1 unify the M3 userland pipeline with the M5 display
+    world (`ipsw-boot --sweet-devices --display-adt`), W2 driver probe
+    traffic (mkadt/SWEET patch-set, IOKit-verbose diagnosis first),
+    W3 DART stage-2 PTE walker from the measured traces, W4 the IOMFB
+    user client, W5 SpringBoard first frame.
+
 ---
 
 ## 4. Risks (stated plainly)
