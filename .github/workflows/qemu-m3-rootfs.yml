@@ -166,8 +166,17 @@ jobs:
         # docs/RESEARCH-SPRINGBOARD.md. Time does not help; 240s is enough
         # to prove the stable state each run.
         run: |
-          MSGREF=$(llvm-nm kernel/kernel.development.sweet | grep ' _msgbufp$' | awk '{print $1}')
-          echo "_msgbufp = 0x$MSGREF"
+          # W4 session: native symtab parse — llvm-nm not required
+          MSGREF=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _msgbufp | awk '{print $1}')
+          echo "_msgbufp = $MSGREF"
+          # Patch 0047's 4 MiB console ring (_cnputs captures kernel printf
+          # AND every daemon's /dev/console). In-memory layout (the patch's
+          # C): u64 total at _sweet_log_total, ring bytes at _sweet_log_ring
+          # (byte n of the stream at ring offset n % 4 MiB). Read both via
+          # HMP memsave (kernel-VA translation) at stop; reconstruct below.
+          SWEETLOGTOTAL=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _sweet_log_total | awk '{print $1}')
+          SWEETLOGRING=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _sweet_log_ring | awk '{print $1}')
+          echo "sweetlog ring = $SWEETLOGRING total = $SWEETLOGTOTAL"
           ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW" out-m3 \
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \
@@ -175,9 +184,29 @@ jobs:
             --highmem --no-logo --secs 240 --dump-ramdisk \
             --snap-every 20 \
             --msgbuf-dump "0x$MSGREF" \
+            --hmp "memsave $SWEETLOGTOTAL 8 sweetlogtotal.bin;memsave $SWEETLOGRING 4194304 sweetlogring.bin" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           ls -la out-m3
+          python3 - <<'PY'
+          import struct, pathlib
+          out = pathlib.Path("out-m3")
+          try:
+              total = struct.unpack('<Q', (out/'sweetlogtotal.bin').read_bytes()[:8])[0]
+          except FileNotFoundError:
+              total = 0
+          ring_path = out/'sweetlogring.bin'
+          if ring_path.exists() and total:
+              ring = ring_path.read_bytes()
+              size = len(ring)
+              text = ring[:total] if total <= size else ring[total % size:] + ring[:total % size]
+              (out/'sweetlog.txt').write_bytes(text)
+              print(f'SWEETLOG: ring {size}, total {total} bytes -> sweetlog.txt')
+          else:
+              print(f'SWEETLOG: no ring data (total={total})')
+          PY
+          echo "===== SWEETLOG daemon console (tail 80 — backboardd's own words land here) ====="
+          tail -80 out-m3/sweetlog.txt 2>/dev/null || echo "(sweetlog.txt missing)"
           echo "===== msgbuf console history (head 200 lines) ====="
           head -200 out-m3/msgbuf.txt 2>/dev/null || echo "(msgbuf.txt missing)"
           echo "===== msgbuf console history (tail 60 lines — early-boot-complete lands here) ====="
