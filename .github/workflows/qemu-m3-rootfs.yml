@@ -348,6 +348,7 @@ jobs:
             out-m3/fb-*.txt
             out-m3/msgbuf.bin
             out-m3/msgbuf.txt
+            out-m3/sweetlog.txt
             out-m3/boot-verdict.json
             out-m3/m3-verdict.json
             out-m3/qemu.log
