@@ -43,9 +43,13 @@ on:
       - "qemu-sweet/**"
       - ".github/workflows/full-boot.yml"
 
-concurrency:
-  group: full-boot-${{ github.ref }}
-  cancel-in-progress: false
+# NO concurrency block: the group slot of a run cancelled WHILE PENDING is
+# never released (both 226667e runs — push 40096547541 and dispatch
+# 40097195821 — sat pending with 0 jobs behind the ghost of the cancelled
+# paid-label run 40093358895). Parallel runs are safe: the IPSW cache is
+# read-only shared, workspaces and artifacts are per-run. The old
+# cancel-in-progress behavior is exactly what killed every previous
+# full-boot (superseded by the next push before it could finish).
 
 permissions:
   contents: read
