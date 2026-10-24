@@ -114,7 +114,7 @@ jobs:
           export PATH="$PWD/qemu-prefix-sweet/bin:$PATH"
           set +e
           ./target/release/sweet-rust boot-qemu out/m5-payload.bin out/m5 \
-            --secs 150 --snap-every 25 --sweet-devices
+            --secs 150 --snap-every 25 --sweet-devices --vnc 127.0.0.1:59
           rc=$?
           set -e
           echo "boot rc=$rc (recorded, pipeline continues)"
@@ -133,6 +133,9 @@ jobs:
               verdict["devices"][dev+"_realized"] = f"{dev}: realized" in qlog
           # disp0 must have linked its DMA address space to the DART IOMMU
           verdict["devices"]["disp0_dma_via_dart"] = "sweet-disp0: DMA via DART" in qlog
+          # display OUT: console registered for VNC/screendump + PNG captured
+          verdict["devices"]["vnc_console_registered"] = "sweet-disp0: console registered" in qlog
+          verdict["devices"]["console_screenshots"] = len(list(out.glob("screenshot-*.png")))
 
           # 2. the kernel actually TOUCHED the device registers (probe traffic)
           dart_writes = len(re.findall(r"sweet-dart: W ", qlog))

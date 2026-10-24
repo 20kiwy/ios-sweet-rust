@@ -30,6 +30,7 @@ Run the M3 userland recipe ON TOP of the M5 display world:
 ipsw-boot --ipsw <IPSW> out-full --kernel kernel --ramdisk mini-root.img
           --product dt/DeviceTree.d22ap.im4p
           --display-adt --sweet-devices        # SHIPPED (f5de58a)
+          --vnc 127.0.0.1:59                   # SHIPPED (display out)
           --highmem --secs 240
 ```
 
@@ -42,12 +43,21 @@ end-to-end (`pass:true`, devices realized, console painted) and the live
 control session survives with the guest painting on its own
 (`session_alive:true`, `guest_painted:true`).
 
+**Display out (VNC + screendump) — SHIPPED:** the fork's `sweet-disp0`
+registers a QEMU console (`graphic_console_init` + `dpy_gfx_replace_surface`
+of the fb mirror), `-vnc` serves it live, QMP `screendump` captures it to
+`screenshot-NNNN.png` / `screenshot-final.png` in every runner command;
+`spawn_session` (emu-boot/Session) wires the same devices + `-vnc`.
+Verified end-to-end on the real kernel: the console screenshot decodes to
+the exact M2 wall text. This is the machine half of "control the screen";
+the guest half (touch IN) is W5's BackBoard/HID work.
+
 CI: `.github/workflows/full-boot.yml` runs the unified boot on a 16 GB
 runner (`ubuntu-latest-4-cores`, 7 GB `ubuntu-latest` fallback via
-workflow_dispatch) with the M3 stage verdicts + device checks as the gate
-and the device register traffic as the W2 measurement, plus a live
-screen-control step (real-IPSW wallpaper painted into the guest FB while
-the kernel runs).
+workflow_dispatch) with the M3 stage verdicts + device checks + VNC
+console-registration + screenshot-captured as the gate and the device
+register traffic as the W2 measurement, plus a live screen-control step
+(real-IPSW wallpaper painted into the guest FB while the kernel runs).
 
 ### W2 — make the real drivers probe the synthetic nubs (device traffic > 0)
 

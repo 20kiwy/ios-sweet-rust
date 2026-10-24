@@ -60,6 +60,13 @@ pub struct RunOptions {
     /// Requires the qemu-sweet build (qemu-sweet/build.sh) FIRST in PATH —
     /// the devices only exist in that fork; stock QEMU errors on them.
     pub sweet_devices: bool,
+    /// Serve the sweet-disp0 console over VNC (e.g. "127.0.0.1:5901" or
+    /// ":1").  Requires the fork build (the console is registered by the
+    /// sweet-disp0 device model) and --sweet-devices.  VNC is display
+    /// OUT for now (watching the framebuffer); touch/keyboard IN arrives
+    /// with the W5 BackBoard/HID work, and QMP screendump gives the
+    /// artifacts regardless.
+    pub vnc: Option<String>,
 }
 
 impl Default for RunOptions {
@@ -77,6 +84,7 @@ impl Default for RunOptions {
             dump_ramdisk: false,
             snap_every: None,
             sweet_devices: false,
+            vnc: None,
             qemu_datadir: Vec::new(),
             logo: None,
         }
@@ -633,11 +641,12 @@ fn stream_serial(serial_path: &Path, file_pos: &mut u64, out: &mut impl Write) {
 // The boot itself
 // ---------------------------------------------------------------------------
 
-/// Live-interval framebuffer snapshot: fresh sequential QMP connection,
-/// pmemsave the FB (no VM stop — the guest keeps running), encode PNG.
-fn snap_fb(mon: &Transport, out: &Path, at_secs: u64) -> Result<PathBuf> {
-    let mut q = Qmp::connect(mon)?;
-    q.handshake()?;
+/// Live-interval framebuffer snapshot: pmemsave the FB (no VM stop — the
+/// guest keeps running) and encode PNG.  Takes the CALLER'S Qmp handle:
+/// the QMP chardev serves ONE client at a time (a second connection sits
+/// in the backlog without a greeting, hanging forever), so every helper
+/// reuses the connection it is given instead of opening its own.
+fn snap_fb(q: &mut Qmp, out: &Path, at_secs: u64) -> Result<PathBuf> {
     let raw_name = format!("fb-{at_secs:04}.raw");
     let mut args = J::obj();
     args.set("val", J::n(FB_BASE as f64));
@@ -648,12 +657,93 @@ fn snap_fb(mon: &Transport, out: &Path, at_secs: u64) -> Result<PathBuf> {
             return Err(crate::Error::Msg(format!("qmp pmemsave: {e:?}")));
         }
     }
-    drop(q);
     let raw = std::fs::read(out.join(&raw_name))?;
     let png = crate::png::encode_fb(FB_W, FB_H, &raw)?;
     let png_path = out.join(format!("fb-{at_secs:04}.png"));
     std::fs::write(&png_path, &png)?;
     let _ = std::fs::remove_file(out.join(&raw_name));
+    Ok(png_path)
+}
+
+/// Parse a binary PPM (P6) as written by QEMU's ppm_save: "P6\n<w> <h>\n
+/// <maxval>\n" then raw RGB bytes.
+fn parse_ppm6(b: &[u8]) -> Result<(u32, u32, &[u8])> {
+    if b.len() < 3 || &b[0..2] != b"P6" {
+        bail!("screendump: not a P6 ppm");
+    }
+    let mut i = 2usize;
+    let mut vals = [0u32; 3];
+    for v in &mut vals {
+        // skip whitespace + comments between tokens
+        loop {
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b'#' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            bail!("screendump: bad ppm header");
+        }
+        let txt = std::str::from_utf8(&b[start..i])
+            .map_err(|_| crate::Error::Msg("bad ppm number".into()))?;
+        *v = txt.parse::<u32>().map_err(|_| {
+            crate::Error::Msg("bad ppm number".into())
+        })?;
+    }
+    // exactly one whitespace byte separates the header from the pixels
+    i += 1;
+    let (w, h, maxval) = (vals[0], vals[1], vals[2]);
+    if maxval != 255 {
+        bail!("screendump: unexpected ppm maxval {maxval}");
+    }
+    let need = (w as usize) * (h as usize) * 3;
+    if b.len() < i + need {
+        bail!(
+            "screendump: ppm truncated (need {need}, have {})",
+            b.len() - i
+        );
+    }
+    Ok((w, h, &b[i..i + need]))
+}
+
+/// Console screenshot through QEMU's display layer -- exactly what VNC
+/// serves: QMP screendump on the sweet-disp0 console.  PNG when the fork
+/// build has libpng; otherwise PPM, re-encoded to PNG here so the
+/// artifact contract (PNG in out/) stays uniform.
+fn snap_console(q: &mut Qmp, out: &Path, tag: &str) -> Result<PathBuf> {
+    let png_path = out.join(format!("screenshot-{tag}.png"));
+    let mut args = J::obj();
+    args.set("filename", J::s(png_path.display().to_string()));
+    args.set("format", J::s("png"));
+    if let J::Obj(m) = q.call("screendump", args)? {
+        if m.get("error").is_none() {
+            return Ok(png_path);
+        }
+    }
+    // no libpng in the fork -> ppm fallback
+    let ppm_path = out.join(format!("screenshot-{tag}.ppm"));
+    let mut args = J::obj();
+    args.set("filename", J::s(ppm_path.display().to_string()));
+    if let J::Obj(m) = q.call("screendump", args)? {
+        if let Some(J::Obj(e)) = m.get("error") {
+            return Err(crate::Error::Msg(format!("qmp screendump: {e:?}")));
+        }
+    }
+    let ppm = std::fs::read(&ppm_path)?;
+    let (w, h, rgb) = parse_ppm6(&ppm)?;
+    let png = crate::png::encode_rgb(w, h, rgb)?;
+    std::fs::write(&png_path, &png)?;
+    let _ = std::fs::remove_file(&ppm_path);
     Ok(png_path)
 }
 
@@ -750,6 +840,12 @@ pub fn run(
             "sweet-disp0,dart=sweet-dart0",
         ]);
     }
+    // VNC display out (fork-only: the console is registered by
+    // sweet-disp0).  Coexists with -nographic: the VNC server is a
+    // separate frontend from the default display.
+    if let Some(vnc) = &opts.vnc {
+        cmd.args(["-vnc", vnc]);
+    }
     // payload image: one loader device per <=1.5GiB chunk, consecutive PAs
     for (p, off) in &loader_parts {
         cmd.args([
@@ -801,10 +897,33 @@ pub fn run(
             // leave the last `every` seconds to the end-of-boot screenshot
             if el - last_snap >= every && el < opts.secs - every {
                 last_snap = el;
-                match snap_fb(&mon, &out, el as u64) {
+                // ONE fresh connection per snap tick, dropped before the
+                // next (single-connection discipline: the QMP chardev
+                // serves one client at a time -- see snap_fb).
+                let mut sq = match Qmp::connect(&mon) {
+                    Ok(mut q) => match q.handshake() {
+                        Ok(()) => q,
+                        Err(e) => {
+                            eprintln!("snap connect failed: {e}");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("snap connect failed: {e}");
+                        continue;
+                    }
+                };
+                match snap_fb(&mut sq, &out, el as u64) {
                     Ok(path) => eprintln!("snap: {}", path.display()),
                     Err(e) => eprintln!("snap failed: {e}"),
                 }
+                if opts.sweet_devices {
+                    match snap_console(&mut sq, &out, &format!("{:04}", el as u64)) {
+                        Ok(path) => eprintln!("screenshot: {}", path.display()),
+                        Err(e) => eprintln!("screenshot failed: {e}"),
+                    }
+                }
+                drop(sq);
             }
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -867,6 +986,23 @@ pub fn run(
                 eprintln!("--dump-ramdisk: payload has no RAMDisk entry");
             }
         }
+        // console screenshot of the final screen (the display layer's
+        // view -- what VNC serves) WHILE QEMU IS STILL ALIVE, on the SAME
+        // persistent connection (a second connection would hang: the QMP
+        // chardev serves one client at a time).  The console exists only
+        // with the fork's devices attached.
+        if opts.sweet_devices {
+            match snap_console(&mut q, &out, "final") {
+                Ok(path) => {
+                    eprintln!("screenshot: {}", path.display());
+                    result.set(
+                        "console_screenshot",
+                        J::s(path.display().to_string()),
+                    );
+                }
+                Err(e) => eprintln!("screenshot failed: {e}"),
+            }
+        }
         let _ = p.kill();
         let _ = p.wait();
 
@@ -896,6 +1032,9 @@ pub fn run(
         eprintln!("qemu exited early: {:?}", qemu_rc);
         result.set("status", J::s("qemu_exited"));
         result.set("qemu_returncode", J::n(qemu_rc.unwrap_or(-1) as f64));
+    }
+    if let Some(vnc) = &opts.vnc {
+        result.set("vnc", J::s(vnc.clone()));
     }
     std::fs::write(out.join("result.json"), format!("{}\n", result.dump()))?;
     for (p, _) in &loader_parts {
@@ -1141,6 +1280,22 @@ pub fn spawn_session(
     }
     for d in &opts.qemu_datadir {
         cmd.args(["-L", d]);
+    }
+    // qemu-sweet M4/M5 device models (same wiring as run()) and VNC
+    // display out.  The control plane's fb access (shared RAM file /
+    // pmemsave) is independent of this; VNC is a live view for humans.
+    if opts.sweet_devices {
+        cmd.args([
+            "-device",
+            "sweet-dart,id=sweet-dart0",
+            "-device",
+            "sweet-mipi-dsim",
+            "-device",
+            "sweet-disp0,dart=sweet-dart0",
+        ]);
+    }
+    if let Some(vnc) = &opts.vnc {
+        cmd.args(["-vnc", vnc]);
     }
     // gdbstub WITHOUT -S: the machine boots immediately; gdb attaches live.
     // nodelay=on: without it every RSP packet round trip pays

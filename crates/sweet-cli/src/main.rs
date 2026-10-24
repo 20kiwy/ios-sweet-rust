@@ -99,17 +99,21 @@ COMMANDS:
         running QEMU - for debugging loaders.
 
     boot-qemu <PAYLOAD> <OUTDIR> [--secs 20] [--cpu cortex-a76] [--gdb]
-              [--sweet-devices]
+              [--sweet-devices] [--vnc 127.0.0.1:5901]
         [--snap-every N]  # interval fb screenshots while the guest runs
         [--logo LOGO.bin | --logo-ipsw IPSW] [--live-serial] [--qemu-datadir D]
         [--check-env]
         Boot the payload in QEMU virt; writes fb.png / regs.txt / serial.txt /
         qemu.log / result.json (qemu-sweet.py parity, exit codes 0/1/2/3/130).
+        --vnc serves the sweet-disp0 console over VNC (display OUT; needs
+        --sweet-devices); console screenshots also land as
+        screenshot-NNNN.png / screenshot-final.png.
 
     ipsw-boot --ipsw IPSW|URL <OUTDIR> [--kernel K | --demo] [--ramdisk IMAGE]
         [--cmdline \"...\"] [--secs 120] [--product FILE.adt] [--logo-scale 33]
         [--cpu MODEL] [--no-logo] [--live-serial] [--snap-every N]
-        [--display-adt] [--sweet-devices] [--highmem] [--lowmem]
+        [--display-adt] [--sweet-devices] [--vnc 127.0.0.1:5901] [--highmem]
+        [--lowmem]
         The full pipeline in one command: IPSW -> logo asset + (kernelcache |
         demo kernel) -> payload -> logo injection -> QEMU -> fb.png +
         boot-verdict.json. Verdict checks: logo visible, serial marker,
@@ -261,7 +265,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "emu-boot" => vec![
             "ipsw", "wallpaper", "wallpaper-manifest", "send", "secs", "cpu",
             "strip", "logo-scale", "qemu-datadir", "kernel", "ramdisk",
-            "cmdline", "product", "snap-every",
+            "cmdline", "product", "snap-every", "vnc",
         ],
         "emu-peek" => vec!["addr", "len", "secs", "cpu"],
         "kernel-unpack" => vec![],
@@ -276,12 +280,12 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "decmp-dump" => vec!["member", "out", "bytes", "scan", "rsrc"],
         "rootfs-plan" => vec![],
         "screen-decode" => vec!["kernel", "payload", "nm"],
-        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "snap-every"],
+        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "snap-every", "vnc"],
         // --sweet-devices and --display are boolean flags (Flags::has)
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
             "logo-scale", "cpu", "w", "h", "qemu-datadir", "hello-lang",
-            "hmp", "msgbuf-dump", "snap-every",
+            "hmp", "msgbuf-dump", "snap-every", "vnc",
         ],
         _ => vec![],
     }
@@ -1193,6 +1197,7 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
         ram_file: Some(outdir.join("ram.mmap")),
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         sweet_devices: f.has("sweet-devices"),
+        vnc: f.val("vnc").map(|s| s.to_string()),
         ..Default::default()
     };
     let mut sess = sc::control::Session::boot(&payload_path, &outdir, &opts, gdb_port)?;
@@ -1683,6 +1688,7 @@ fn cmd_boot_qemu(args: &[String]) -> Result<()> {
         dump_ramdisk: f.has("dump-ramdisk"),
         snap_every: f.val("snap-every").and_then(|v| v.parse().ok()),
         sweet_devices: f.has("sweet-devices"),
+        vnc: f.val("vnc").map(|s| s.to_string()),
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()
     };
@@ -1857,6 +1863,7 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         logo: if f.has("no-logo") { None } else { logo_blob.clone() },
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         sweet_devices: f.has("sweet-devices"),
+        vnc: f.val("vnc").map(|s| s.to_string()),
         ..Default::default()
     };
     if f.has("sweet-devices") {

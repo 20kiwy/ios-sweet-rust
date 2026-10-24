@@ -175,6 +175,7 @@ jobs:
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
             --display-adt --sweet-devices \
+            --vnc 127.0.0.1:59 \
             --highmem --no-logo --secs "$SECS" --dump-ramdisk \
             --snap-every 30 \
             --msgbuf-dump "0x$MSGREF" \
@@ -182,6 +183,8 @@ jobs:
             || true
           set -e
           ls -la out-full
+          echo "===== console screenshots (the display layer's view -- what VNC serves) ====="
+          ls -la out-full/screenshot-*.png 2>/dev/null || echo "(no console screenshots)"
           echo "===== msgbuf tail (early-boot-complete / spawn cycle lands here) ====="
           tail -50 out-full/msgbuf.txt 2>/dev/null || echo "(msgbuf.txt missing)"
 
@@ -189,7 +192,7 @@ jobs:
         run: |
           set +e
           {
-            for f in out-full/fb-*.png out-full/fb.png; do
+            for f in out-full/fb-*.png out-full/screenshot-*.png out-full/fb.png; do
               [ -f "$f" ] || continue
               echo "=== $(basename "$f") ==="
               ./target/release/sweet-rust screen-decode "$f" \
@@ -215,6 +218,9 @@ jobs:
           for dev in ("sweet-dart", "sweet-mipi-dsim", "sweet-disp0"):
               v["devices"][dev+"_realized"] = f"{dev}: realized" in qlog
           v["devices"]["disp0_dma_via_dart"] = "sweet-disp0: DMA via DART" in qlog
+          # display OUT: the fork registered the console for VNC/screendump
+          v["devices"]["vnc_console_registered"] = "sweet-disp0: console registered" in qlog
+          v["devices"]["console_screenshots"] = len(list(out.glob("screenshot-*.png")))
 
           # W2 measurement: did any real driver probe the synthetic nubs?
           for dev in ("sweet-dart", "sweet-disp0", "sweet-mipi-dsim"):
@@ -241,6 +247,8 @@ jobs:
           v["gates"]["devices_realized"] = all(v["devices"][d+"_realized"]
               for d in ("sweet-dart", "sweet-mipi-dsim", "sweet-disp0"))
           v["gates"]["disp0_dma_via_dart"] = v["devices"]["disp0_dma_via_dart"]
+          v["gates"]["vnc_console_registered"] = v["devices"]["vnc_console_registered"]
+          v["gates"]["console_screenshot_captured"] = v["devices"]["console_screenshots"] > 0
           v["gates"]["m3_stage_holds_with_devices"] = stage in (
               "mounted", "launchd-early-boot", "user-domain")
           v["gates"]["no_kernel_panic"] = not kernel_panic
@@ -249,6 +257,7 @@ jobs:
           print(json.dumps(v, indent=1))
           g = v["gates"]
           if not (g["devices_realized"] and g["disp0_dma_via_dart"]
+                  and g["vnc_console_registered"] and g["console_screenshot_captured"]
                   and g["m3_stage_holds_with_devices"] and g["no_kernel_panic"]):
               sys.exit("W1 gate FAILED: " + json.dumps(g))
           PY
@@ -262,6 +271,7 @@ jobs:
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
             --display-adt --sweet-devices --highmem \
+            --vnc 127.0.0.1:59 \
             --wallpaper wall/clownfish-1080x2400.png \
             --send "hello from the host" \
             --secs 150 || true
