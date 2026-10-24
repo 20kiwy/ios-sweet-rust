@@ -174,12 +174,27 @@ client selectors 3/4/5/6/7/8/18/28/72, SwapEnd = CPU layer copy, vsync =
 text console on the first swap so the framebuffer shows the pure GUI —
 the prerequisite for clean SpringBoard/Settings screenshots (W5).
 
-**Measurement (next CI run):** the unified verdict now records
-`daemons_execd[_count]` + `last_msgbuf_ts` against the freeze baseline
-`mach_wall_freeze_baseline_ts = 45.0`. Gate to pin from that evidence:
-`last_msgbuf_ts > baseline` and a daemon roster that grows past the
-baseline set. **Gate:** the parking daemon gets past the IOMFB connect;
-the spawn cycle advances one measured daemon further.
+**Measured (CI-verified runs 40097359964 + 40099577010, both green):**
+`last_msgbuf_ts = 45.07` against the 45.0 baseline — the freeze is EXACT,
+not a slow retry. The **1200 s probe** (m3 dispatch, run 40100656311)
+sealed it: 532 msgbuf lines, last kernel timestamp **41.4 s**, then 20
+minutes of silence; 23 daemons exec'd; launchd's ring shows ALL 22
+services reaching "running" — the park is inside
+backboardd/SpringBoard/IOMFB_FDR_Loader's own startup, between exec and
+their FIRST kernel service call (no AKS/SURF/FB selector lines, unlike
+phone parity where backboardd calls AKS early). logd persists zero
+tracev3 in both pipelines (the HfsReader extraction is verified correct
+by a writer<->reader round-trip, so the empty result is real).
+
+**Gate (pinned next):** `last_msgbuf_ts > 120 s` in a >=600 s boot — i.e.
+any userland progress after the 45 s boundary. The tool that resolves the
+park is the **thread-state walk**: allproc -> proc(p_pid) -> task ->
+threads -> saved PC, offsets derived from the xnu-8796 sources and
+self-validated against p_comm in guest RAM; symbolicate the parked PC
+against the dyld shared cache. Everything else is in place for W5 once
+the park opens (scripted-touch kernel vendored as
+`kernel/kernel.development.touch`, VNC + screenshot capture CI-gated,
+CoreAnimation's software renderer confirmed upstream).
 
 **MEASURED — run 40097359964 (2026-10-24, the FIRST-EVER green full-boot
 on the runner; the paid-label + concurrency-slot runner bugs were fixed
