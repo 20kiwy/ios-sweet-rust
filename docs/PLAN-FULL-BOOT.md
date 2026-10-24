@@ -112,21 +112,40 @@ Consequences:
 * The boot-critical path is **W4** (below) — and its cause was found this
   session.
 
-### W3 — DART stage-2: the real PTE walker (device model work) — **DEPRIORITIZED (W2 closed: no guest code programs the DART)**
+### W3 — DART stage-2: the real PTE walker (device model work) — **REVIVED + IMPLEMENTED + GATED (2026-10-24)**
 
-Driven by the W2 traces, never by guesses (the stage-1 `qemu.log` traces
-ARE the spec — see `qemu-sweet/README.md`):
+W2 closed the "kernel traces as spec" premise (no guest code ever
+programs the DART), so stage 2 was written against the **real D22AP ADT
+parameters** (`page-size = 0x1000`, `stt-idx-width = 0xa`, `sids = 3`)
+plus public M1-DART-style PTE bit knowledge — RE-grade, documented, and
+frozen as the fork's contract by a deterministic gate (see
+`qemu-sweet/README.md` §Stage-2 scope):
 
-* `sweet-dart`: TTBR[SID] → 4-level walk of guest RAM (page size 0x1000,
-  `stt-idx-width=10` sub-TTBRs), real fault reporting, TLB invalidate ops.
-* `sweet-disp0`: swap path keyed on the register the real IOMFB writes
-  (replaces the host-driven HMP `sweet-disp0-swap` hook).
-* `sweet-mipi-dsim`: DSI command FIFO acks so the `lcd,summit` panel
-  interface completes.
+* `sweet-dart`: TTBR0[sid][n] → 4-level walk of guest RAM (page 0x1000,
+  L1/STT index 10 bits, L2/L3 9 bits), 4096-entry translation cache,
+  `STREAM_COMMAND` invalidate, real fault reporting (`FAULT_STATUS` /
+  `FAULT_IOVA_LO/HI` + the fault IRQ, W1C-acked), and a layout fix:
+  TTBR0 moved 0x200 → 0x300 (stage 1's TTBR0[0][0] was shadowed by
+  TCR[2] — unreachable with the D22AP's sids=3).
+* `sweet-disp0`: the register-keyed swap path (`SWAP_SRC_LO/HI`,
+  `SWAP_CTRL` bit 0 SWAP_GO, `SWAP_COUNT`, `INTSTATUS` SWAP_DONE) — the
+  guest-initiated IOMFB flip; the HMP hook stays, sharing the engine.
+* `sweet-mipi-dsim`: DSI command FIFO acks (`GEN_HDR`/`GEN_PLD`/
+  `CMD_PKT_STATUS` + `INTSTATUS` CMD_DONE).
 
-**Gate:** a guest-programmed PTE translates a DMA to the right host page
-(read-back of a known pattern through the DART AS); IOMFB-initiated FB
-flip changes `fb.png` without host help.
+**Gate — PASS (4 GB sandbox, 2 GiB guest, real kernel boot):**
+`tools/dart-walker-gate.sh` boots the payload on the fork with
+`--qtest`, pauses the vCPU and drives the models' MMIO exactly as the
+real drivers would: unconfigured DART **denies** and latches FAULT_*;
+a guest-programmed PTE translates the non-identity IOVA 0x70000000 →
+0xbf007000 through L1[1]→L2[384]→L3[0] (10 MB framebuffer read-back =
+the programmed pattern); the cache serves the stale PTE until
+`STREAM_COMMAND` invalidate, then refetches; the MIPI FIFO acks. All
+ten gates true (`dart-gate-verdict.json`); wired as a hard CI step in
+`qemu-m5-display.yml`. The models remain fidelity decoration for the
+BOOT itself (W2 verdict unchanged — the booted kernel never touches
+them); what changed is that the decoration is now REAL, verified
+machinery instead of store+echo stubs.
 
 ### W4 — the IOMFB user client (userland × device) — **CAUSE FOUND + FIXED (2026-10-24)**
 
@@ -174,6 +193,10 @@ root) or is W1–W4.
 1. ~~W1~~ — **SHIPPED + CI-VERIFIED** (run 40063428984).
 2. ~~W2 diagnosis~~ — **CLOSED** (see the W2 verdict: the drivers are not
    in the kernel; the display path is the built-in RAM shim).
+2b. **W3** — REVIVED + IMPLEMENTED + GATED (see W3 below): the stage-2
+   device models land with `tools/dart-walker-gate.sh`, CI-gated in
+   `qemu-m5-display.yml` (its push trigger was also broken —
+   `branches: ain]` — and is fixed in this push).
 3. **W4 measurement** — the `display-subsystem` fix ships in this push;
    the full-boot CI run measures the spawn-cycle advance past the 45 s
    freeze baseline (`daemons_execd_count`, `last_msgbuf_ts`). Gate pins

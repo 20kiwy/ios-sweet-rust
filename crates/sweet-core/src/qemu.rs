@@ -67,6 +67,12 @@ pub struct RunOptions {
     /// with the W5 BackBoard/HID work, and QMP screendump gives the
     /// artifacts regardless.
     pub vnc: Option<String>,
+    /// Expose the qtest unix socket at this path (`-qtest unix:...`):
+    /// the device-model gate (tools/dart-walker-gate.py) drives the
+    /// sweet-dart/disp0 registers from the host through it -- the W3
+    /// "guest-programmed PTE translates a DMA" measurement without a
+    /// kernel-side driver (none exists: W2).  Harmless otherwise.
+    pub qtest: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -85,6 +91,7 @@ impl Default for RunOptions {
             snap_every: None,
             sweet_devices: false,
             vnc: None,
+            qtest: None,
             qemu_datadir: Vec::new(),
             logo: None,
         }
@@ -845,6 +852,15 @@ pub fn run(
     // separate frontend from the default display.
     if let Some(vnc) = &opts.vnc {
         cmd.args(["-vnc", vnc]);
+    }
+    // qtest socket (device-model gate: see RunOptions::qtest).
+    if let Some(qt) = &opts.qtest {
+        cmd.args([
+            "-qtest",
+            &format!("unix:{},server,nowait", qt.display()),
+            "-qtest-log",
+            "none",
+        ]);
     }
     // payload image: one loader device per <=1.5GiB chunk, consecutive PAs
     for (p, off) in &loader_parts {

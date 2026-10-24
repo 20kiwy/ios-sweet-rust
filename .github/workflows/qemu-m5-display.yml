@@ -196,6 +196,30 @@ jobs:
               sys.exit("M5 pipeline gate FAILED: " + json.dumps(g))
           PY
 
+      # W3 -- the stage-2 device-model gate, CI-verified every push:
+      # the DART PTE walker, the register-keyed IOMFB swap path, the
+      # TLB invalidate and the MIPI command FIFO, driven through their
+      # real MMIO by tools/dart-walker-gate.py (qtest) against a live
+      # boot of this payload.  2 GiB guest: the documented low-RAM
+      # preset (mkadt.rs LOW_PHYS_BASE/LOW_MEM_SIZE), fine on any runner.
+      - name: W3 gate — the stage-2 DART walker + IOMFB swap (qtest)
+        run: |
+          ./target/release/sweet-rust make-adt out/gate.adt --qemu --display \
+            --phys 0x48000000 --mem 0x70000000
+          ./target/release/sweet-rust make-payload \
+            kernel/kernel.development.sweet out/gate.adt out/gate-payload.bin \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 -noprogress wdt=-1' \
+            --ramdisk empty.cpio
+          sh tools/dart-walker-gate.sh out/gate-payload.bin out/gate 60
+          python3 - <<'PY'
+          import json, sys
+          v = json.loads(open("out/gate/dart-gate-verdict.json").read())
+          print(json.dumps(v, indent=2))
+          if not v["pass"]:
+              sys.exit("W3 gate FAILED: " +
+                       str([k for k, ok in v["gates"].items() if not ok]))
+          PY
+
       - name: Upload M5 artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -203,6 +227,7 @@ jobs:
           name: m5-display-${{ github.run_id }}
           path: |
             out/m5/
+            out/gate/
             out/adt-dump.txt
           if-no-files-found: error
 
@@ -213,6 +238,9 @@ jobs:
             echo "## M5 display/DART/MIPI device-model run"
             echo '```'
             cat out/m5/m5-verdict.json 2>/dev/null || echo "(no verdict)"
+            echo '```'
+            echo '```'
+            cat out/gate/dart-gate-verdict.json 2>/dev/null || echo "(no W3 gate verdict)"
             echo '```'
             echo '```'
             tail -40 out/m5/console.txt 2>/dev/null || true

@@ -17,7 +17,65 @@ All four disp0 ranges and both DART ranges are **below guest RAM**
 (priority 1 — beats `virt`'s empty pcie-mmio alias container) and **no
 change to `hw/arm/virt.c` is needed**.
 
-## Stage-1 scope (deliberately honest)
+## Stage-2 scope (the W3 deliverable, CI-gated)
+
+The stage-1 models shipped store+echo registers, the DART IOMMU wiring and
+a host-driven swap hook, with the real translation machinery explicitly
+marked "stage 2, driven by kernel traces". W2 then proved no kernel ever
+probes these registers (the SWEET kernel's display path is the built-in
+RAM shim of upstream patch 0046), so stage 2 was written against the
+**real D22AP ADT parameters** (`docs/research/devicetree-d22ap.md`:
+`page-size = 0x1000`, `stt-idx-width = 0xa`, `sids = 3`) plus public
+M1-DART-style PTE knowledge — RE-grade, documented in the sources, and
+**frozen as this fork's contract** by a deterministic gate:
+
+* **`sweet-dart` stage 2 — the real PTE walker:**
+  `TTBR0[sid][n]` (now at `0x300 + sid*0x100 + 8n` — stage 1 had a real
+  collision: `TTBR0[0][0]` at `0x200` was shadowed by `TCR[2]`) points at
+  an L1 table (`bit 0 VALID`, bits `[47:12]` table base). The walk is
+  4-level with 4 KB granule: L1/STT index 10 bits (`stt-idx-width`),
+  L2/L3 9 bits each, 64-bit LE entries (`bit 0 VALID`, `bit 1 NO_READ`,
+  `bit 2 NO_WRITE`, bits `[47:12]` next table / output PA). A 4096-entry
+  translation cache serves repeat DMAs; `STREAM_COMMAND` (0x20) bit 0
+  invalidates it (TCR/TTBR writes flush it too — documented deviation).
+  Unconfigured/unmapped DMAs are DENIED, latch `FAULT_STATUS`/`FAULT_IOVA_LO/HI`
+  (0x40/0x44/0x48) and assert the (hitherto reserved) fault IRQ until
+  `FAULT_STATUS` is W1C-acked.
+* **`sweet-disp0` stage 2 — the register-keyed (IOMFB-style) swap path:**
+  `SWAP_SRC_LO/HI` (0x200/0x204) program the surface IOVA, `SWAP_CTRL`
+  (0x208) bit 0 `SWAP_GO` makes the DEVICE DMA the surface through the
+  DART AS into the framebuffer — a fully guest-initiated flip, no host
+  help. `SWAP_COUNT` (0x20c) counts swaps; `INTSTATUS` bit 0
+  (`SWAP_DONE`) self-asserts per swap (W1C). The stage-1 HMP hook
+  `sweet-disp0-swap` remains and shares the same engine (source-tagged
+  `hmp` vs `iomfb` in the traces).
+* **`sweet-mipi-dsim` stage 2 — DSI command FIFO acks:** `GEN_HDR`
+  (0x48) sends a packet (completes instantly, header latched for
+  read-back, `INTSTATUS` bit 0 `CMD_DONE`), `GEN_PLD` (0x4c) accepts
+  payload words, `CMD_PKT_STATUS` (0x50) reads `0x5` (command empty +
+  payload writable) so a polling driver's command loop completes.
+
+**The W3 gate** (`tools/dart-walker-gate.sh` + `.py`, CI job
+`qemu-m5-display.yml` step "W3 gate"): boots the real kernel payload on
+the fork with `--qtest`, pauses the vCPU, and drives the exact register
+traffic the real drivers would produce — then asserts:
+
+1. unconfigured DART **denies** the disp0 swap and latches FAULT_*;
+2. a guest-programmed PTE **translates a non-identity IOVA**
+   (`0x70000000` → `0xbf007000`) through L1[1]→L2[384]→L3 to the right
+   host page: the 10 MB framebuffer reads back the programmed pattern;
+3. the translation cache serves the **stale** PTE until
+   `STREAM_COMMAND` invalidate, then refetches (page 0 flips to the new
+   pattern, the rest stays);
+4. the MIPI command FIFO acks a `GEN_HDR` packet.
+
+Measured PASS in the 4 GB sandbox session (2 GiB guest, real
+`kernel.development.sweet` boot, 2026-10-24) and wired as a hard CI gate.
+
+## Stage-1 scope (superseded, kept for the record)
+
+The exact t8015 register semantics are reverse-engineering grade. Stage 1
+did NOT pretend to be bit-accurate. It provided:
 
 The exact t8015 register semantics are reverse-engineering grade. Stage 1
 does NOT pretend to be bit-accurate. It provides:

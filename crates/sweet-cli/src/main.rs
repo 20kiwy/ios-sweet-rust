@@ -109,7 +109,7 @@ COMMANDS:
         writes them under --out with '/' -> '__' in names.
 
     boot-qemu <PAYLOAD> <OUTDIR> [--secs 20] [--cpu cortex-a76] [--gdb]
-              [--sweet-devices] [--vnc 127.0.0.1:5901]
+              [--sweet-devices] [--vnc 127.0.0.1:5901] [--qtest SOCKET]
         [--snap-every N]  # interval fb screenshots while the guest runs
         [--logo LOGO.bin | --logo-ipsw IPSW] [--live-serial] [--qemu-datadir D]
         [--check-env]
@@ -293,7 +293,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "decmp-dump" => vec!["member", "out", "bytes", "scan", "rsrc"],
         "rootfs-plan" => vec![],
         "screen-decode" => vec!["kernel", "payload", "nm"],
-        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "msgbuf-dump", "snap-every", "vnc"],
+        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "msgbuf-dump", "snap-every", "vnc", "qtest"],
         // --sweet-devices and --display are boolean flags (Flags::has)
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
@@ -1725,6 +1725,7 @@ fn cmd_boot_qemu(args: &[String]) -> Result<()> {
         snap_every: f.val("snap-every").and_then(|v| v.parse().ok()),
         sweet_devices: f.has("sweet-devices"),
         vnc: f.val("vnc").map(|s| s.to_string()),
+        qtest: f.val("qtest").map(PathBuf::from),
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()
     };
