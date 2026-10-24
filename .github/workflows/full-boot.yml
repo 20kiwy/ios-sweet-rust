@@ -184,13 +184,13 @@ jobs:
             --highmem --no-logo --secs "$SECS" --dump-ramdisk \
             --snap-every 30 \
             --msgbuf-dump "0x$MSGREF" \
-            --hmp "memsave $SWEETLOGTOTAL 8 sweetlogtotal.bin;memsave $SWEETLOGRING 4194304 sweetlogring.bin" \
+            --hmp "memsave $SWEETLOGTOTAL 8 sweetlogtotal.bin;memsave $SWEETLOGRING 4194304 sweetlogring.bin;pmemsave 0x40000000 0x200000000 gustram.bin" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 sweetfb_noconsole=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           set -e
           ls -la out-full
-          # QEMU's cwd is the repo root — collect the ring files
-          cp sweetlogtotal.bin sweetlogring.bin out-full/ 2>/dev/null || true
+          # QEMU's cwd is the repo root — collect the ring + RAM dump files
+          cp sweetlogtotal.bin sweetlogring.bin gustram.bin out-full/ 2>/dev/null || true
           python3 - <<'PY'
           import struct, pathlib
           out = pathlib.Path("out-full")
@@ -230,6 +230,28 @@ jobs:
           } > out-full/console.txt
           set -e
           tail -30 out-full/console.txt
+
+      - name: W4 probe — guest RAM strings at the freeze (backboardd's heap)
+        # The parked processes never reach their first kernel service call,
+        # so the kernel ring only says "exec". Their OWN state (XPC error
+        # strings, BackBoardServer init strings, mach service names, the
+        # in-flight tracev3 logd buffer) lives in the guest heap. The
+        # unified boot already pmemsave'd the full RAM at stop; strings it
+        # here and keep only the grep hits.
+        run: |
+          set +e
+          if [ -f out-full/gustram.bin ]; then
+            ls -la out-full/guest-ram.bin
+            strings -n 8 out-full/gustram.bin | grep -aiE \
+              'BackBoard|backboardd|IOMFB|IOMobileFrame|display-subsystem|HIDEventSystem|SpringBoard|IOSurface|swap|vsync|IOServiceMatching|bootstrap|check-in|XPC.*error|Can not|could not|unable to' \
+              | sort | uniq -c | sort -rn | head -200 > out-full/ram-strings-w4.txt
+            wc -l out-full/ram-strings-w4.txt
+            head -60 out-full/ram-strings-w4.txt
+            rm -f out-full/gustram.bin
+          else
+            echo "no gustram.bin (dump step did not run?)"
+          fi
+          set -e
 
       - name: Unified verdict — M3 stages WITH devices + W2 traffic + W1 gate
         run: |
