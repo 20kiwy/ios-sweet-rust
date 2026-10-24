@@ -308,6 +308,26 @@ reality beats the original guess.
   patch (upstream SWEET patch set) or QEMU `unimplemented-device`
   stubs at the real D22AP MMIO bases (reads-as-zero; a half-matched
   real IOMFB may panic — revert restores the proven stable state).
+* **Daemon-plist tweak verified applied; os_log does NOT route to stderr (run 40041071761, 2026-10-23).**
+  The 270fdd8 diagnostics settled the invisibility question:
+  `daemon plists: 491 seen, 0 shared-extent bypasses, 7 os_log-mirrored
+  (com.apple.SpringBoard, com.apple.backboardd, com.apple.configd,
+  com.apple.containermanagerd, com.apple.logd, com.apple.mediaserverd,
+  com.apple.watchdogd), 108 parse failures: not a binary plist`. Three
+  facts: (1) the per-daemon surgery WORKS and reaches the right files —
+  the 108 XML plists (usermanagerd, tccd, notifyd among them) are
+  skipped verbatim by the binary-only parser; (2) no hard-link bypass;
+  (3) the daemons STILL log nothing to the console — so the earlier
+  "tweak didn't land" reading was an artifact of the guest-strings GREP
+  FILTER (OS_ACTIVITY_DT_MODE lines never matched any pattern and were
+  filtered out before hitting the artifact). The real conclusion: on
+  iOS 16.7, os_log does not honor OS_ACTIVITY_DT_MODE /
+  CFLOG_FORCE_STDERR routing to stderr for these daemons — their logs
+  go to logd (running since the first wave), which persists them to
+  /var/db/diagnostics as tracev3 on the md0. The next visibility tool
+  is a tracev3 reader over the md0 dump (the repo already parses
+  binary plists / ADT / IM4P / decmpfs — same discipline), NOT more
+  plist env surgery. The MACH wall itself is unchanged (M4/M5 IOMFB).
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —

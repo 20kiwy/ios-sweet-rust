@@ -193,9 +193,15 @@ jobs:
           D=out-m3/md0-dump.img
           if [ -f "$D" ]; then
             ls -la "$D"
-            # launchd + usermanagerd file logs and any panic-adjacent text
+            # launchd + usermanagerd file logs and any panic-adjacent text.
+            # NOTE: this filter HIDES anything not matching — run
+            # 40041071761 proved OS_ACTIVITY_DT_MODE strings WERE in the
+            # dump but the filter ate them. logd-store patterns added:
+            # logd (running since the first wave) persists os_log to
+            # /var/db/diagnostics as tracev3 — the daemon logs are THERE,
+            # not on stderr (env-var routing does not work on 16.7).
             strings -n 8 "$D" | grep -aE \
-              'launchd|usermanagerd|mobile|getpwnam|libinfo|muser|keybag|persona|UIKitApplication|exit reason|unable to|failed|xpcproxy|user/501|WILL_SPAWN|Early boot complete|Successfully spawned|Missing executable|SpringBoard|backboardd' \
+              'launchd|usermanagerd|mobile|getpwnam|libinfo|muser|keybag|persona|UIKitApplication|exit reason|unable to|failed|xpcproxy|user/501|WILL_SPAWN|Early boot complete|Successfully spawned|Missing executable|SpringBoard|backboardd|tracev3|logdata|diagnostics|OS_ACTIVITY' \
               > out-m3/guest-strings.txt || true
             wc -l out-m3/guest-strings.txt || true
             # the launchd log file itself is plaintext: pull its head/tail
