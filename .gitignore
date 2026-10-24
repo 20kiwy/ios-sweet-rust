@@ -3,3 +3,7 @@ Cargo.lock.orig
 *.ram.bin
 out/
 *.log
+# build outputs: the vendored SOURCE is tracked, the compiled artifacts are not
+qemu-sweet/qemu/build-sweet/
+qemu-prefix-sweet/
+out-*/
