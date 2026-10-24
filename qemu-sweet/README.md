@@ -63,9 +63,15 @@ sh qemu-sweet/build.sh          # source is VENDORED at qemu-sweet/qemu/ (v10.0.
   `0001-sweet-wire-device-models.patch` (meson/Kconfig/HMP wiring only —
   the device sources come from `overlay/`), configures a fresh
   `build-sweet/`, builds `qemu-system-aarch64` (aarch64-softmmu only) and
-  installs it into `$QEMU_PREFIX/bin`. A hard post-apply gate fails the
-  build if the wiring did not land (a silent no-op apply once produced a
-  stock-QEMU binary with zero diagnostics).
+  installs it into `$QEMU_PREFIX/bin` (default: `qemu-prefix-sweet/` next
+  to this directory; the old `/home/z` default once failed the CI install
+  step AFTER the link — runners are not `/home/z`). A hard post-apply
+  gate fails the build if the wiring did not land (a silent no-op apply
+  once produced a stock-QEMU binary with zero diagnostics).
+* VNC is enabled in the fork configure (display OUT for the disp0
+  console); `build.sh` also installs the pregenerated keymaps from the
+  QEMU source into `$QEMU_PREFIX/share/qemu/keymaps` — without them
+  `-vnc` dies with "could not read keymap file: 'en-us'".
 * `FAST=1 sh qemu-sweet/build.sh` resumes an interrupted long build
   (reuses the configured `build-sweet/`; ninja continues incrementally).
 * Sandbox (no root): the system needs `gcc`, `pkg-config`, `glib-2.0` and
@@ -96,9 +102,29 @@ PY
 sweet-rust make-payload kernel/kernel.development.sweet out/m5.adt out/payload.bin \
   --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 -noprogress wdt=-1' \
   --ramdisk empty.cpio
-sweet-rust boot-qemu out/payload.bin out/m5 --secs 150 --sweet-devices
+sweet-rust boot-qemu out/payload.bin out/m5 --secs 150 --sweet-devices \
+  --vnc 127.0.0.1:59
 grep 'sweet-' out/m5/qemu.log      # every device register access, in order
 ```
+
+### Display out: VNC + console screenshots
+
+The fork's `sweet-disp0` registers a QEMU console backed by guest RAM at
+`fb-base`: `-vnc 127.0.0.1:59` serves it live (RFB on port 5959), and
+QMP `screendump` captures it — `boot-qemu`/`ipsw-boot` write
+`screenshot-NNNN.png` per `--snap-every` tick plus `screenshot-final.png`,
+and `emu-boot`/`Session` get the same wiring through `spawn_session`.
+Verified: the console screenshot decodes (screen-decode) to the same M2
+wall text as the fb pmemsave path. Display IN (touch) is W5
+(BackBoard/HID), not this path.
+
+Two portability traps, both measured:
+* the console starts as a 640x480 "not initialized" placeholder — the
+  device must `dpy_gfx_replace_surface()` its real surface; a bare
+  `dpy_gfx_update_full()` would update a surface nobody displays;
+* the QMP chardev serves ONE client at a time — a second connection sits
+  in the backlog without a greeting forever (the runner's snap helpers
+  therefore reuse the caller's `Qmp` handle).
 
 Measured verdict of exactly this recipe (vendored-source build, sandbox):
 all three devices realized at the D22AP bases, disp0 DMA rooted at the

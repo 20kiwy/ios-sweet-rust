@@ -19,6 +19,9 @@
  *   * No IRQ is ever asserted.
  *   * A host-driven swap hook (HMP `sweet-disp0-swap`) blits a BGRA
  *     surface into the framebuffer through the DART address space.
+ *   * The framebuffer (guest RAM at fb-base) is registered with QEMU's
+ *     display layer: `-vnc` serves it live and QMP/HMP `screendump`
+ *     screenshots it.  This is the "display out" path of the fork.
  *
  * Observability contract: `-d int,guest_errors,unimp -D qemu.log`, all
  * traces via qemu_log_mask(LOG_UNIMP|LOG_GUEST_ERROR) with the
@@ -38,6 +41,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "system/dma.h"
+#include "ui/console.h"
 
 /* Window sizes. */
 #define SWEET_DISP0_MAIN_SIZE   0x2a6000
@@ -95,6 +99,12 @@ struct SweetDisp0State {
     uint32_t int_mask;      /* 0x40 INTMASK (store+echo) */
     uint32_t int_status;    /* 0x48 INTSTATUS (W1C, never self-asserts) */
     uint64_t last_surface;  /* 0x100, set by hmp_sweet_disp0_swap */
+
+    /* QEMU display layer: -vnc and screendump serve this console from
+     * the guest framebuffer at fb-base. */
+    QemuConsole *con;
+    DisplaySurface *surface;
+    uint8_t *fb_shadow;     /* host copy of the guest framebuffer */
 };
 
 DECLARE_INSTANCE_CHECKER(SweetDisp0State, SWEET_DISP0, TYPE_SWEET_DISP0)
@@ -260,6 +270,43 @@ static const MemoryRegionOps sweet_disp0_small_ops = {
 };
 
 /* ------------------------------------------------------------------ */
+/* Display layer (VNC + screendump)                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Mirror the guest framebuffer (guest RAM at fb-base) into QEMU's
+ * display layer on every refresh.  Writers of the fb are NOT tracked:
+ * the guest's early console writes it directly (no swap involved), so
+ * the dirty-flag shortcut would freeze the surface at its first frame.
+ * 10MB is cheap at screendump rate; VNC pays it only per refresh tick
+ * with a client attached.  Memory layout is BGRA (the swap hook blits
+ * BGRA verbatim); on a little-endian host that is PIXMAN_a8r8g8b8.
+ */
+static void sweet_disp0_gfx_update(void *opaque)
+{
+    SweetDisp0State *s = opaque;
+    size_t len = (size_t)s->fb_width * s->fb_height * 4;
+
+    if (!s->surface) {
+        s->fb_shadow = g_malloc0(len);
+        s->surface = qemu_create_displaysurface_from(
+            (int)s->fb_width, (int)s->fb_height, PIXMAN_a8r8g8b8,
+            (int)(s->fb_width * 4), s->fb_shadow);
+        /* REPLACE the 640x480 "not initialized" placeholder that
+         * graphic_console_init installed: dpy_gfx_update_full only marks
+         * regions of the CURRENT surface dirty, so without this the
+         * console would show the placeholder forever. */
+        dpy_gfx_replace_surface(s->con, s->surface);
+    }
+    cpu_physical_memory_read(s->fb_base, s->fb_shadow, len);
+    dpy_gfx_update_full(s->con);
+}
+
+static const GraphicHwOps sweet_disp0_gfx_ops = {
+    .gfx_update = sweet_disp0_gfx_update,
+};
+
+/* ------------------------------------------------------------------ */
 /* Realize                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -320,12 +367,19 @@ static void sweet_disp0_realize(DeviceState *dev, Error **errp)
                       "address_space_memory (identity)\n");
     }
 
+    /* Register with QEMU's display layer so -vnc serves the framebuffer
+     * live and screendump can capture it. */
+    s->con = graphic_console_init(dev, 0, &sweet_disp0_gfx_ops, s);
+
     qemu_log_mask(LOG_UNIMP,
                   "sweet-disp0: realized main=0x%" PRIx64 " aux=0x%" PRIx64
                   " pmgr-a=0x%" PRIx64 " pmgr-b=0x%" PRIx64
                   " fb=0x%" PRIx64 " %ux%u BGRA\n",
                   s->main_base, s->aux_base, s->pmgr_a_base, s->pmgr_b_base,
                   s->fb_base, s->fb_width, s->fb_height);
+    qemu_log_mask(LOG_UNIMP,
+                  "sweet-disp0: console registered (--vnc + screendump "
+                  "serve fb-base)\n");
 }
 
 static void sweet_disp0_instance_init(Object *obj)

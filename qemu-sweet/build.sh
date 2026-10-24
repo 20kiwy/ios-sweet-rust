@@ -16,7 +16,8 @@
 # Env:
 #   QEMU_SRC      QEMU v10.0.0 source      (default <this dir>/qemu, the
 #                 vendored tree; an external clone also works)
-#   QEMU_PREFIX   install prefix           (default /home/z/qemu-prefix-sweet)
+#   QEMU_PREFIX   install prefix           (default <repo>/qemu-prefix-sweet,
+#                                          next to this directory)
 #   FAST=1        resume mode: reuse build-sweet/ if it is already
 #                 configured (long first builds survive a killed shell;
 #                 ninja picks up incrementally).  Default = full clean.
@@ -28,12 +29,19 @@
 set -e
 
 # The sandbox ships meson/ninja in /home/z/.venv/bin; on CI the distro
-# toolchain is usually first on PATH already.  Prepending is harmless.
-export PATH="/home/z/.venv/bin:$PATH"
+# toolchain is usually first on PATH already.  (Guarded: on a runner
+# without that directory the entry is simply not prepended.)
+[ -d /home/z/.venv/bin ] && export PATH="/home/z/.venv/bin:$PATH"
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 QEMU_SRC="${QEMU_SRC:-$HERE/qemu}"
-QEMU_PREFIX="${QEMU_PREFIX:-/home/z/qemu-prefix-sweet}"
+# Install prefix: repo-relative by default.  (The previous /home/z
+# default was a sandbox-ism: the CI runner runs as /home/runner, and the
+# install mkdir failed AFTER the link succeeded -- "cannot create
+# directory '/home/z': Permission denied".  Repo-relative works on any
+# host with a writable checkout; override with QEMU_PREFIX=... to
+# install elsewhere.)
+QEMU_PREFIX="${QEMU_PREFIX:-$HERE/../qemu-prefix-sweet}"
 PATCH="$HERE/0001-sweet-wire-device-models.patch"
 
 CC=gcc
@@ -169,7 +177,6 @@ if [ "$need_configure" = "1" ]; then
             --disable-opengl \
             --disable-gtk \
             --disable-sdl \
-            --disable-vnc \
             --disable-xkbcommon \
             --disable-auth-pam \
             --disable-glusterfs \
@@ -201,6 +208,12 @@ ninja -C "$QEMU_SRC/build-sweet" -j "$(nproc)" qemu-system-aarch64
 # --------------------------------------------------------------- install --
 mkdir -p "$QEMU_PREFIX/bin"
 cp "$QEMU_SRC/build-sweet/qemu-system-aarch64" "$QEMU_PREFIX/bin/qemu-system-aarch64"
+# VNC keymaps: qemu-keymap needs xkbcommon (we configure without it), but
+# QEMU ships pregenerated keymaps in the source tree and resolves its
+# datadir relative to the binary, so install them next to it.  Without
+# this, `-vnc` dies with "could not read keymap file: 'en-us'".
+mkdir -p "$QEMU_PREFIX/share/qemu/keymaps"
+cp "$QEMU_SRC/pc-bios/keymaps/"* "$QEMU_PREFIX/share/qemu/keymaps/"
 {
     git -C "$QEMU_SRC" describe --tags 2>/dev/null || echo "v10.0.0-sweet"
 } > "$QEMU_PREFIX/qemu-sweet-version.txt"
