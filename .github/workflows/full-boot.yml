@@ -265,6 +265,36 @@ jobs:
           fi
           set -e
 
+      - name: Daemon logs (logd tracev3 from the md0 dump — backboardd's own words)
+        # W4 gate evidence: the parked daemons' os_log goes to logd's
+        # /var/db/diagnostics (tracev3), not to the console. The unified
+        # boot already --dump-ramdisk'd the md0; extract the diag store
+        # with the HFS+ reader (same tool as qemu-m3-rootfs.yml). Whether
+        # backboardd got PAST the IOMobileFramebuffer connect is answered
+        # by THESE files, not by the kernel ring.
+        if: always()
+        run: |
+          D=out-full/md0-dump.img
+          if [ -f "$D" ]; then
+            ls -la "$D"
+            ./target/release/sweet-rust md0-logs "$D" --out out-full/diag --max-file 64 \
+              > out-full/diag-listing.txt 2>&1 || true
+            head -40 out-full/diag-listing.txt || true
+            # the tracev3 chunks are the daemons' own timeline: grep the
+            # backboardd / SpringBoard / IOMFB connect evidence out of them
+            if [ -d out-full/diag ]; then
+              grep -raoE -i \
+                '.{0,60}(backboard|IOMobileFramebuffer|IOMFB|display.services|SpringBoard|check.in|bootstrap).{0,60}' \
+                out-full/diag 2>/dev/null | sort | uniq -c | sort -rn | head -120 \
+                > out-full/diag-w4.txt || true
+              wc -l out-full/diag-w4.txt || true
+              head -60 out-full/diag-w4.txt || true
+            fi
+            rm -f "$D"
+          else
+            echo "no md0-dump.img (boot exited early?)"
+          fi
+
       - name: Unified verdict — M3 stages WITH devices + W2 traffic + W1 gate
         run: |
           python3 - <<'PY'
@@ -375,17 +405,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: full-boot-${{ github.run_id }}
+          # the multi-GB rebuildables would dominate the zip: payload.bin and
+          # md0-dump.img are rebuilt every run from the cached IPSW (v4 has
+          # no 'exclude' input — negation patterns inside 'path' are the way)
           path: |
             out-full/
             out-ctl/
             fsck-summary.txt
             wall/
-          # the multi-GB rebuildables would dominate the zip: payload.bin and
-          # md0-dump.img are rebuilt every run from the cached IPSW
-          exclude: |
-            out-full/payload.bin
-            out-full/md0-dump.img
-            out-ctl/payload.bin
+            !out-full/payload.bin
+            !out-full/md0-dump.img
+            !out-ctl/payload.bin
           if-no-files-found: warn
 
       - name: Job summary

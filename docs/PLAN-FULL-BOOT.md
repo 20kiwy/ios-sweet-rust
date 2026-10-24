@@ -181,6 +181,26 @@ the prerequisite for clean SpringBoard/Settings screenshots (W5).
 baseline set. **Gate:** the parking daemon gets past the IOMFB connect;
 the spawn cycle advances one measured daemon further.
 
+**MEASURED — run 40097359964 (2026-10-24, the FIRST-EVER green full-boot
+on the runner; the paid-label + concurrency-slot runner bugs were fixed
+this session):** every step green including the W1 gate. Verdict:
+`stage_with_devices = "user-domain"` with `daemons_execd_count = 23`
+(backboardd, SpringBoard, mediaserverd, lockdownd, keybagd, IOMFB_FDR_Loader,
+…), `last_msgbuf_ts = 45.07` vs the 45.0 baseline, `kernel_panic = false`,
+all three sweet devices realized, `disp0_dma_via_dart = true`, 7 console
+screenshots, and the LIVE control session PASS (`wallpaper_painted`,
+`guest_painted`, `session_alive` all true). The W4 heap probe (first run
+with the corrected probe window — the ADT bank 0x100000000+0xfcc00000)
+shows the REAL GUI stack resident in the guest: SpringBoardServices,
+BackBoardServices, IOSurface, IOMobileFramebuffer, IOSurfaceAccelerator,
+SpringBoardUI + `_IOServiceMatching`/`_bootstrap_port` — the daemons are
+alive and parked at their bootstrap/IOMFB check-ins, not dead.
+**Remaining uncertainty (next run answers it):** whether backboardd got
+PAST the IOMobileFramebuffer connect. The kernel ring goes quiet at 45 s
+(userland took over); the daemons' own words are in logd's tracev3 store
+on the md0 — the new "Daemon logs" step now extracts it (`md0-logs` +
+`out-full/diag-w4.txt`), giving backboardd's check-in verdict verbatim.
+
 ### W5 — SpringBoard first frame (the finish line of the plan, §M7)
 
 BackBoard + HID injection (`com.apple.iohideventsystem`) and the first
