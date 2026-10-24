@@ -188,6 +188,9 @@ jobs:
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           ls -la out-m3
+          # QEMU's cwd is the REPO ROOT (msgbuf.bin gets renamed into the
+          # out dir by the runner, sweetlog*.bin do not — collect them).
+          cp sweetlogtotal.bin sweetlogring.bin out-m3/ 2>/dev/null || true
           python3 - <<'PY'
           import struct, pathlib
           out = pathlib.Path("out-m3")
