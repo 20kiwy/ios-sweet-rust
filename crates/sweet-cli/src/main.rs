@@ -1657,6 +1657,63 @@ fn probe_vcpu_pcs(
         s.push(e);
     }
     v.set("samples", J::Arr(s));
+
+    // Name the wall: when the park is _handle_debugger_trap, the kernel's
+    // debugger-state block holds WHY (xnu kern/debug.c globals). One extra
+    // pause, one attach, five reads.
+    sess.pause()?;
+    let dbg = (|| -> Result<J> {
+        let mut g = sc::control::Gdb::attach(gdb_port)?;
+        let symaddr = |name: &str| syms.iter().find(|(n, _)| n == name).map(|(_, a)| *a);
+        let read_u64 = |g: &mut sc::control::Gdb, a: u64| -> Result<u64> {
+            let b = g.read_mem(a, 8)?;
+            Ok(u64::from_le_bytes(b.try_into().unwrap()))
+        };
+        let read_cstr = |g: &mut sc::control::Gdb, a: u64| -> Result<String> {
+            let b = g.read_mem(a, 256)?;
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            Ok(String::from_utf8_lossy(&b[..end]).to_string())
+        };
+        let mut d = J::obj();
+        if let Some(a) = symaddr("_debugger_current_op") {
+            match read_u64(&mut g, a) {
+                Ok(x) => d.set("current_op", J::s(format!("{x:#x}"))),
+                Err(e) => d.set("current_op", J::s(format!("read failed: {e}"))),
+            }
+        }
+        for (symname, key) in [
+            ("_debugger_panic_str", "panic_str"),
+            ("_debugger_panic_caller", "panic_caller"),
+            ("_debugger_panic_args", "panic_args"),
+            ("_debugger_panic_data", "panic_data"),
+            ("_debugger_panic_options", "panic_options"),
+        ] {
+            let Some(a) = symaddr(symname) else { continue };
+            let val = match read_u64(&mut g, a) {
+                Ok(x) => x,
+                Err(e) => {
+                    d.set(key, J::s(format!("read failed: {e}")));
+                    continue;
+                }
+            };
+            d.set(&format!("{key}_ptr"), J::s(format!("{val:#x}")));
+            // only _debugger_panic_str points at a C string; the others are
+            // code addresses / raw values (the smoke read proved it: caller
+            // decoded to garbage bytes)
+            if key == "panic_str" && val >= kmin && val <= kmax + 0x10000000 {
+                match read_cstr(&mut g, val) {
+                    Ok(t) if !t.is_empty() => d.set(key, J::s(t)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(d)
+    })();
+    sess.cont()?;
+    match dbg {
+        Ok(d) => v.set("debugger_state", d),
+        Err(e) => v.set("debugger_state", J::s(format!("failed: {e}"))),
+    }
     Ok(v)
 }
 
