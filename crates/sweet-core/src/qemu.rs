@@ -52,6 +52,14 @@ pub struct RunOptions {
     /// via screen-decode --kernel). No QMP conflicts: each snap is a fresh
     /// sequential connection, closed before the next.
     pub snap_every: Option<f64>,
+    /// Attach the qemu-sweet device models (M4/M5 display path):
+    ///   -device sweet-dart,id=sweet-dart0      (dart-disp0 @ 0x18704000)
+    ///   -device sweet-mipi-dsim                (mipi-dsim @ 0x18400000)
+    ///   -device sweet-disp0,dart=sweet-dart0   (disp0 @ 0x18000000, DMA
+    ///                                           through the DART's IOMMU AS)
+    /// Requires the qemu-sweet build (qemu-sweet/build.sh) FIRST in PATH —
+    /// the devices only exist in that fork; stock QEMU errors on them.
+    pub sweet_devices: bool,
 }
 
 impl Default for RunOptions {
@@ -68,6 +76,7 @@ impl Default for RunOptions {
             msgbufp: None,
             dump_ramdisk: false,
             snap_every: None,
+            sweet_devices: false,
             qemu_datadir: Vec::new(),
             logo: None,
         }
@@ -728,6 +737,19 @@ pub fn run(
         &out.join("qemu.log").display().to_string(),
         "-no-reboot",
     ]);
+    // qemu-sweet M4/M5 device models: DART first (disp0 links to it by id),
+    // then MIPI-DSI, then the display controller with its DMA address space
+    // rooted at the DART's IOMMU. Order in the log proves the chain.
+    if opts.sweet_devices {
+        cmd.args([
+            "-device",
+            "sweet-dart,id=sweet-dart0",
+            "-device",
+            "sweet-mipi-dsim",
+            "-device",
+            "sweet-disp0,dart=sweet-dart0",
+        ]);
+    }
     // payload image: one loader device per <=1.5GiB chunk, consecutive PAs
     for (p, off) in &loader_parts {
         cmd.args([

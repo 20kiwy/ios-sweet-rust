@@ -68,7 +68,7 @@ COMMANDS:
     kernel-unpack <IN.im4p> <OUT.macho>
         IM4P unwrap + LZFSE (bvx2) decompress -> plain Mach-O kernel.
 
-    make-adt <OUT.adt> [--qemu] [--highmem] [--product FILE.adt] [--seed HEX] [--dump]
+    make-adt <OUT.adt> [--qemu] [--highmem] [--product FILE.adt] [--seed HEX] [--display] [--dump]
         Build the Apple Device Tree (mkadt parity). --product copies the
         /product node of the real D22AP tree (MobileGestalt identity).
 
@@ -99,6 +99,7 @@ COMMANDS:
         running QEMU - for debugging loaders.
 
     boot-qemu <PAYLOAD> <OUTDIR> [--secs 20] [--cpu cortex-a76] [--gdb]
+              [--sweet-devices]
         [--snap-every N]  # interval fb screenshots while the guest runs
         [--logo LOGO.bin | --logo-ipsw IPSW] [--live-serial] [--qemu-datadir D]
         [--check-env]
@@ -271,6 +272,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "rootfs-plan" => vec![],
         "screen-decode" => vec!["kernel", "payload", "nm"],
         "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "snap-every"],
+        // --sweet-devices and --display are boolean flags (Flags::has)
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
             "logo-scale", "cpu", "w", "h", "qemu-datadir", "hello-lang",
@@ -1423,7 +1425,7 @@ fn cmd_kernel_unpack(args: &[String]) -> Result<()> {
 fn cmd_make_adt(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("make-adt"));
     if f.rest.is_empty() {
-        bail!("usage: make-adt <OUT.adt> [--qemu] [--highmem] [--product FILE] [--seed HEX] [--dump]");
+        bail!("usage: make-adt <OUT.adt> [--qemu] [--highmem] [--product FILE] [--seed HEX] [--display] [--dump]");
     }
     let product = f.val("product").map(|p| -> Result<Vec<(String, Vec<u8>)>> {
         let buf = load_adtish(Path::new(p))?;
@@ -1449,6 +1451,7 @@ fn cmd_make_adt(args: &[String]) -> Result<()> {
         product: product.as_deref(),
         seed,
         phys_override,
+        display: f.has("display"),
     };
     let root = mkadt::build(&opts)?;
     let blob = adt::serialize(&root);
@@ -1585,6 +1588,7 @@ fn cmd_boot_qemu(args: &[String]) -> Result<()> {
         live_serial: f.has("live-serial"),
         dump_ramdisk: f.has("dump-ramdisk"),
         snap_every: f.val("snap-every").and_then(|v| v.parse().ok()),
+        sweet_devices: f.has("sweet-devices"),
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
         ..Default::default()
     };

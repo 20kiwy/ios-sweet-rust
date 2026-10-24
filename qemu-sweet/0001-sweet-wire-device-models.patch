@@ -1,0 +1,1381 @@
+diff --git a/hmp-commands.hx b/hmp-commands.hx
+index 06746f0..8292b96 100644
+--- a/hmp-commands.hx
++++ b/hmp-commands.hx
+@@ -1859,3 +1859,20 @@ SRST
+   List event channels in the guest
+ ERST
+ #endif
++
++HXCOMM ios-sweet-rust: host-driven framebuffer swap hook (sweet-disp0).
++
++    {
++        .name       = "sweet-disp0-swap",
++        .args_type  = "addr:s",
++        .params     = "addr",
++        .help       = "blit the BGRA surface at guest physical address addr into the sweet-disp0 framebuffer",
++        .cmd        = hmp_sweet_disp0_swap,
++    },
++
++SRST
++``sweet-disp0-swap`` *addr*
++  ios-sweet device hook: read the BGRA surface at guest physical address
++  *addr* through the sweet-disp0 DART address space and write it to the
++  framebuffer (``fb-base``).  See the qemu-sweet README.
++ERST
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index a55b44d..db1849a 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -37,6 +37,7 @@ config ARM_VIRT
+     select VIRTIO_MEM_SUPPORTED
+     select ACPI_CXL
+     select ACPI_HMAT
++    select SWEET_DEVICES
+ 
+ config CUBIEBOARD
+     bool
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index a96452f..7fb2992 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -37,6 +37,7 @@
+ #include "hw/arm/boot.h"
+ #include "hw/arm/primecell.h"
+ #include "hw/arm/virt.h"
++#include "hw/arm/sweet_devices.h"
+ #include "hw/block/flash.h"
+ #include "hw/vfio/vfio-calxeda-xgmac.h"
+ #include "hw/vfio/vfio-amd-xgbe.h"
+@@ -3166,6 +3167,11 @@ static void virt_machine_class_init(ObjectClass *oc, void *data)
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_VFIO_PLATFORM);
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_UEFI_VARS_SYSBUS);
++    /* ios-sweet-rust: allow the T8015 display-path device models
++     * (qemu-sweet/, self-mapped at the D22AP MMIO bases in realize). */
++    machine_class_allow_dynamic_sysbus_dev(mc, TYPE_SWEET_DART);
++    machine_class_allow_dynamic_sysbus_dev(mc, TYPE_SWEET_MIPI);
++    machine_class_allow_dynamic_sysbus_dev(mc, TYPE_SWEET_DISP0);
+ #ifdef CONFIG_TPM
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
+ #endif
+diff --git a/hw/core/sysbus-fdt.c b/hw/core/sysbus-fdt.c
+index e85066b..120ec1e 100644
+--- a/hw/core/sysbus-fdt.c
++++ b/hw/core/sysbus-fdt.c
+@@ -38,6 +38,7 @@
+ #include "hw/display/ramfb.h"
+ #include "hw/uefi/var-service-api.h"
+ #include "hw/arm/fdt.h"
++#include "hw/arm/sweet_devices.h"
+ 
+ /*
+  * internal struct that contains the information to create dynamic
+@@ -519,6 +520,12 @@ static const BindingEntry bindings[] = {
+ #endif
+     TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
+     TYPE_BINDING(TYPE_UEFI_VARS_SYSBUS, add_uefi_vars_node),
++    /* ios-sweet-rust: the T8015 display-path device models describe
++     * themselves in the payload's Apple DeviceTree (the guest ignores the
++     * QEMU-generated FDT), so they get no FDT node. */
++    TYPE_BINDING(TYPE_SWEET_DART, no_fdt_node),
++    TYPE_BINDING(TYPE_SWEET_MIPI, no_fdt_node),
++    TYPE_BINDING(TYPE_SWEET_DISP0, no_fdt_node),
+     TYPE_BINDING("", NULL), /* last element */
+ };
+ 
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 90e6c04..739059d 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -145,3 +145,6 @@ endif
+ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
+ 
+ modules += { 'hw-display': hw_display_modules }
++
++# ios-sweet-rust: Apple T8015 display controller (stage-1 sweet model)
++system_ss.add(when: 'CONFIG_SWEET_DEVICES', if_true: files('sweet_disp0.c'))
+diff --git a/hw/display/sweet_disp0.c b/hw/display/sweet_disp0.c
+new file mode 100644
+index 0000000..ffbd74e
+--- /dev/null
++++ b/hw/display/sweet_disp0.c
+@@ -0,0 +1,448 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Apple T8015 display controller (disp0,t8015) -- stage-1 "sweet" model
++ * for the ios-sweet-rust project.
++ *
++ * Stage-1 scope (honest):
++ *   * Four MMIO windows self-mapped at the D22AP (iPhone X) addresses:
++ *       main  0x18000000  size 0x2a6000   (display controller core)
++ *       aux   0x18708000  size 0x1000     (disp0-aux)
++ *       pmgrA 0x320b8000  size 0x1000     (disp0 pmgr gate block A)
++ *       pmgrB 0x3230c000  size 0x1000     (disp0 pmgr gate block B)
++ *   * Register semantics are store+echo with a few curated constants so
++ *     AppleSynopsysMIPIDSIController / disp0 kernel probing finds sane
++ *     values.  The bit-accurate register model is stage 2 (driven by the
++ *     kernel traces this model produces).
++ *   * DMA goes through the linked DART's IOMMU address space (stage 1:
++ *     identity translation), proving the wiring end to end.
++ *   * No IRQ is ever asserted.
++ *   * A host-driven swap hook (HMP `sweet-disp0-swap`) blits a BGRA
++ *     surface into the framebuffer through the DART address space.
++ *
++ * Observability contract: `-d int,guest_errors,unimp -D qemu.log`, all
++ * traces via qemu_log_mask(LOG_UNIMP|LOG_GUEST_ERROR) with the
++ * "sweet-disp0:" prefix.  Reads are silent (they flood).
++ */
++
++#include "qemu/osdep.h"
++#include "exec/address-spaces.h"
++#include "exec/cpu-common.h"
++#include "hw/arm/sweet_devices.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/sysbus.h"
++#include "monitor/monitor.h"
++#include "qapi/error.h"
++#include "qobject/qdict.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "system/dma.h"
++
++/* Window sizes. */
++#define SWEET_DISP0_MAIN_SIZE   0x2a6000
++#define SWEET_DISP0_SMALL_SIZE  0x1000
++
++/* Curated stage-1 constants (documented in the README). */
++#define SWEET_DISP0_ID_VERSION  0x1d020005ull  /* main+0x0 id/version */
++
++/* Main-window offsets. */
++#define SWEET_DISP0_REG_ID        0x00
++#define SWEET_DISP0_REG_INTMASK   0x40
++#define SWEET_DISP0_REG_INTSTATUS 0x48
++#define SWEET_DISP0_REG_SURFACE   0x100  /* host-managed: last swap PA */
++
++typedef struct SweetDisp0State SweetDisp0State;
++
++/* One store+echo bank; carries its name for log lines. */
++typedef struct SweetStoreBank {
++    struct SweetDisp0State *dev;
++    const char *name;
++    uint8_t *data;
++} SweetStoreBank;
++
++struct SweetDisp0State {
++    SysBusDevice parent_obj;
++
++    /* Optional link to TYPE_SWEET_DART (-device sweet-disp0,dart=...). */
++    Object *dart_obj;
++    AddressSpace *dma_as;   /* DART IOMMU AS, or &address_space_memory */
++    bool via_dart;
++
++    /* Reserved: no IRQ lines are wired or asserted in stage 1. */
++    qemu_irq irq;
++
++    MemoryRegion mmio_main;
++    MemoryRegion mmio_aux;
++    MemoryRegion mmio_pmgr_a;
++    MemoryRegion mmio_pmgr_b;
++
++    SweetStoreBank bank_main;
++    SweetStoreBank bank_aux;
++    SweetStoreBank bank_pmgr_a;
++    SweetStoreBank bank_pmgr_b;
++
++    /* Properties. */
++    uint64_t main_base;
++    uint64_t aux_base;
++    uint64_t pmgr_a_base;
++    uint64_t pmgr_b_base;
++    uint64_t fb_base;
++    uint32_t fb_width;
++    uint32_t fb_height;
++
++    /* Curated stage-1 register state. */
++    uint32_t int_mask;      /* 0x40 INTMASK (store+echo) */
++    uint32_t int_status;    /* 0x48 INTSTATUS (W1C, never self-asserts) */
++    uint64_t last_surface;  /* 0x100, set by hmp_sweet_disp0_swap */
++};
++
++DECLARE_INSTANCE_CHECKER(SweetDisp0State, SWEET_DISP0, TYPE_SWEET_DISP0)
++
++/* ------------------------------------------------------------------ */
++/* Store+echo helpers (little-endian byte order, portable)             */
++/* ------------------------------------------------------------------ */
++
++static uint64_t sweet_store_read_le(const uint8_t *store, hwaddr addr,
++                                    unsigned size)
++{
++    uint64_t val = 0;
++    unsigned i;
++
++    for (i = 0; i < size; i++) {
++        val |= (uint64_t)store[addr + i] << (8 * i);
++    }
++    return val;
++}
++
++static void sweet_store_write_le(uint8_t *store, hwaddr addr, uint64_t val,
++                                 unsigned size)
++{
++    unsigned i;
++
++    for (i = 0; i < size; i++) {
++        store[addr + i] = (uint8_t)(val >> (8 * i));
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Main window                                                         */
++/* ------------------------------------------------------------------ */
++
++/* Reads silent. */
++static uint64_t sweet_disp0_main_read(void *opaque, hwaddr addr,
++                                      unsigned size)
++{
++    SweetStoreBank *b = opaque;
++    SweetDisp0State *s = b->dev;
++
++    switch (addr) {
++    case SWEET_DISP0_REG_ID:
++        if (size == 4) {
++            return SWEET_DISP0_ID_VERSION;
++        }
++        break;
++    case SWEET_DISP0_REG_INTSTATUS:
++        if (size == 4) {
++            return s->int_status;
++        }
++        break;
++    case SWEET_DISP0_REG_SURFACE:
++        if (size == 8) {
++            return s->last_surface;
++        }
++        if (size == 4) {
++            /* 0x100: low half.  A 0x104 (high half) read falls through
++             * to store+echo, which is fine for stage 1. */
++            return (uint32_t)s->last_surface;
++        }
++        break;
++    default:
++        break;
++    }
++
++    return sweet_store_read_le(b->data, addr, size);
++}
++
++static void sweet_disp0_main_write(void *opaque, hwaddr addr, uint64_t val,
++                                   unsigned size)
++{
++    SweetStoreBank *b = opaque;
++    SweetDisp0State *s = b->dev;
++
++    switch (addr) {
++    case SWEET_DISP0_REG_ID:
++        /* Read-only ID/version. */
++        qemu_log_mask(LOG_UNIMP,
++                      "sweet-disp0: W ID[0x0] (read-only, ignored) = 0x%08"
++                      PRIx64 "\n", val);
++        return;
++    case SWEET_DISP0_REG_INTMASK:
++        if (size == 4) {
++            s->int_mask = (uint32_t)val;
++            sweet_store_write_le(b->data, addr, val, size);
++            qemu_log_mask(LOG_UNIMP,
++                          "sweet-disp0: W INTMASK = 0x%08" PRIx64 "\n", val);
++            return;
++        }
++        break;
++    case SWEET_DISP0_REG_INTSTATUS:
++        if (size == 4) {
++            /* Write-1-to-clear; nothing ever self-asserts in stage 1. */
++            s->int_status &= ~(uint32_t)val;
++            if (val != 0) {
++                qemu_log_mask(LOG_UNIMP,
++                              "sweet-disp0: W1C INTSTATUS = 0x%08" PRIx64
++                              "\n", val);
++            }
++            return;
++        }
++        break;
++    case SWEET_DISP0_REG_SURFACE:
++        /* Host-managed evidence register (sweet-disp0-swap). */
++        qemu_log_mask(LOG_UNIMP,
++                      "sweet-disp0: W SURFACE (host-managed, ignored) = "
++                      "0x%016" PRIx64 "\n", val);
++        return;
++    default:
++        break;
++    }
++
++    /* Unknown offset: store+echo, one compact log line. */
++    sweet_store_write_le(b->data, addr, val, size);
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-disp0: main W unk[0x%04" HWADDR_PRIx "] = 0x%08"
++                  PRIx64 " (store+echo)\n", addr, val);
++}
++
++static const MemoryRegionOps sweet_disp0_main_ops = {
++    .read = sweet_disp0_main_read,
++    .write = sweet_disp0_main_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 8,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 8,
++};
++
++/* ------------------------------------------------------------------ */
++/* Small windows (aux, pmgr-a, pmgr-b): pure store+echo                */
++/* ------------------------------------------------------------------ */
++
++/* Reads silent. */
++static uint64_t sweet_disp0_small_read(void *opaque, hwaddr addr,
++                                       unsigned size)
++{
++    SweetStoreBank *b = opaque;
++
++    return sweet_store_read_le(b->data, addr, size);
++}
++
++static void sweet_disp0_small_write(void *opaque, hwaddr addr, uint64_t val,
++                                    unsigned size)
++{
++    SweetStoreBank *b = opaque;
++
++    sweet_store_write_le(b->data, addr, val, size);
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-disp0: %s W [0x%04" HWADDR_PRIx "] = 0x%08" PRIx64
++                  " (store+echo)\n", b->name, addr, val);
++}
++
++static const MemoryRegionOps sweet_disp0_small_ops = {
++    .read = sweet_disp0_small_read,
++    .write = sweet_disp0_small_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 8,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 8,
++};
++
++/* ------------------------------------------------------------------ */
++/* Realize                                                             */
++/* ------------------------------------------------------------------ */
++
++static void sweet_disp0_realize(DeviceState *dev, Error **errp)
++{
++    SweetDisp0State *s = SWEET_DISP0(dev);
++
++    if (s->fb_width == 0 || s->fb_height == 0) {
++        error_setg(errp, "sweet-disp0: fb-width/fb-height must be nonzero");
++        return;
++    }
++
++    s->bank_main.data = g_malloc0(SWEET_DISP0_MAIN_SIZE);
++    s->bank_aux.data = g_malloc0(SWEET_DISP0_SMALL_SIZE);
++    s->bank_pmgr_a.data = g_malloc0(SWEET_DISP0_SMALL_SIZE);
++    s->bank_pmgr_b.data = g_malloc0(SWEET_DISP0_SMALL_SIZE);
++
++    memory_region_init_io(&s->mmio_main, OBJECT(s), &sweet_disp0_main_ops,
++                          &s->bank_main, "sweet-disp0-main",
++                          SWEET_DISP0_MAIN_SIZE);
++    memory_region_init_io(&s->mmio_aux, OBJECT(s), &sweet_disp0_small_ops,
++                          &s->bank_aux, "sweet-disp0-aux",
++                          SWEET_DISP0_SMALL_SIZE);
++    memory_region_init_io(&s->mmio_pmgr_a, OBJECT(s), &sweet_disp0_small_ops,
++                          &s->bank_pmgr_a, "sweet-disp0-pmgr-a",
++                          SWEET_DISP0_SMALL_SIZE);
++    memory_region_init_io(&s->mmio_pmgr_b, OBJECT(s), &sweet_disp0_small_ops,
++                          &s->bank_pmgr_b, "sweet-disp0-pmgr-b",
++                          SWEET_DISP0_SMALL_SIZE);
++
++    /* Self-map all four windows (priority 1, see sweet_dart.c comment). */
++    memory_region_add_subregion_overlap(get_system_memory(), s->main_base,
++                                        &s->mmio_main, 1);
++    memory_region_add_subregion_overlap(get_system_memory(), s->aux_base,
++                                        &s->mmio_aux, 1);
++    memory_region_add_subregion_overlap(get_system_memory(), s->pmgr_a_base,
++                                        &s->mmio_pmgr_a, 1);
++    memory_region_add_subregion_overlap(get_system_memory(), s->pmgr_b_base,
++                                        &s->mmio_pmgr_b, 1);
++
++    /* DMA address space: through the DART IOMMU when linked (stage 1:
++     * DART translates identity), else straight system memory.  Log once
++     * which path was taken. */
++    if (s->dart_obj) {
++        MemoryRegion *iommu = sweet_dart_iommu_mr(s->dart_obj);
++
++        s->dma_as = g_new0(AddressSpace, 1);
++        address_space_init(s->dma_as, iommu, "sweet-disp0-dma");
++        s->via_dart = true;
++        qemu_log_mask(LOG_UNIMP,
++                      "sweet-disp0: DMA via DART iommu AS "
++                      "\"sweet-disp0-dma\"\n");
++    } else {
++        s->dma_as = &address_space_memory;
++        s->via_dart = false;
++        qemu_log_mask(LOG_UNIMP,
++                      "sweet-disp0: no DART linked, DMA via "
++                      "address_space_memory (identity)\n");
++    }
++
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-disp0: realized main=0x%" PRIx64 " aux=0x%" PRIx64
++                  " pmgr-a=0x%" PRIx64 " pmgr-b=0x%" PRIx64
++                  " fb=0x%" PRIx64 " %ux%u BGRA\n",
++                  s->main_base, s->aux_base, s->pmgr_a_base, s->pmgr_b_base,
++                  s->fb_base, s->fb_width, s->fb_height);
++}
++
++static void sweet_disp0_instance_init(Object *obj)
++{
++    SweetDisp0State *s = SWEET_DISP0(obj);
++
++    s->bank_main.dev = s;
++    s->bank_main.name = "main";
++    s->bank_aux.dev = s;
++    s->bank_aux.name = "aux";
++    s->bank_pmgr_a.dev = s;
++    s->bank_pmgr_a.name = "pmgr-a";
++    s->bank_pmgr_b.dev = s;
++    s->bank_pmgr_b.name = "pmgr-b";
++
++    /* Reserved: not wired to any interrupt controller in stage 1. */
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static const Property sweet_disp0_properties[] = {
++    DEFINE_PROP_LINK("dart", SweetDisp0State, dart_obj, TYPE_SWEET_DART,
++                     Object *),
++    DEFINE_PROP_UINT64("fb-base", SweetDisp0State, fb_base, 0x9c000000),
++    DEFINE_PROP_UINT32("fb-width", SweetDisp0State, fb_width, 1080),
++    DEFINE_PROP_UINT32("fb-height", SweetDisp0State, fb_height, 2400),
++    DEFINE_PROP_UINT64("main-base", SweetDisp0State, main_base, 0x18000000),
++    DEFINE_PROP_UINT64("aux-base", SweetDisp0State, aux_base, 0x18708000),
++    DEFINE_PROP_UINT64("pmgr-a-base", SweetDisp0State, pmgr_a_base,
++                       0x320b8000),
++    DEFINE_PROP_UINT64("pmgr-b-base", SweetDisp0State, pmgr_b_base,
++                       0x3230c000),
++};
++
++static void sweet_disp0_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = sweet_disp0_realize;
++    dc->user_creatable = true;
++    device_class_set_props(dc, sweet_disp0_properties);
++    dc->desc = "Apple T8015 display controller (disp0,t8015) stage-1 model";
++    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
++}
++
++static const TypeInfo sweet_disp0_info = {
++    .name = TYPE_SWEET_DISP0,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(SweetDisp0State),
++    .instance_init = sweet_disp0_instance_init,
++    .class_init = sweet_disp0_class_init,
++};
++
++/* ------------------------------------------------------------------ */
++/* Host-driven swap hook (HMP `sweet-disp0-swap`)                      */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Resolve the sweet-disp0 instance from the QOM tree.  Stage 1 assumes a
++ * single instance (the ios-sweet runner creates exactly one); if several
++ * exist object_resolve_path_type() returns NULL and we say so.
++ */
++void hmp_sweet_disp0_swap(Monitor *mon, const QDict *qdict)
++{
++    const char *addr_str = qdict_get_str(qdict, "addr");
++    hwaddr surface_pa = (hwaddr)strtoull(addr_str, NULL, 0);
++    SweetDisp0State *s = (SweetDisp0State *)object_resolve_path_type(
++        "", TYPE_SWEET_DISP0, NULL);
++    dma_addr_t len;
++    void *buf;
++    MemTxResult r;
++
++    if (!s) {
++        monitor_printf(mon,
++                       "sweet-disp0: no sweet-disp0 device instantiated "
++                       "(or multiple)\n");
++        return;
++    }
++
++    len = (dma_addr_t)s->fb_width * s->fb_height * 4; /* BGRA */
++    buf = g_malloc(len);
++
++    /*
++     * Stage 1: read the surface through the DART address space (identity
++     * translation today -- this is what proves the DART wiring), then
++     * bounce it into guest RAM at fb-base.
++     */
++    r = dma_memory_read(s->dma_as, surface_pa, buf, len,
++                        MEMTXATTRS_UNSPECIFIED);
++    if (r != MEMTX_OK) {
++        g_free(buf);
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "sweet-disp0: swap DMA fault reading surface "
++                      "PA=0x%" HWADDR_PRIx " (memtx=%u); FB unchanged\n",
++                      surface_pa, (unsigned)r);
++        monitor_printf(mon,
++                       "sweet-disp0: swap FAILED (DMA fault "
++                       "PA=0x%" HWADDR_PRIx ")\n", surface_pa);
++        return;
++    }
++
++    cpu_physical_memory_write(s->fb_base, buf, len);
++    s->last_surface = surface_pa;
++
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-disp0: swap surface PA=0x%" HWADDR_PRIx
++                  " -> FB 0x%" PRIx64 " (%u bytes, DART-translated)\n",
++                  surface_pa, s->fb_base, (unsigned)len);
++    monitor_printf(mon,
++                   "sweet-disp0: swapped %u bytes PA=0x%" HWADDR_PRIx
++                   " -> FB 0x%" PRIx64 "\n",
++                   (unsigned)len, surface_pa, s->fb_base);
++    g_free(buf);
++}
++
++static void sweet_disp0_register_types(void)
++{
++    type_register_static(&sweet_disp0_info);
++}
++
++type_init(sweet_disp0_register_types)
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index ec0fa5a..937495e 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -223,3 +223,8 @@ config XLNX_VERSAL_TRNG
+     bool
+ 
+ source macio/Kconfig
++
++config SWEET_DEVICES
++    bool
++    default y
++    depends on ARM
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 6d47de4..86e0051 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -157,3 +157,6 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ 
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
++
++# ios-sweet-rust: Apple T8015 platform devices (stage-1 sweet models)
++system_ss.add(when: 'CONFIG_SWEET_DEVICES', if_true: files('sweet_dart.c', 'sweet_mipi.c'))
+diff --git a/hw/misc/sweet_dart.c b/hw/misc/sweet_dart.c
+new file mode 100644
+index 0000000..2508d8a
+--- /dev/null
++++ b/hw/misc/sweet_dart.c
+@@ -0,0 +1,483 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Apple T8015 DART (Device Address Resolution Table) -- stage-1 "sweet"
++ * model for the ios-sweet-rust project.
++ *
++ * This is a deliberately honest stage-1 model:
++ *
++ *   * The exact t8015 DART bit layout is reverse-engineering grade; the
++ *     register model below is store-and-echo with a handful of curated
++ *     semantics so that the real iOS kernel driver (AppleT8015DART,
++ *     compatible "dart,t8015") can probe the hardware and leave traces
++ *     in the QEMU log.  Those traces are what stage 2 uses to implement
++ *     the bit-accurate TCR/TTBR/TLB PTE walker.
++ *
++ *   * Stage 1 implements: per-SID TCR / TTBR0 registers with the
++ *     TRANSLATE_ENABLE / BYPASS semantics documented below, an IOMMU
++ *     MemoryRegion that currently translates identity (pass-through),
++ *     a remap register window, and a reserved fault IRQ line that is
++ *     never asserted.
++ *
++ *   * Everything else is a silent-read / logged-write store+echo
++ *     register file so read-back checks by the kernel driver pass.
++ *
++ * Observability contract: the Rust runner boots with
++ * `-d int,guest_errors,unimp -D qemu.log`, so ALL logging goes through
++ * qemu_log_mask(LOG_UNIMP|LOG_GUEST_ERROR) with the "sweet-dart:" prefix.
++ * No trace-events, no printf.
++ */
++
++#include "qemu/osdep.h"
++#include "exec/address-spaces.h"
++#include "hw/arm/sweet_devices.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/sysbus.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++/* ------------------------------------------------------------------ */
++/* Register map (stage-1 understanding, subject to kernel traces)      */
++/* ------------------------------------------------------------------ */
++
++/* Per-SID register block stride. */
++#define SWEET_DART_SID_STRIDE   0x100ull
++#define SWEET_DART_TCR_OFF(sid)   (0x000ull + SWEET_DART_SID_STRIDE * (sid))
++#define SWEET_DART_TTBR0_OFF(sid, n) \
++    (0x200ull + SWEET_DART_SID_STRIDE * (sid) + 8ull * (n))
++
++/*
++ * TCR bits (stage-1 semantics, documented for the stage-2 PTE walker):
++ *   bit 0: TRANSLATE_ENABLE -- when clear, DMA passes through untouched.
++ *   bit 1: BYPASS          -- when set, DMA passes through even if
++ *                             translation is enabled.
++ * Every other bit is stored and echoed.
++ */
++#define SWEET_DART_TCR_TRANSLATE_ENABLE (1ull << 0)
++#define SWEET_DART_TCR_BYPASS           (1ull << 1)
++/*
++ * Reset value: bypass on, translate off.  Mirrors a DART left in bypass
++ * by iBoot, so DMA works out of the box on stage 1.
++ */
++#define SWEET_DART_TCR_RESET            SWEET_DART_TCR_BYPASS
++
++#define SWEET_DART_MAX_SIDS    16
++#define SWEET_DART_TTBR_SLOTS  4
++
++/* ------------------------------------------------------------------ */
++/* State                                                               */
++/* ------------------------------------------------------------------ */
++
++struct SweetDartState {
++    SysBusDevice parent_obj;
++
++    /* Main register window @ base and remap window @ remap-base.
++     * Both self-mapped into the system address space (priority 1). */
++    MemoryRegion mmio;
++    MemoryRegion mmio_remap;
++
++    /*
++     * IOMMU MemoryRegion (TYPE_SWEET_DART_IOMMU_MEMORY_REGION).  NOT
++     * mapped into the system address space -- it is only referenced as
++     * the root of DMA AddressSpaces (see sweet_disp0.c).
++     */
++    IOMMUMemoryRegion iommu;
++
++    /* Fault IRQ line: wired via sysbus_init_irq but never asserted in
++     * stage 1 (we only log DMA faults).  Stage 2 will drive it from the
++     * real fault registers. */
++    qemu_irq irq;
++
++    /* Properties. */
++    uint64_t base;        /* main window base  (default 0x18704000) */
++    uint64_t remap_base;  /* remap window base (default 0x18700000) */
++    uint32_t size;        /* window size        (default 0x4000)    */
++    uint32_t sids;        /* stream IDs         (default 3, max 16) */
++
++    /* Stage-1 translation state.  The DMA requester SID is not modelled
++     * yet; translation uses the global / SID 0 view. */
++    uint64_t *tcr;        /* sids entries */
++    uint64_t *ttbr0;      /* sids * SWEET_DART_TTBR_SLOTS entries */
++    bool pass_logged;     /* "stage-1 pass-through" logged once per enable */
++
++    /* Byte-granular store+echo backing arrays (LE layout). */
++    uint8_t *store;
++    uint8_t *store_remap;
++
++    /* Latched fault info (exposed to stage 2; not readable yet). */
++    hwaddr fault_iova;
++};
++
++DECLARE_INSTANCE_CHECKER(SweetDartState, SWEET_DART, TYPE_SWEET_DART)
++
++/* ------------------------------------------------------------------ */
++/* Store+echo helpers (little-endian byte order, portable)             */
++/* ------------------------------------------------------------------ */
++
++static uint64_t sweet_store_read_le(const uint8_t *store, hwaddr addr,
++                                    unsigned size)
++{
++    uint64_t val = 0;
++    unsigned i;
++
++    for (i = 0; i < size; i++) {
++        val |= (uint64_t)store[addr + i] << (8 * i);
++    }
++    return val;
++}
++
++static void sweet_store_write_le(uint8_t *store, hwaddr addr, uint64_t val,
++                                 unsigned size)
++{
++    unsigned i;
++
++    for (i = 0; i < size; i++) {
++        store[addr + i] = (uint8_t)(val >> (8 * i));
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Register matching                                                   */
++/* ------------------------------------------------------------------ */
++
++/* TCR(sid): 4-byte access at the TCR offset (an 8-byte access there also
++ * hits TCR in its low half; we accept both so the shadow can never go
++ * stale). */
++static bool dart_tcr_hit(SweetDartState *s, hwaddr addr, unsigned size,
++                         uint32_t *sid)
++{
++    uint32_t i;
++
++    if (size != 4 && size != 8) {
++        return false;
++    }
++    for (i = 0; i < s->sids; i++) {
++        if (addr == SWEET_DART_TCR_OFF(i)) {
++            *sid = i;
++            return true;
++        }
++    }
++    return false;
++}
++
++/* TTBR0(sid)[slot]: access starting exactly at the slot offset,
++ * 4 or 8 bytes wide. */
++static bool dart_ttbr_hit(SweetDartState *s, hwaddr addr, unsigned size,
++                          uint32_t *sid, uint32_t *slot)
++{
++    uint32_t i, n;
++
++    if (size != 4 && size != 8) {
++        return false;
++    }
++    for (i = 0; i < s->sids; i++) {
++        for (n = 0; n < SWEET_DART_TTBR_SLOTS; n++) {
++            if (addr == SWEET_DART_TTBR0_OFF(i, n)) {
++                *sid = i;
++                *slot = n;
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++/* ------------------------------------------------------------------ */
++/* Main window                                                         */
++/* ------------------------------------------------------------------ */
++
++/* Reads are intentionally silent: reads flood logs.  TCR/TTBR values live
++ * in the same backing store, so kernel read-back checks pass. */
++static uint64_t sweet_dart_mmio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    SweetDartState *s = SWEET_DART(opaque);
++
++    return sweet_store_read_le(s->store, addr, size);
++}
++
++static void sweet_dart_mmio_write(void *opaque, hwaddr addr, uint64_t val,
++                                  unsigned size)
++{
++    SweetDartState *s = SWEET_DART(opaque);
++    uint32_t sid, slot;
++
++    if (dart_tcr_hit(s, addr, size, &sid)) {
++        uint64_t old = s->tcr[sid];
++
++        s->tcr[sid] = val & 0xffffffffull;
++        /* Keep the backing store in sync so read-back matches. */
++        sweet_store_write_le(s->store, addr, s->tcr[sid], 4);
++        if (old != s->tcr[sid]) {
++            qemu_log_mask(LOG_UNIMP,
++                          "sweet-dart: W TCR[%u] = 0x%04" PRIx64 "\n",
++                          sid, s->tcr[sid]);
++        }
++        if (!(old & SWEET_DART_TCR_TRANSLATE_ENABLE) &&
++            (s->tcr[sid] & SWEET_DART_TCR_TRANSLATE_ENABLE)) {
++            /* Loud, once per enable. */
++            qemu_log_mask(LOG_UNIMP,
++                          "sweet-dart: TCR[%u] TRANSLATE_ENABLE set: "
++                          "stage-1 pass-through (PTE walker TODO)\n", sid);
++            s->pass_logged = false;
++        }
++        return;
++    }
++
++    if (dart_ttbr_hit(s, addr, size, &sid, &slot)) {
++        s->ttbr0[sid * SWEET_DART_TTBR_SLOTS + slot] = val;
++        sweet_store_write_le(s->store, addr, val, size);
++        qemu_log_mask(LOG_UNIMP,
++                      "sweet-dart: W TTBR0[%u][%u] = 0x%016" PRIx64 "\n",
++                      sid, slot, val);
++        return;
++    }
++
++    /* Unknown offset: store+echo, one compact log line. */
++    sweet_store_write_le(s->store, addr, val, size);
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-dart: W unk[0x%04" HWADDR_PRIx "] = 0x%08" PRIx64
++                  " (store+echo)\n", addr, val);
++}
++
++/* ------------------------------------------------------------------ */
++/* Remap window (store+echo only)                                      */
++/* ------------------------------------------------------------------ */
++
++static uint64_t sweet_dart_remap_read(void *opaque, hwaddr addr,
++                                      unsigned size)
++{
++    SweetDartState *s = SWEET_DART(opaque);
++
++    return sweet_store_read_le(s->store_remap, addr, size);
++}
++
++static void sweet_dart_remap_write(void *opaque, hwaddr addr, uint64_t val,
++                                   unsigned size)
++{
++    SweetDartState *s = SWEET_DART(opaque);
++
++    sweet_store_write_le(s->store_remap, addr, val, size);
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-dart: remap W unk[0x%04" HWADDR_PRIx "] = 0x%08"
++                  PRIx64 " (store+echo)\n", addr, val);
++}
++
++/* ------------------------------------------------------------------ */
++/* MemoryRegionOps                                                     */
++/* ------------------------------------------------------------------ */
++
++static const MemoryRegionOps sweet_dart_mmio_ops = {
++    .read = sweet_dart_mmio_read,
++    .write = sweet_dart_mmio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 8,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 8,
++};
++
++static const MemoryRegionOps sweet_dart_remap_ops = {
++    .read = sweet_dart_remap_read,
++    .write = sweet_dart_remap_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 8,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 8,
++};
++
++/* ------------------------------------------------------------------ */
++/* IOMMU (stage 1: identity / pass-through, deny on unconfigured TTBR) */
++/* ------------------------------------------------------------------ */
++
++static IOMMUTLBEntry sweet_dart_iommu_translate(IOMMUMemoryRegion *iommu,
++                                                hwaddr addr,
++                                                IOMMUAccessFlags flag,
++                                                int iommu_idx)
++{
++    SweetDartState *s = container_of(iommu, SweetDartState, iommu);
++    /* Stage 1: the DMA requester SID is not carried yet; use the global
++     * (SID 0) view. */
++    const uint32_t sid = 0;
++    uint64_t tcr = s->tcr[sid];
++    IOMMUTLBEntry ret = {
++        .target_as = &address_space_memory,
++        .iova = addr,
++        .translated_addr = addr & ~0xfffull,
++        .addr_mask = 0xfff,
++        .perm = IOMMU_RW,
++    };
++    bool allow;
++
++    if (!(tcr & SWEET_DART_TCR_TRANSLATE_ENABLE) ||
++        (tcr & SWEET_DART_TCR_BYPASS)) {
++        /* Bypass enabled or translation disabled: identity. */
++        allow = true;
++    } else if (s->ttbr0[sid * SWEET_DART_TTBR_SLOTS + 0] != 0) {
++        /* Translate enabled with a non-zero TTBR: stage-1 pass-through.
++         * The real PTE walk is the stage-2 deliverable; log once per
++         * enable so the traces tell us when the kernel turned the DART on. */
++        if (!s->pass_logged) {
++            qemu_log_mask(LOG_UNIMP,
++                          "sweet-dart: translate enabled, stage-1 "
++                          "pass-through (PTE walker TODO)\n");
++            s->pass_logged = true;
++        }
++        allow = true;
++    } else {
++        allow = false;
++    }
++
++    if (!allow) {
++        s->fault_iova = addr;
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "sweet-dart: DMA fault iova=0x%" HWADDR_PRIx
++                      " (TTBR0[0]=0, translation on)\n", addr);
++        ret.perm = IOMMU_NONE;
++        ret.translated_addr = 0;
++    }
++    return ret;
++}
++
++static uint64_t sweet_dart_iommu_get_min_page_size(IOMMUMemoryRegion *iommu)
++{
++    return 4096;
++}
++
++static void sweet_dart_iommu_class_init(ObjectClass *klass, void *data)
++{
++    IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
++
++    imrc->translate = sweet_dart_iommu_translate;
++    imrc->get_min_page_size = sweet_dart_iommu_get_min_page_size;
++}
++
++static const TypeInfo sweet_dart_iommu_info = {
++    .name = TYPE_SWEET_DART_IOMMU_MEMORY_REGION,
++    .parent = TYPE_IOMMU_MEMORY_REGION,
++    .class_init = sweet_dart_iommu_class_init,
++};
++
++/* ------------------------------------------------------------------ */
++/* Device plumbing                                                     */
++/* ------------------------------------------------------------------ */
++
++MemoryRegion *sweet_dart_iommu_mr(Object *dart_obj)
++{
++    SweetDartState *s = SWEET_DART(dart_obj);
++
++    return MEMORY_REGION(&s->iommu);
++}
++
++static void sweet_dart_realize(DeviceState *dev, Error **errp)
++{
++    SweetDartState *s = SWEET_DART(dev);
++
++    if (s->sids == 0 || s->sids > SWEET_DART_MAX_SIDS) {
++        error_setg(errp, "sweet-dart: property sids must be 1..%u",
++                   SWEET_DART_MAX_SIDS);
++        return;
++    }
++    if (s->size < 0x400 || (s->size & (s->size - 1)) != 0) {
++        error_setg(errp, "sweet-dart: property size must be a power of two "
++                   ">= 0x400");
++        return;
++    }
++
++    s->tcr = g_new0(uint64_t, s->sids);
++    s->ttbr0 = g_new0(uint64_t, s->sids * SWEET_DART_TTBR_SLOTS);
++    s->store = g_malloc0(s->size);
++    s->store_remap = g_malloc0(s->size);
++
++    memory_region_init_io(&s->mmio, OBJECT(s), &sweet_dart_mmio_ops, s,
++                          "sweet-dart", s->size);
++    memory_region_init_io(&s->mmio_remap, OBJECT(s), &sweet_dart_remap_ops, s,
++                          "sweet-dart-remap", s->size);
++    memory_region_init_iommu(&s->iommu, sizeof(s->iommu),
++                             TYPE_SWEET_DART_IOMMU_MEMORY_REGION, OBJECT(s),
++                             "dart-iommu", 0x100000000ULL);
++
++    /*
++     * Self-map both register windows into the system address space.
++     * Priority 1 beats the (empty) pcie-mmio alias container that 'virt'
++     * puts at 0x10000000..0x3effffff, so no hw/arm/virt.c change is
++     * needed.  All D22AP display bases are below RAM (0x40000000) or in
++     * that window.
++     */
++    memory_region_add_subregion_overlap(get_system_memory(), s->base,
++                                        &s->mmio, 1);
++    memory_region_add_subregion_overlap(get_system_memory(), s->remap_base,
++                                        &s->mmio_remap, 1);
++
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-dart: realized base=0x%" PRIx64 " remap=0x%" PRIx64
++                  " size=0x%x sids=%u (stage-1 bypass model)\n",
++                  s->base, s->remap_base, s->size, s->sids);
++}
++
++static void sweet_dart_reset(DeviceState *dev)
++{
++    SweetDartState *s = SWEET_DART(dev);
++    uint32_t i;
++
++    if (!s->store) {
++        return; /* not realized yet */
++    }
++
++    memset(s->ttbr0, 0, s->sids * SWEET_DART_TTBR_SLOTS * sizeof(uint64_t));
++    memset(s->store, 0, s->size);
++    memset(s->store_remap, 0, s->size);
++    for (i = 0; i < s->sids; i++) {
++        s->tcr[i] = SWEET_DART_TCR_RESET;
++        /* Mirror the reset value into the backing store so read-back of
++         * TCR matches before the kernel writes anything. */
++        sweet_store_write_le(s->store, SWEET_DART_TCR_OFF(i),
++                             SWEET_DART_TCR_RESET, 4);
++    }
++    s->pass_logged = false;
++}
++
++static void sweet_dart_instance_init(Object *obj)
++{
++    SweetDartState *s = SWEET_DART(obj);
++
++    /* Fault IRQ: reserved for stage 2, never asserted here. */
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static const Property sweet_dart_properties[] = {
++    DEFINE_PROP_UINT64("base", SweetDartState, base, 0x18704000),
++    DEFINE_PROP_UINT64("remap-base", SweetDartState, remap_base, 0x18700000),
++    DEFINE_PROP_UINT32("size", SweetDartState, size, 0x4000),
++    DEFINE_PROP_UINT32("sids", SweetDartState, sids, 3),
++};
++
++static void sweet_dart_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = sweet_dart_realize;
++    dc->user_creatable = true;
++    device_class_set_legacy_reset(dc, sweet_dart_reset);
++    device_class_set_props(dc, sweet_dart_properties);
++    dc->desc = "Apple T8015 DART (dart,t8015) stage-1 model";
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo sweet_dart_info = {
++    .name = TYPE_SWEET_DART,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(SweetDartState),
++    .instance_init = sweet_dart_instance_init,
++    .class_init = sweet_dart_class_init,
++};
++
++static void sweet_dart_register_types(void)
++{
++    type_register_static(&sweet_dart_info);
++    type_register_static(&sweet_dart_iommu_info);
++}
++
++type_init(sweet_dart_register_types)
+diff --git a/hw/misc/sweet_mipi.c b/hw/misc/sweet_mipi.c
+new file mode 100644
+index 0000000..60b4c76
+--- /dev/null
++++ b/hw/misc/sweet_mipi.c
+@@ -0,0 +1,240 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Synopsys MIPI-DSI host controller (mipi-dsim-1,synopsys) -- stage-1
++ * "sweet" model for the ios-sweet-rust project.
++ *
++ * Stage-1 scope (honest):
++ *   * One MMIO window self-mapped at the D22AP address (default
++ *     0x18400000, size 0x100000).
++ *   * Curated constants so the real iOS driver
++ *     (AppleSynopsysMIPIDSIController) sees a healthy controller:
++ *       0x00: DWC DSI version  = 0x3133302A ("100*" DWC pattern)
++ *       0x58: PHY status       = 0x0000000F (all lanes in stop state,
++ *                               so PHY polling passes)
++ *       0x60: INTSTATUS        = write-1-to-clear, never self-asserts
++ *       0x64: INTMASK          = store+echo
++ *   * Everything else: store+echo backing store; writes log one compact
++ *     LOG_UNIMP line, reads are silent (they flood).
++ *
++ * The bit-accurate D-PHY / video-mode engine is stage 2, driven by the
++ * kernel traces this model produces.
++ *
++ * Observability contract: `-d int,guest_errors,unimp -D qemu.log`, all
++ * traces via qemu_log_mask(LOG_UNIMP|LOG_GUEST_ERROR) with the
++ * "sweet-mipi-dsim:" prefix.
++ */
++
++#include "qemu/osdep.h"
++#include "exec/address-spaces.h"
++#include "hw/arm/sweet_devices.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/sysbus.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define SWEET_MIPI_REG_VERSION   0x00
++#define SWEET_MIPI_REG_PHY_STATUS 0x58
++#define SWEET_MIPI_REG_INTSTATUS 0x60
++#define SWEET_MIPI_REG_INTMASK   0x64
++
++/* Curated stage-1 constants. */
++#define SWEET_MIPI_VERSION_VAL   0x3133302aull /* "100*" DWC pattern */
++#define SWEET_MIPI_PHY_STATUS_VAL 0x0000000full /* all lanes stop-state idle */
++
++typedef struct SweetMipiState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion mmio;
++    qemu_irq irq;        /* reserved: never asserted in stage 1 */
++
++    uint64_t base;       /* default 0x18400000 */
++    uint32_t size;       /* default 0x100000 */
++
++    uint32_t int_status; /* 0x60, W1C, never self-asserts */
++    uint32_t int_mask;   /* 0x64, store+echo */
++
++    uint8_t *store;      /* byte-granular store+echo backing (LE) */
++} SweetMipiState;
++
++DECLARE_INSTANCE_CHECKER(SweetMipiState, SWEET_MIPI, TYPE_SWEET_MIPI)
++
++static uint64_t sweet_store_read_le(const uint8_t *store, hwaddr addr,
++                                    unsigned size)
++{
++    uint64_t val = 0;
++    unsigned i;
++
++    for (i = 0; i < size; i++) {
++        val |= (uint64_t)store[addr + i] << (8 * i);
++    }
++    return val;
++}
++
++static void sweet_store_write_le(uint8_t *store, hwaddr addr, uint64_t val,
++                                 unsigned size)
++{
++    unsigned i;
++
++    for (i = 0; i < size; i++) {
++        store[addr + i] = (uint8_t)(val >> (8 * i));
++    }
++}
++
++/* Reads silent. */
++static uint64_t sweet_mipi_read(void *opaque, hwaddr addr, unsigned size)
++{
++    SweetMipiState *s = SWEET_MIPI(opaque);
++
++    switch (addr) {
++    case SWEET_MIPI_REG_VERSION:
++        if (size == 4) {
++            return SWEET_MIPI_VERSION_VAL;
++        }
++        break;
++    case SWEET_MIPI_REG_PHY_STATUS:
++        if (size == 4) {
++            return SWEET_MIPI_PHY_STATUS_VAL;
++        }
++        break;
++    case SWEET_MIPI_REG_INTSTATUS:
++        if (size == 4) {
++            return s->int_status;
++        }
++        break;
++    case SWEET_MIPI_REG_INTMASK:
++        if (size == 4) {
++            return s->int_mask;
++        }
++        break;
++    default:
++        break;
++    }
++
++    return sweet_store_read_le(s->store, addr, size);
++}
++
++static void sweet_mipi_write(void *opaque, hwaddr addr, uint64_t val,
++                             unsigned size)
++{
++    SweetMipiState *s = SWEET_MIPI(opaque);
++
++    switch (addr) {
++    case SWEET_MIPI_REG_VERSION:
++        /* Read-only version. */
++        qemu_log_mask(LOG_UNIMP,
++                      "sweet-mipi-dsim: W VERSION (read-only, ignored) = "
++                      "0x%08" PRIx64 "\n", val);
++        return;
++    case SWEET_MIPI_REG_PHY_STATUS:
++        sweet_store_write_le(s->store, addr, val, size);
++        qemu_log_mask(LOG_UNIMP,
++                      "sweet-mipi-dsim: W PHY_STATUS = 0x%08" PRIx64
++                      " (stage-1 constant on read)\n", val);
++        return;
++    case SWEET_MIPI_REG_INTSTATUS:
++        if (size == 4) {
++            /* Write-1-to-clear; nothing self-asserts in stage 1. */
++            s->int_status &= ~(uint32_t)val;
++            if (val != 0) {
++                qemu_log_mask(LOG_UNIMP,
++                              "sweet-mipi-dsim: W1C INTSTATUS = 0x%08"
++                              PRIx64 "\n", val);
++            }
++            return;
++        }
++        break;
++    case SWEET_MIPI_REG_INTMASK:
++        if (size == 4) {
++            s->int_mask = (uint32_t)val;
++            sweet_store_write_le(s->store, addr, val, size);
++            qemu_log_mask(LOG_UNIMP,
++                          "sweet-mipi-dsim: W INTMASK = 0x%08" PRIx64 "\n",
++                          val);
++            return;
++        }
++        break;
++    default:
++        break;
++    }
++
++    /* Unknown offset: store+echo, one compact log line. */
++    sweet_store_write_le(s->store, addr, val, size);
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-mipi-dsim: W unk[0x%04" HWADDR_PRIx "] = 0x%08"
++                  PRIx64 " (store+echo)\n", addr, val);
++}
++
++static const MemoryRegionOps sweet_mipi_ops = {
++    .read = sweet_mipi_read,
++    .write = sweet_mipi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static void sweet_mipi_realize(DeviceState *dev, Error **errp)
++{
++    SweetMipiState *s = SWEET_MIPI(dev);
++
++    if (s->size == 0) {
++        error_setg(errp, "sweet-mipi-dsim: property size must be nonzero");
++        return;
++    }
++
++    s->store = g_malloc0(s->size);
++
++    memory_region_init_io(&s->mmio, OBJECT(s), &sweet_mipi_ops, s,
++                          "sweet-mipi-dsim", s->size);
++
++    /* Self-map (priority 1, see sweet_dart.c comment). */
++    memory_region_add_subregion_overlap(get_system_memory(), s->base,
++                                        &s->mmio, 1);
++
++    qemu_log_mask(LOG_UNIMP,
++                  "sweet-mipi-dsim: realized base=0x%" PRIx64 " size=0x%x"
++                  " (stage-1 constants + store+echo)\n", s->base, s->size);
++}
++
++static void sweet_mipi_instance_init(Object *obj)
++{
++    SweetMipiState *s = SWEET_MIPI(obj);
++
++    /* Reserved: not wired to any interrupt controller in stage 1. */
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static const Property sweet_mipi_properties[] = {
++    DEFINE_PROP_UINT64("base", SweetMipiState, base, 0x18400000),
++    DEFINE_PROP_UINT32("size", SweetMipiState, size, 0x100000),
++};
++
++static void sweet_mipi_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = sweet_mipi_realize;
++    dc->user_creatable = true;
++    device_class_set_props(dc, sweet_mipi_properties);
++    dc->desc = "Synopsys MIPI-DSI host (mipi-dsim-1,synopsys) stage-1 model";
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo sweet_mipi_info = {
++    .name = TYPE_SWEET_MIPI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(SweetMipiState),
++    .instance_init = sweet_mipi_instance_init,
++    .class_init = sweet_mipi_class_init,
++};
++
++static void sweet_mipi_register_types(void)
++{
++    type_register_static(&sweet_mipi_info);
++}
++
++type_init(sweet_mipi_register_types)
+diff --git a/include/hw/arm/sweet_devices.h b/include/hw/arm/sweet_devices.h
+new file mode 100644
+index 0000000..c893763
+--- /dev/null
++++ b/include/hw/arm/sweet_devices.h
+@@ -0,0 +1,53 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Apple T8015 "sweet" device models for the ios-sweet-rust project.
++ *
++ * Stage 1 scope: register-level store+echo models with curated constants
++ * for the D22AP (iPhone X) display path, so the real iOS 16 XNU kernel
++ * drivers (AppleT8015DART, AppleSynopsysMIPIDSIController, disp0 subsystem)
++ * can probe real MMIO addresses on QEMU 'virt'.
++ *
++ * All devices are user-creatable (-device) and self-map their MMIO regions
++ * into the system address space at the D22AP physical addresses using
++ * memory_region_add_subregion_overlap(get_system_memory(), base, mr, 1)
++ * (priority 1 wins over the empty pcie-mmio alias container on 'virt'),
++ * so no hw/arm/virt.c changes are required.
++ */
++#ifndef HW_ARM_SWEET_DEVICES_H
++#define HW_ARM_SWEET_DEVICES_H
++
++#include "exec/memory.h"
++#include "qom/object.h"
++
++#define TYPE_SWEET_DART  "sweet-dart"
++#define TYPE_SWEET_DISP0 "sweet-disp0"
++#define TYPE_SWEET_MIPI  "sweet-mipi-dsim"
++
++/*
++ * IOMMUMemoryRegion subclass instantiated inside the DART state.  It is
++ * never mapped into the system address space; it is only the root of the
++ * DMA AddressSpace handed to sweet-disp0 (and later to other bus masters).
++ */
++#define TYPE_SWEET_DART_IOMMU_MEMORY_REGION "sweet-dart-iommu-memory-region"
++
++typedef struct SweetDartState SweetDartState;
++
++/*
++ * Return the DART's IOMMU MemoryRegion (4 GiB IOVA window).  Used by
++ * sweet_disp0.c to build its DMA AddressSpace:
++ *   address_space_init(&as, sweet_dart_iommu_mr(dart_obj), "name");
++ */
++MemoryRegion *sweet_dart_iommu_mr(Object *dart_obj);
++
++/*
++ * HMP glue for the host-driven framebuffer swap hook (defined in
++ * sweet_disp0.c, registered in hmp-commands.hx).  The prototype lives in
++ * include/monitor/hmp.h as well, because that is what monitor/hmp-target.c
++ * includes when it resolves hmp-commands.hx handler names.
++ */
++struct Monitor;
++struct QDict;
++void hmp_sweet_disp0_swap(struct Monitor *mon, const struct QDict *qdict);
++
++#endif /* HW_ARM_SWEET_DEVICES_H */
+diff --git a/include/monitor/hmp.h b/include/monitor/hmp.h
+index ae116d9..09f5edf 100644
+--- a/include/monitor/hmp.h
++++ b/include/monitor/hmp.h
+@@ -179,4 +179,7 @@ void hmp_info_mtree(Monitor *mon, const QDict *qdict);
+ void hmp_info_cryptodev(Monitor *mon, const QDict *qdict);
+ void hmp_dumpdtb(Monitor *mon, const QDict *qdict);
+ 
++/* ios-sweet-rust: host-driven framebuffer swap hook (hw/display/sweet_disp0.c) */
++void hmp_sweet_disp0_swap(Monitor *mon, const QDict *qdict);
++
+ #endif

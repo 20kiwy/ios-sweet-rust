@@ -65,11 +65,26 @@ pub struct AdtOptions<'a> {
     /// reads everything from boot_args, so a 2 GiB window above QEMU virt's
     /// RAM base works there (the real xnu expects the phone layout).
     pub phys_override: Option<(u64, u64)>,
+    /// Add the REAL D22AP display subtree (M4/M5): /arm-io/disp0 gains the
+    /// `disp0,t8015` compatible + register map, and /arm-io/dart-disp0 +
+    /// /arm-io/mipi-dsim appear with their real D22AP properties. The
+    /// `sweet,display` compatible and the canvas props stay on disp0 so the
+    /// SWEET-patched console driver (AppleCLCD, patch 0046) keeps matching.
+    /// The register maps come from the real DeviceTree dump
+    /// (docs/research/devicetree-d22ap.md, lines disp0/dart-disp0/mipi-dsim).
+    pub display: bool,
 }
 
 impl Default for AdtOptions<'_> {
     fn default() -> Self {
-        AdtOptions { qemu: false, highmem: false, product: None, seed: None, phys_override: None }
+        AdtOptions {
+            qemu: false,
+            highmem: false,
+            product: None,
+            seed: None,
+            phys_override: None,
+            display: false,
+        }
     }
 }
 
@@ -237,6 +252,186 @@ pub fn build(opts: &AdtOptions) -> Result<Node> {
         ],
         vec![],
     );
+    // Main display node. Two personas share the node:
+    //   * default: the SWEET console persona (`sweet,display` + canvas props,
+    //     matched by the SWEET-patched AppleCLCD, patch 0046) — this is what
+    //     boots on every proven config;
+    //   * --display: the REAL D22AP persona adds `disp0,t8015` + the 4-range
+    //     register map + the D22AP display properties, so the real IOMFB
+    //     driver stack (IOMobileFramebuffer / AppleMobileDispH10P) matches.
+    let mut disp0 = node(
+        "disp0",
+        vec![
+            ph!(),
+            ("device_type", adt::cstr("dart")),
+            ("compatible", adt::cstr("sweet,display")),
+            ("canvas-width", u32v(&[1125])),
+            ("canvas-height", u32v(&[2436])),
+        ],
+        vec![],
+    );
+
+    let mut dart_disp0 = None;
+    let mut mipi_dsim = None;
+
+    if opts.display {
+        // --- mapper phandle first: disp0.iommu-parent references it. ------
+        let mapper_phandle = phandle.next().unwrap();
+        let dart_phandle = phandle.next().unwrap();
+        let disp_phandle = phandle.next().unwrap();
+        // disp0's own phandle was allocated by ph!() above; overwrite it with
+        // our deterministic one so iommu-parent wiring is verifiable.
+        disp0
+            .props
+            .retain(|(k, _, _)| k != "AAPL,phandle");
+        disp0.props.push(("AAPL,phandle".to_string(), 0, u32v(&[disp_phandle])));
+
+        // Real D22AP disp0 properties (devicetree-d22ap.md lines 1880-1908).
+        // OMITTED on purpose:
+        //   * interrupt-parent — the real node points at the AIC (phandle
+        //     0x1c), which does not exist on this synthetic tree. MEASURED
+        //     (this session): an `interrupts` array WITHOUT interrupt-parent
+        //     is NOT inert — IOKit resolves it against the ROOT interrupt
+        //     controller (our arm,gic-v3 node), and nub creation wedges the
+        //     boot before ANY IOKit output (console freezes after
+        //     "configuring debugging over serial", kernel parked in
+        //     _ml_get_timebase, zero device register accesses). With no
+        //     interrupts property the boot reaches the M2 mount wall.
+        //     Stage 2 reintroduces interrupts together with an AIC model
+        //     (or GIC-mapped IRQ numbers) as a deliberate step.
+        for (k, v) in [
+            ("compatible", [adt::cstr("disp0,t8015"), adt::cstr("sweet,display")].concat()),
+            (
+                "reg",
+                u32v(&[
+                    0x1800_0000, 0x2a_6000, // main display engine
+                    0x1870_8000, 0x1000,   // disp0 aux
+                    0x320b_8000, 0x1000,   // pmgr-adjacent
+                    0x3230_c000, 0x1000,   // pmgr-adjacent
+                ]),
+            ),
+            // (interrupts/interrupt-parent deliberately omitted — see the
+            // block comment above; IOKit would resolve them against the GIC
+            // and wedge nub creation)
+            ("iommu-parent", u32v(&[mapper_phandle])),
+            ("clock-gates", u64v(&[0x7600_0000_fe, 0x7300_0000_74])),
+            ("clock-ids", u64v(&[0x13b0_0000_013d])),
+            ("power-gates", u32v(&[0xfe])),
+            ("max-avg-bpp", u32v(&[0xd_999a])),
+            ("max-peak-bpp", u32v(&[0xd_999a])),
+            ("max-scaling-ratio", u32v(&[0x2_0000])),
+            ("subframe-interrupt-time-lines", u32v(&[0x9bb])),
+            ("subframe-duration-nclks", u32v(&[0x61b4d])),
+            ("display-lead-time-nclks", u32v(&[0x54b0])),
+            (
+                "first-frame-response-threshold",
+                u32v(&[0xccccd, 0xe147b, 0xf5c29, 0x10a3d7, 0x170a3d]),
+            ),
+            ("display-carveout-inhibitcache", u32v(&[1])),
+        ] {
+            disp0.set_prop(k, v);
+        }
+
+        // Real D22AP dart-disp0 (devicetree-d22ap.md lines 1910-1938).
+        let mut mapper = node(
+            "mapper-disp0",
+            vec![
+                ("device_type", adt::cstr("dart-mapper")),
+                ("compatible", adt::cstr("iommu-mapper")),
+                ("AAPL,phandle", u32v(&[mapper_phandle])),
+                ("iomd-cache-size", u32v(&[0x40])),
+                ("iomd-cache-ttl", u32v(&[0x7d0])),
+                ("tail-padding", u32v(&[1])),
+            ],
+            vec![],
+        );
+        // reg is a run-time placeholder in the real tree (4 zero bytes).
+        mapper.set_prop("reg", vec![0u8; 4]);
+
+        dart_disp0 = Some(node(
+            "dart-disp0",
+            vec![
+                ("device_type", adt::cstr("dart")),
+                ("compatible", adt::cstr("dart,t8015")),
+                ("AAPL,phandle", u32v(&[dart_phandle])),
+                ("reg", u32v(&[0x1870_4000, 0x4000, 0x1870_0000, 0x4000])),
+                ("sids", u32v(&[3])),
+                ("page-size", u32v(&[0x1000])),
+                ("stt-idx-width", u32v(&[0xa])),
+                ("dart-options", u32v(&[5])),
+                ("smmu-options", u32v(&[2])),
+                ("fetch-config", u32v(&[0xe0303])),
+                ("diag-config", u32v(&[0x8000_0100])),
+                // instance = "TRADDART\0\0\0\0" "UMMSSMMU\0\0\0\0" (24 bytes)
+                (
+                    "instance",
+                    [b"TRADDART".as_slice(), &[0u8; 4], b"UMMSSMMU".as_slice(), &[0u8; 4]].concat(),
+                ),
+                ("clock-gates", [b"%".as_slice(), &[0u8; 3]].concat()),
+                ("power-gates", [b"%".as_slice(), &[0u8; 3]].concat()),
+                ("smmu-clock-gating", vec![]),
+                ("bypass-address", u32v(&[0x800, 0, 0, 0, 0x800])),
+                ("error-reflector", u64v(&[0x2_33ff_c000, 0x2_33ff_c000])),
+                // interrupts (0xdf, 0xde) omitted — see disp0 block comment
+            ],
+            vec![mapper],
+        ));
+
+        // Real D22AP mipi-dsim (devicetree-d22ap.md lines 1839-1878).
+        // OMITTED on purpose: sac-frequency-list (240 bytes, truncated in the
+        // real dump), phy-test (138 zero bytes), function-* phandle refs,
+        // interrupt-parent (same AIC reason as disp0).
+        let lcd = node(
+            "lcd",
+            vec![
+                ("device_type", adt::cstr("lcd")),
+                ("compatible", adt::cstr("lcd,summit")),
+                ("video-mode", u32v(&[1])),
+                ("backlight-level-encoding", u32v(&[0xb])),
+                ("set-temp-require-mcs-unlock", u32v(&[1])),
+                ("power-to-reset-delay", u32v(&[0xa])),
+            ],
+            vec![],
+        );
+        mipi_dsim = Some(node(
+            "mipi-dsim",
+            vec![
+                ("device_type", adt::cstr("mipi-dsim")),
+                ("compatible", adt::cstr("mipi-dsim-1,synopsys")),
+                ("reg", u32v(&[0x1840_0000, 0x10_0000])),
+                ("mipi-version", u32v(&[5])),
+                ("#lanes", u32v(&[2])),
+                ("clock-ids", u32v(&[0x111])),
+                // interrupts (0xe1) omitted — see disp0 block comment
+                ("clock-gates", u32v(&[0x71])),
+                ("power-gates", u32v(&[0x71])),
+                ("invert-interrupt-mask", vec![]),
+                ("sac-enable", u32v(&[1])),
+                ("sac-version", u32v(&[3])),
+                ("sac-divisor", u32v(&[8])),
+                ("sac-noise-width", u32v(&[0x131_2d00])),
+                ("sac-frequency-list-count", u32v(&[0xa])),
+                ("agile-line-count", u32v(&[9])),
+                ("apply-testcode", u32v(&[1])),
+                ("mipi-top-size", [b"\\".as_slice(), &[0u8; 3]].concat()),
+            ],
+            vec![lcd],
+        ));
+    }
+
+    let mut arm_io_children = vec![
+        gic,
+        // watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
+        // otherwise crashes trying to set the PMU boot stage.
+        node("wdt", vec![ph!(), ("no-pmu", u32v(&[1]))], vec![]),
+        disp0,
+    ];
+    if let Some(dart) = dart_disp0 {
+        arm_io_children.push(dart);
+    }
+    if let Some(mipi) = mipi_dsim {
+        arm_io_children.push(mipi);
+    }
     let arm_io = node(
         "arm-io",
         vec![
@@ -247,26 +442,7 @@ pub fn build(opts: &AdtOptions) -> Result<Node> {
             ("#size-cells", u32v(&[2])),
             ("ranges", u64v(&[0, SOC_BASE, 0x1_0000_0000 - SOC_BASE])),
         ],
-        vec![
-            gic,
-            // watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
-            // otherwise crashes trying to set the PMU boot stage.
-            node("wdt", vec![ph!(), ("no-pmu", u32v(&[1]))], vec![]),
-            // Main display: IOMobileFramebuffer counts /arm-io children with
-            // this device_type and reads the canvas size from the node; the
-            // kernel's AppleCLCD matches the compatible string.
-            node(
-                "disp0",
-                vec![
-                    ph!(),
-                    ("device_type", adt::cstr("display-subsystem")),
-                    ("compatible", adt::cstr("sweet,display")),
-                    ("canvas-width", u32v(&[1125])),
-                    ("canvas-height", u32v(&[2436])),
-                ],
-                vec![],
-            ),
-        ],
+        arm_io_children,
     );
 
     let fbcon = node(

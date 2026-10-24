@@ -1,0 +1,227 @@
+name: qemu-m5-display
+
+# M4/M5: the display/DART/MIPI device-model measurement.
+#
+#   real kernel.development.sweet (checked into kernel/)
+#     -> ADT with the REAL D22AP display subtree (make-adt --display:
+#        disp0,t8015 @ 0x18000000, dart-disp0 @ 0x18704000,
+#        mipi-dsim-1,synopsys @ 0x18400000; interrupts omitted — see
+#        mkadt.rs: an `interrupts` array without interrupt-parent is
+#        resolved against the root controller and WEDGES nub creation)
+#     -> payload + EMPTY cpio as md0 (rd=md0). Measured: without a
+#        RAMDisk the kernel parks in _cpu_idle before IOKit output —
+#        the M2 recipe always carried one ("empty initrd"), so we do too.
+#     -> qemu-sweet (QEMU 10.0.0 + sweet-dart/sweet-disp0/sweet-mipi-dsim
+#        device models, built from qemu-sweet/ by build.sh)
+#     -> the boot must reach the M2 wall ("cannot mount root, errno = 19")
+#        with the display subtree present — the pipeline gate — while the
+#        device-trace evidence (does AppleT8015DART probe the registers?)
+#        is REPORTED as the next-step measurement.
+#
+# Measured (2026-10-24, sandbox run): boot stable through IOKit matching
+# to the mount-retry wall; zero register traffic on the three devices —
+# the real drivers do not probe the synthetic nubs yet (SWEET patch-set
+# territory: see RESEARCH-SPRINGBOARD.md §3b M5 entry).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "kernel/**"
+      - "qemu-sweet/**"
+      - ".github/workflows/qemu-m5-display.yml"
+
+concurrency:
+  group: qemu-m5-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  m5-display-devices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + QEMU build deps (fork build needs glib/pixman headers)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libglib2.0-dev libpixman-1-dev zlib1g-dev \
+            libfdt-dev ninja-build meson llvm
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-targets: true
+
+      - name: Cache pristine QEMU v10.0.0 source
+        uses: actions/cache@v4
+        with:
+          path: qemu-src
+          key: qemu-v10.0.0-src
+          # restore-keys omitted: the tree must be exactly the pristine tag
+          # (build.sh resets only the paths it touches, so a stale extra file
+          # would survive — a fresh clone on cache miss is the safe path).
+
+      - name: Clone QEMU v10.0.0 (cache miss)
+        run: |
+          if [ ! -d qemu-src ]; then
+            git clone --depth 1 --branch v10.0.0 https://github.com/qemu/qemu.git qemu-src
+          fi
+
+      - name: Build + unit tests (Rust)
+        run: |
+          cargo build --release
+          cargo test --release
+          (cd kernel && sha256sum -c SHA256SUMS)
+
+      - name: Build qemu-sweet (fork with the three device models)
+        run: |
+          sh qemu-sweet/build.sh
+          qemu-prefix-sweet/bin/qemu-system-aarch64 --version | head -1
+          qemu-prefix-sweet/bin/qemu-system-aarch64 -device help 2>&1 | grep -E "sweet-(dart|disp0|mipi)" || {
+            echo "::error::sweet devices not registered in the fork"; exit 1; }
+
+      - name: ADT with the real D22AP display subtree
+        run: |
+          ./target/release/sweet-rust make-adt out/m5.adt --qemu --display --dump > out/adt-dump.txt 2>out/make-adt.log || {
+            cat out/make-adt.log; exit 1; }
+          grep -q "disp0,t8015" out/adt-dump.txt
+          grep -q "dart,t8015"  out/adt-dump.txt
+          grep -q "mipi-dsim-1,synopsys" out/adt-dump.txt
+          grep -q "iommu-mapper" out/adt-dump.txt
+
+      - name: Payload (real kernel, M2-exact boot args + empty md0)
+        run: |
+          # Empty newc cpio (TRAILER!!! only): the kernel parks before IOKit
+          # output without ANY RAMDisk in the payload (measured); M2 always
+          # booted with one.
+          python3 - <<'PY'
+          def hdr(ino, mode, nlink=1, mtime=0, filesize=0, dmaj=0, dmin=0,
+                  rmaj=0, rmin=0, namesize=0, chksum=0):
+              return ''.join(f'{f:08X}' if isinstance(f, int) else f
+                             for f in ['070701', ino, mode, nlink, mtime,
+                                       filesize, dmaj, dmin, rmaj, rmin,
+                                       namesize, chksum]).encode()
+          name = b'TRAILER!!!\x00'
+          h = hdr(0, 0, namesize=len(name))
+          pad = lambda b, n: b + b'\x00' * ((-len(b)) % n)
+          open('empty.cpio', 'wb').write(h + name + pad(h + name, 4))
+          PY
+          ./target/release/sweet-rust make-payload kernel/kernel.development.sweet \
+            out/m5.adt out/m5-payload.bin \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 -noprogress wdt=-1' \
+            --ramdisk empty.cpio
+
+      - name: Boot against the device models (measurement, not a gate)
+        run: |
+          export PATH="$PWD/qemu-prefix-sweet/bin:$PATH"
+          set +e
+          ./target/release/sweet-rust boot-qemu out/m5-payload.bin out/m5 \
+            --secs 150 --snap-every 25 --sweet-devices
+          rc=$?
+          set -e
+          echo "boot rc=$rc (recorded, pipeline continues)"
+          ls -la out/m5/
+
+      - name: M5 verdict — device traces + kernel state
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, subprocess, sys
+          out = pathlib.Path("out/m5")
+          qlog = (out/"qemu.log").read_text(errors="replace")
+          verdict = {"artifacts": {}, "devices": {}, "kernel": {}}
+
+          # 1. the three device models were realized by QEMU
+          for dev in ("sweet-dart", "sweet-mipi-dsim", "sweet-disp0"):
+              verdict["devices"][dev+"_realized"] = f"{dev}: realized" in qlog
+          # disp0 must have linked its DMA address space to the DART IOMMU
+          verdict["devices"]["disp0_dma_via_dart"] = "sweet-disp0: DMA via DART" in qlog
+
+          # 2. the kernel actually TOUCHED the device registers (probe traffic)
+          dart_writes = len(re.findall(r"sweet-dart: W ", qlog))
+          disp_writes = len(re.findall(r"sweet-disp0: W ", qlog))
+          mipi_writes = len(re.findall(r"sweet-mipi-dsim: W ", qlog))
+          verdict["kernel"]["dart_register_writes"] = dart_writes
+          verdict["kernel"]["disp0_register_writes"] = disp_writes
+          verdict["kernel"]["mipi_register_writes"] = mipi_writes
+          verdict["kernel"]["any_device_traffic"] = dart_writes + disp_writes + mipi_writes > 0
+
+          # 3. boot state from the runner (screen decode status)
+          res = json.loads((out/"result.json").read_text())
+          verdict["kernel"]["screen_status"] = res.get("status")
+
+          # 4. decoded console (kernel's own _iso_font) for the log artifact
+          kd = subprocess.run(
+              ["./target/release/sweet-rust", "screen-decode", str(out/"fb.png"),
+               "--kernel", "kernel/kernel.development.sweet",
+               "--payload", "out/m5-payload.bin"],
+              capture_output=True, text=True)
+          fb_txt = ""
+          for f in sorted(out.glob("fb-*.png")):
+              r = subprocess.run(
+                  ["./target/release/sweet-rust", "screen-decode", str(f),
+                   "--kernel", "kernel/kernel.development.sweet",
+                   "--payload", "out/m5-payload.bin"],
+                  capture_output=True, text=True)
+              fb_txt += f"=== {f.name} ===\n" + r.stdout
+          fb_txt += "=== fb.png (last) ===\n" + kd.stdout
+          (out/"console.txt").write_text(fb_txt)
+          verdict["kernel"]["dart_t8015_in_console"] = "dart" in fb_txt.lower()
+          verdict["kernel"]["iomfb_in_console"] = "iomobileframebuffer" in fb_txt.lower() \
+              or "iomfb" in fb_txt.lower()
+          # The M2 wall MUST be reached with the display subtree present:
+          # the boot survived IOKit matching (errno=19 = no HFS+ signature
+          # on the empty md0 — the documented M2 mount-retry loop).
+          verdict["kernel"]["m2_wall_reached"] = "cannot mount root" in fb_txt
+          verdict["kernel"]["mount_retry_loop"] = "mount(" in fb_txt
+
+          verdict["gates"] = {
+              # pipeline gates (CI must pass these):
+              "devices_realized": all(verdict["devices"][d+"_realized"]
+                  for d in ("sweet-dart", "sweet-mipi-dsim", "sweet-disp0")),
+              "disp0_dma_via_dart": verdict["devices"]["disp0_dma_via_dart"],
+              "m2_wall_reached": verdict["kernel"]["m2_wall_reached"],
+              # measurement gate — the M4/M5 experiment itself (REPORTED;
+              # currently FALSE: the drivers do not probe the synthetic
+              # nubs yet — see the workflow header + RESEARCH-SPRINGBOARD.md)
+              "any_device_traffic": verdict["kernel"]["any_device_traffic"],
+          }
+          (out/"m5-verdict.json").write_text(json.dumps(verdict, indent=2)+"\n")
+          print(json.dumps(verdict, indent=2))
+          # CI gates: fork wiring + boot stability with the display subtree.
+          g = verdict["gates"]
+          if not (g["devices_realized"] and g["disp0_dma_via_dart"]
+                  and g["m2_wall_reached"]):
+              sys.exit("M5 pipeline gate FAILED: " + json.dumps(g))
+          PY
+
+      - name: Upload M5 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m5-display-${{ github.run_id }}
+          path: |
+            out/m5/
+            out/adt-dump.txt
+          if-no-files-found: error
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## M5 display/DART/MIPI device-model run"
+            echo '```'
+            cat out/m5/m5-verdict.json 2>/dev/null || echo "(no verdict)"
+            echo '```'
+            echo '```'
+            tail -40 out/m5/console.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

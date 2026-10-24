@@ -171,6 +171,97 @@ fn adt_roundtrip_and_qemu_values() {
     assert_eq!(h, mkadt::sha384(b"sweet boot manifest").to_vec());
 }
 
+/// The --display subtree: real D22AP display nodes with exact register maps,
+/// phandle-consistent iommu-parent wiring, and the SWEET console persona
+/// preserved (patch 0046 must keep matching).
+#[test]
+fn adt_display_subtree_is_real_d22ap() {
+    // Default ADT: synthetic disp0 only.
+    let plain = mkadt::build(&AdtOptions { qemu: true, ..Default::default() }).unwrap();
+    let (p, _) = adt::parse(&adt::serialize(&plain)).unwrap();
+    let arm_io = p.child("arm-io").unwrap();
+    let plain_disp0 = arm_io.child("disp0").unwrap();
+    assert_eq!(plain_disp0.prop("reg"), None, "synthetic disp0 has no reg");
+    assert!(arm_io.child("dart-disp0").is_none());
+    assert!(arm_io.child("mipi-dsim").is_none());
+
+    // --display ADT: the real D22AP display path.
+    let blob = {
+        let root = mkadt::build(&AdtOptions { qemu: true, display: true, ..Default::default() })
+            .unwrap();
+        adt::serialize(&root)
+    };
+    let (root, _) = adt::parse(&blob).unwrap();
+    let arm_io = root.child("arm-io").unwrap();
+
+    let disp0 = arm_io.child("disp0").unwrap();
+    // Both personas on one node: real IOMFB matches disp0,t8015; the SWEET
+    // console driver keeps matching sweet,display (patch 0046).
+    let compat = disp0.prop("compatible").unwrap().to_vec();
+    let want = [adt::cstr("disp0,t8015"), adt::cstr("sweet,display")].concat();
+    assert_eq!(compat, want);
+    // 4 register ranges, exact D22AP bases/sizes.
+    let reg = disp0.prop("reg").unwrap();
+    assert_eq!(reg.len(), 32);
+    for (i, (base, size)) in [
+        (0x1800_0000u32, 0x2a_6000u32),
+        (0x1870_8000, 0x1000),
+        (0x320b_8000, 0x1000),
+        (0x3230_c000, 0x1000),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let b = u32::from_le_bytes(reg[i * 8..i * 8 + 4].try_into().unwrap());
+        let s = u32::from_le_bytes(reg[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+        assert_eq!((b, s), (*base, *size), "disp0 reg range {i}");
+    }
+    // canvas props preserved for the console path
+    assert!(disp0.prop("canvas-width").is_some());
+
+    let dart = arm_io.child("dart-disp0").unwrap();
+    assert_eq!(dart.prop("compatible").unwrap(), adt::cstr("dart,t8015").as_slice());
+    let dreg = dart.prop("reg").unwrap();
+    assert_eq!(dreg.len(), 16);
+    assert_eq!(
+        u32::from_le_bytes(dreg[..4].try_into().unwrap()),
+        0x1870_4000
+    );
+    assert_eq!(
+        u32::from_le_bytes(dreg[8..12].try_into().unwrap()),
+        0x1870_0000
+    );
+    let sids = dart.prop("sids").unwrap();
+    assert_eq!(u32::from_le_bytes(sids.try_into().unwrap()), 3);
+
+    // phandle wiring: disp0.iommu-parent == dart-disp0/mapper-disp0 phandle
+    let iommu_parent = u32::from_le_bytes(disp0.prop("iommu-parent").unwrap().try_into().unwrap());
+    let mapper = dart.child("mapper-disp0").unwrap();
+    let mapper_ph =
+        u32::from_le_bytes(mapper.prop("AAPL,phandle").unwrap().try_into().unwrap());
+    assert_eq!(iommu_parent, mapper_ph, "disp0.iommu-parent must reference mapper-disp0");
+    assert_eq!(mapper.prop("compatible").unwrap(), adt::cstr("iommu-mapper").as_slice());
+
+    let mipi = arm_io.child("mipi-dsim").unwrap();
+    assert_eq!(
+        mipi.prop("compatible").unwrap(),
+        adt::cstr("mipi-dsim-1,synopsys").as_slice()
+    );
+    let mreg = mipi.prop("reg").unwrap();
+    assert_eq!(u32::from_le_bytes(mreg[..4].try_into().unwrap()), 0x1840_0000);
+    let lanes = mipi.prop("#lanes").unwrap();
+    assert_eq!(u32::from_le_bytes(lanes.try_into().unwrap()), 2);
+    // the panel child rides along
+    assert_eq!(
+        mipi.child("lcd").unwrap().prop("compatible").unwrap(),
+        adt::cstr("lcd,summit").as_slice()
+    );
+
+    // roundtrip byte-stability (same property order)
+    let again = adt::serialize(&root);
+    assert_eq!(blob, again);
+}
+
 #[test]
 fn payload_pipeline_roundtrip() {
     // Ports the 16 checks of scripts/test_payload_pipeline.py.

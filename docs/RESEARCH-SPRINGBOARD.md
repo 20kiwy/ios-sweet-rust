@@ -328,6 +328,43 @@ reality beats the original guess.
   is a tracev3 reader over the md0 dump (the repo already parses
   binary plists / ADT / IM4P / decmpfs — same discipline), NOT more
   plist env surgery. The MACH wall itself is unchanged (M4/M5 IOMFB).
+* **M4/M5 device models landed — the display/DART/MIPI QEMU fork exists, and three boot-configuration walls are measured (2026-10-24, sandbox session).**
+  The "much richer QEMU device model" exists now: `qemu-sweet/` (QEMU
+  10.0.0 + three new devices, built by `qemu-sweet/build.sh`, CI job
+  `qemu-m5-display.yml`) adds `sweet-dart` (dart-disp0 @ 0x18704000 +
+  remap @ 0x18700000, real `IOMMUMemoryRegion` — stage-1 bypass/pass-through
+  with a real DMA-deny fault path), `sweet-mipi-dsim` (@ 0x18400000) and
+  `sweet-disp0` (@ 0x18000000 + aux/pmgr windows) whose DMA address space is
+  rooted AT the DART's IOMMU; a host-driven HMP hook
+  (`sweet-disp0-swap <PA>`) blits a surface through the DART AS into the
+  framebuffer at 0x9c000000. All writes trace into `qemu.log`
+  (`-d unimp,guest_errors`). `make-adt --display` synthesizes the real
+  D22AP display subtree (exact register maps from `devicetree-d22ap.md`;
+  disp0 keeps `sweet,display` so patch 0046's console driver keeps
+  matching). Measured in the sandbox (real kernel, stock and fork QEMU):
+  * **debug=0x8 is NOT "IOKit verbose"** — it is DB_KDB: the kernel
+    configures serial debugging and waits for a KDB connection forever
+    (first-wall.md's plan line was never actually run; M2 used 0xc).
+  * **No RAMDisk ⇒ no boot.** Without ANY `rd=` payload the kernel parks in
+    `_cpu_idle` right after "configuring debugging over serial" and NEVER
+    reaches IOKit output — M2's "empty initrd" was load-bearing. The M5
+    pipeline now carries an empty cpio (TRAILER!!!-only) as md0.
+  * **`interrupts` without `interrupt-parent` WEDGES the boot.** With the
+    real display `interrupts` arrays in the synthetic nodes (no AIC to
+    point at), nub creation hangs before ANY IOKit output (kernel parked in
+    `_ml_get_timebase`, zero device MMIO). IOKit resolves orphan
+    `interrupts` against the ROOT controller (our arm,gic-v3 node) —
+    "inert without interrupt-parent" is FALSE. The subtree omits
+    interrupts now; the boot with the full display subtree reaches the
+    M2 wall (`cannot mount root, errno = 19` mount-retry loop) — IOKit
+    matching survives the new nodes.
+  * **The real drivers still do not probe the synthetic nubs** (zero
+    register traffic on all three devices; `device_type` swap tested —
+    no effect). The next wall is kernel-side: the SWEET patch set's
+    IOKit-match tolerance (Class C #2) governs whether AppleT8015DART /
+    AppleSynopsysMIPIDSI personalities ever start against the synthetic
+    tree — re-enabling them (or a GIC-mapped interrupts + AIC-model step)
+    is the follow-up, with the device models and traces ready.
 * **Where this lands us:** stage = `launchd` bring-up. Each further wall is
   expected inside userland (daemon exec/dyld, Mach bootstrap services,
   `com.apple.backboard.display.services` + `com.apple.iohideventsystem` —

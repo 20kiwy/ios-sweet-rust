@@ -26,6 +26,7 @@ Every library in the boot path is implemented here:
 | iBootIm + SSZL (`lzss`) | (none — new) | the all_flash boot-asset format, incl. Apple's classic LZSS |
 | Android boot.img v2 | `shim/build.sh` + `mkbootimg` | header v2 writer (same field values) |
 | PNG codec | `write_png` + system tools | encoder + decoder, no image libraries |
+| **Apple platform device models (M4/M5)** | `qemu-sweet/` | **QEMU 10.0.0 fork**: `sweet-dart` (real IOMMU MR, DMA-deny faults), `sweet-disp0` (DMA AS rooted in the DART + HMP `sweet-disp0-swap` hook), `sweet-mipi-dsim`; register write traces in `qemu.log`; `make-adt --display` synthesizes the real D22AP display subtree; CI job `qemu-m5-display.yml` |
 
 ## What is proven to work
 
