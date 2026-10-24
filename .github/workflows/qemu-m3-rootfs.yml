@@ -17,6 +17,10 @@ name: qemu-m3-rootfs
 
 on:
   workflow_dispatch:
+    inputs:
+      secs:
+        description: boot window (s); 1200 = the 20-min park-retry probe
+        default: "240"
   push:
     branches: [main]
     paths:
@@ -181,7 +185,7 @@ jobs:
             --kernel kernel/kernel.development.sweet \
             --ramdisk mini-root.img \
             --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
-            --highmem --no-logo --secs 240 --dump-ramdisk \
+            --highmem --no-logo --secs "${{ inputs.secs || 240 }}" --dump-ramdisk \
             --snap-every 20 \
             --msgbuf-dump "0x$MSGREF" \
             --hmp "memsave $SWEETLOGTOTAL 8 sweetlogtotal.bin;memsave $SWEETLOGRING 4194304 sweetlogring.bin" \
