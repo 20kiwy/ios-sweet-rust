@@ -22,27 +22,32 @@ rootfs is an empty md0). Full boot = **one pipeline that has both**.
 
 ## 1. The walls, in dependency order
 
-### W1 — unify the pipelines (no new engineering, highest leverage first)
+### W1 — unify the pipelines (no new engineering, highest leverage first) — **SHIPPED, CI-run pending**
 
 Run the M3 userland recipe ON TOP of the M5 display world:
 
 ```
-ipsw-boot --ipsw <IPSW> out-full --ramdisk mini-root.img
-          --sweet-devices            # NEW: fork QEMU + the three devices
-          --display-adt              # NEW: make-adt --display under the hood
+ipsw-boot --ipsw <IPSW> out-full --kernel kernel --ramdisk mini-root.img
+          --product dt/DeviceTree.d22ap.im4p
+          --display-adt --sweet-devices        # SHIPPED (f5de58a)
           --highmem --secs 240
 ```
 
-Implementation: `ipsw-boot` grows `--sweet-devices` (switch QEMU binary +
-append the three `-device` lines) and `--display-adt` (route ADT synthesis
-through `make-adt --display` semantics).
+Implemented: `ipsw-boot --display-adt` + `--sweet-devices` (one command,
+no separate make-adt step), and `emu-boot` real-boot mode (`--kernel
+--ramdisk --cmdline --product --display-adt --sweet-devices --highmem`)
+for the LIVE screen-control session (QMP + gdbstub + serial socket + FB
+paint) against the real boot. Measured in the sandbox: the flags wire
+end-to-end (`pass:true`, devices realized, console painted) and the live
+control session survives with the guest painting on its own
+(`session_alive:true`, `guest_painted:true`).
 
-**Gate:** the M3 verdicts (`mounted` / `launchd-exec` / `user-domain`)
-hold UNCHANGED with the display subtree + devices present. If matching
-wedges (the `interrupts` lesson from M5), the subtree is the suspect —
-bisect by booting with `--sweet-devices` but a plain ADT.
-
-**Cost:** one Rust afternoon. **Risk:** low — both halves already pass CI.
+CI: `.github/workflows/full-boot.yml` runs the unified boot on a 16 GB
+runner (`ubuntu-latest-4-cores`, 7 GB `ubuntu-latest` fallback via
+workflow_dispatch) with the M3 stage verdicts + device checks as the gate
+and the device register traffic as the W2 measurement, plus a live
+screen-control step (real-IPSW wallpaper painted into the guest FB while
+the kernel runs).
 
 ### W2 — make the real drivers probe the synthetic nubs (device traffic > 0)
 

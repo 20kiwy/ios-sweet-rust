@@ -1277,8 +1277,10 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
         verdict.set("guest_painted", J::b(guest_painted));
         verdict.set("session_alive", J::b(session_alive));
         verdict.set("stage4", J::s(p4.as_ref().map(|p| p.display().to_string()).unwrap_or_default()));
+        // with a wallpaper given, the host paint MUST land on the guest FB;
+        // without one the control actions are the UART send + the timeline
         pass = session_alive
-            && fb_mean_abs_diff(&fb1, &fb2) > 8.0
+            && (wall_bgra.is_none() || fb_mean_abs_diff(&fb1, &fb2) > 8.0)
             && (marker_ok || guest_painted || input_echoed);
     } else {
         verdict.set("kernel_alive", J::b(marker_ok || corner_ok || input_echoed));
