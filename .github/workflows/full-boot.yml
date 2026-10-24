@@ -14,9 +14,13 @@ name: full-boot
 #     -> LIVE control session (emu-boot real mode): wallpaper paint into the
 #        guest FB + UART text while the real kernel runs (screen-control gate)
 #
-# Runner: ubuntu-latest-4-cores = 4 vCPU / 16 GB RAM (the unified boot holds
-# a 4.2 GB md0 twice on disk + a shared-memory guest; the 7 GB free-tier
-# runner is the documented fallback via workflow_dispatch).
+# Runner: ubuntu-latest. NOTE: the modern free ubuntu-latest IS 4 vCPU /
+# 16 GB RAM / ~145 GB disk (verified on run 120865131924: 104 GB avail),
+# so the unified boot fits the free tier directly. The dedicated
+# 'ubuntu-latest-4-cores' label is Team/Enterprise-only — on this repo's
+# plan no runner ever picked the job up (run 40093358895 queued forever),
+# which is why every full-boot ended cancelled-or-pending. Stay on the
+# free label; workflow_dispatch may still override for paid plans.
 # IPSW cache: same path + key as qemu-m3-rootfs.yml / qemu-logo.yml — one
 # shared 6.6 GB entry, not three.
 
@@ -24,9 +28,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner label (ubuntu-latest-4-cores = 16 GB RAM; ubuntu-latest = 7 GB fallback)'
+        description: 'Runner label (default: free ubuntu-latest = 4 vCPU/16 GB; paid plans may override)'
         required: false
-        default: 'ubuntu-latest-4-cores'
+        default: 'ubuntu-latest'
       secs:
         description: 'Unified boot seconds'
         required: false
@@ -48,7 +52,7 @@ permissions:
 
 jobs:
   unified-boot:
-    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest-4-cores' }}
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 120
     env:
       SECS: ${{ github.event.inputs.secs || '240' }}
@@ -174,6 +178,10 @@ jobs:
           SWEETLOGTOTAL=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _sweet_log_total | awk '{print $1}')
           SWEETLOGRING=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _sweet_log_ring | awk '{print $1}')
           echo "sweetlog ring = $SWEETLOGRING total = $SWEETLOGTOTAL"
+          # W4 probe window = the ADT's real guest RAM bank (--highmem):
+          # phys 0x100000000 size 0xfcc00000 (QEMU -m 7G also maps a 2 GB
+          # low bank the highmem kernel never uses; the old 0x40000000 +
+          # 0x200000000 dump was half MMIO-hole/beyond-ADT zeros).
           set +e
           ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW" out-full \
             --kernel kernel/kernel.development.sweet \
@@ -184,7 +192,7 @@ jobs:
             --highmem --no-logo --secs "$SECS" --dump-ramdisk \
             --snap-every 30 \
             --msgbuf-dump "0x$MSGREF" \
-            --hmp "memsave $SWEETLOGTOTAL 8 sweetlogtotal.bin;memsave $SWEETLOGRING 4194304 sweetlogring.bin;pmemsave 0x40000000 0x200000000 gustram.bin" \
+            --hmp "memsave $SWEETLOGTOTAL 8 sweetlogtotal.bin;memsave $SWEETLOGRING 4194304 sweetlogring.bin;pmemsave 0x100000000 0xfcc00000 gustram.bin" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 sweetfb_noconsole=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           set -e
@@ -241,7 +249,7 @@ jobs:
         run: |
           set +e
           if [ -f out-full/gustram.bin ]; then
-            ls -la out-full/guest-ram.bin
+            ls -la out-full/gustram.bin
             strings -n 8 out-full/gustram.bin | grep -aiE \
               'BackBoard|backboardd|IOMFB|IOMobileFrame|display-subsystem|HIDEventSystem|SpringBoard|IOSurface|swap|vsync|IOServiceMatching|bootstrap|check-in|XPC.*error|Can not|could not|unable to' \
               | sort | uniq -c | sort -rn | head -200 > out-full/ram-strings-w4.txt
@@ -368,13 +376,19 @@ jobs:
             out-ctl/
             fsck-summary.txt
             wall/
+          # the multi-GB rebuildables would dominate the zip: payload.bin and
+          # md0-dump.img are rebuilt every run from the cached IPSW
+          exclude: |
+            out-full/payload.bin
+            out-full/md0-dump.img
+            out-ctl/payload.bin
           if-no-files-found: warn
 
       - name: Job summary
         if: always()
         run: |
           {
-            echo "## full-boot (W1 unified) — ${{ github.event.inputs.runner || 'ubuntu-latest-4-cores' }}"
+            echo "## full-boot (W1 unified) — ${{ github.event.inputs.runner || 'ubuntu-latest' }}"
             echo '```'
             cat out-full/full-boot-verdict.json 2>/dev/null || echo "(no verdict)"
             cat out-ctl/emu-verdict.json 2>/dev/null || true
