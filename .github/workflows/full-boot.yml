@@ -1,0 +1,310 @@
+name: full-boot
+
+# W1 — the UNIFIED pipeline: the M3 userland (mini-root, real launchd,
+# spawn cycle) ON TOP of the M5 display world (the REAL D22AP display
+# subtree in the ADT + the three qemu-sweet devices attached).
+#
+#   real iPhone X 16.7.16 IPSW
+#     -> SystemOS cryptex -> mkiosroot mini-root (4.2 GB HFS+ md0)
+#     -> ADT with --display-adt (disp0/dart-disp0/mipi-dsim, real registers)
+#     -> payload (real SWEET kernel, M3-proven boot args)
+#     -> qemu-sweet fork --sweet-devices (built from the VENDORED source)
+#     -> the M3 verdicts must HOLD with the devices on (W1 gate)
+#     -> device register traffic is REPORTED (the W2 measurement)
+#     -> LIVE control session (emu-boot real mode): wallpaper paint into the
+#        guest FB + UART text while the real kernel runs (screen-control gate)
+#
+# Runner: ubuntu-latest-4-cores = 4 vCPU / 16 GB RAM (the unified boot holds
+# a 4.2 GB md0 twice on disk + a shared-memory guest; the 7 GB free-tier
+# runner is the documented fallback via workflow_dispatch).
+# IPSW cache: same path + key as qemu-m3-rootfs.yml / qemu-logo.yml — one
+# shared 6.6 GB entry, not three.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (ubuntu-latest-4-cores = 16 GB RAM; ubuntu-latest = 7 GB fallback)'
+        required: false
+        default: 'ubuntu-latest-4-cores'
+      secs:
+        description: 'Unified boot seconds'
+        required: false
+        default: '240'
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "kernel/**"
+      - "qemu-sweet/**"
+      - ".github/workflows/full-boot.yml"
+
+concurrency:
+  group: full-boot-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  unified-boot:
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest-4-cores' }}
+    timeout-minutes: 120
+    env:
+      SECS: ${{ github.event.inputs.secs || '240' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust, llvm-nm, fsck, fork build deps
+        run: |
+          # free runner disk first: cryptex (2.7GB) + mini-root (4.2GB) +
+          # payload (4.2GB) + ram.mmap (guest RAM) need the room
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL || true
+          df -h /
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update -q
+          sudo apt-get install -y -q libglib2.0-dev libpixman-1-dev \
+            zlib1g-dev libfdt-dev ninja-build meson llvm jq
+          llvm-nm --version | head -1
+
+      - name: Cache cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-targets: true
+
+      - name: Build + unit tests (Rust)
+        run: |
+          cargo build --release
+          cargo test --release
+          (cd kernel && sha256sum -c SHA256SUMS)
+
+      - name: Build qemu-sweet (vendored v10.0.0 + the three display devices)
+        run: |
+          sh qemu-sweet/build.sh
+          qemu-prefix-sweet/bin/qemu-system-aarch64 --version | head -1
+          qemu-prefix-sweet/bin/qemu-system-aarch64 -device help 2>&1 \
+            | grep -E "sweet-(dart|disp0|mipi)" \
+            || { echo "::error::sweet devices missing from the fork"; exit 1; }
+
+      - name: Resolve the IPSW URL
+        run: |
+          IPSW_URL=$(curl -sfL 'https://api.ipsw.me/v4/device/iPhone10,3?type=ipsw' \
+            | jq -r '.firmwares[] | select(.version=="16.7.16") | .url')
+          echo "IPSW_URL=$IPSW_URL" | tee -a "$GITHUB_ENV"
+
+      - name: Cache the 16.7.16 IPSW (6.6 GB, shared with the other workflows)
+        uses: actions/cache@v4
+        with:
+          path: ipsw.ipsw
+          key: ipsw-20H392-iPhone10-3-v2
+
+      - name: Fetch the IPSW (cache miss -> Apple CDN)
+        run: |
+          if [ ! -s ipsw.ipsw ]; then
+            curl -fL --retry 5 --retry-delay 10 -o ipsw.ipsw.tmp "$IPSW_URL" \
+              && mv ipsw.ipsw.tmp ipsw.ipsw
+          fi
+          df -h / | head -2
+          echo "IPSW=ipsw.ipsw" | tee -a "$GITHUB_ENV"
+
+      - name: Extract the SystemOS cryptex + the real DeviceTree
+        run: |
+          ./target/release/sweet-rust ipsw-extract "$IPSW" \
+            --member 087-86593-047.dmg --out cryptex
+          ./target/release/sweet-rust ipsw-extract "$IPSW" \
+            --member DeviceTree.d22ap.im4p --out dt
+          ls -la cryptex dt
+
+      - name: Build the mini HFS+ root + fsck gate
+        run: |
+          ./target/release/sweet-rust mkiosroot \
+            --os "$IPSW" \
+            --systemos cryptex/087-86593-047.dmg \
+            --unlink-systemos \
+            --profile mini \
+            --out mini-root.img
+          FSCK=$(find / -name fsck.hfsplus -path "*sbin*" 2>/dev/null | head -1 || true)
+          if [ -z "$FSCK" ]; then
+            curl -sfL -o /tmp/hfsprogs.deb \
+              http://archive.ubuntu.com/ubuntu/pool/universe/h/hfsprogs/hfsprogs_540.1.linux3-6_amd64.deb
+            dpkg -x /tmp/hfsprogs.deb /tmp/hfstools
+            FSCK=$(find /tmp/hfstools -name fsck.hfsplus | head -1)
+          fi
+          set +e
+          "$FSCK" -f -n mini-root.img | tee fsck.log
+          rc=$?
+          set -e
+          invalid=$(grep -cE "Invalid|Incorrect|should be" fsck.log || true)
+          echo "fsck rc=$rc invalid=$invalid" | tee fsck-summary.txt
+          test "$invalid" -eq 0
+
+      - name: Compose the real IPSW wallpaper (for the live control step)
+        run: |
+          pip install pillow-heif
+          mkdir -p wall
+          B="/Library/Wallpaper/Collections/Clownfish~iphone.wallpaperCollection/Wallpapers/7420.Clownfish-375w-812h@3x~iphone.wallpaper"
+          for a in \
+            "7420.Clownfish_Background-375w-812h@3x~iphone.ca/assets/Background.HEIC" \
+            "7420.Clownfish_Foreground-375w-812h@3x~iphone.ca/assets/Foreground.HEIC" \
+            "7420.Clownfish_Foreground-375w-812h@3x~iphone.ca/assets/Foreground_Upper.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_One.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Two.HEIC" \
+            "7420.Clownfish_Floating-375w-812h@3x~iphone.ca/assets/Float_Three.HEIC" ; do
+            n=$(basename "$a")
+            ./target/release/sweet-rust ipsw-file "$IPSW" "$B/$a" --out "wall/$n"
+          done
+          for d in Background Floating Foreground; do
+            ./target/release/sweet-rust ipsw-file "$IPSW" \
+              "$B/7420.Clownfish_${d}-375w-812h@3x~iphone.ca/main.caml" \
+              --out "wall/$d.main.caml"
+          done
+          python3 tools/compose-wallpaper.py wall
+          ls -la wall/*.png
+
+      - name: UNIFIED boot — mini-root userland + display subtree + sweet devices
+        run: |
+          export PATH="$PWD/qemu-prefix-sweet/bin:$PATH"
+          MSGREF=$(llvm-nm kernel/kernel.development.sweet | grep ' _msgbufp$' | awk '{print $1}')
+          echo "_msgbufp = 0x$MSGREF"
+          set +e
+          ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW" out-full \
+            --kernel kernel/kernel.development.sweet \
+            --ramdisk mini-root.img \
+            --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
+            --display-adt --sweet-devices \
+            --highmem --no-logo --secs "$SECS" --dump-ramdisk \
+            --snap-every 30 \
+            --msgbuf-dump "0x$MSGREF" \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
+            || true
+          set -e
+          ls -la out-full
+          echo "===== msgbuf tail (early-boot-complete / spawn cycle lands here) ====="
+          tail -50 out-full/msgbuf.txt 2>/dev/null || echo "(msgbuf.txt missing)"
+
+      - name: Decode the console timeline (screen-decode, kernel _iso_font)
+        run: |
+          set +e
+          {
+            for f in out-full/fb-*.png out-full/fb.png; do
+              [ -f "$f" ] || continue
+              echo "=== $(basename "$f") ==="
+              ./target/release/sweet-rust screen-decode "$f" \
+                --kernel kernel/kernel.development.sweet \
+                --payload out-full/payload.bin 2>/dev/null
+            done
+          } > out-full/console.txt
+          set -e
+          tail -30 out-full/console.txt
+
+      - name: Unified verdict — M3 stages WITH devices + W2 traffic + W1 gate
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+          out = pathlib.Path("out-full")
+          qlog = (out/"qemu.log").read_text(errors="replace")
+          console = (out/"console.txt").read_text(errors="replace") if (out/"console.txt").exists() else ""
+          msgbuf = (out/"msgbuf.txt").read_text(errors="replace") if (out/"msgbuf.txt").exists() else ""
+          both = console + "\n" + msgbuf
+          v = {"devices": {}, "kernel": {}, "gates": {}}
+
+          # devices: realized + the DART-rooted DMA chain (M5 evidence)
+          for dev in ("sweet-dart", "sweet-mipi-dsim", "sweet-disp0"):
+              v["devices"][dev+"_realized"] = f"{dev}: realized" in qlog
+          v["devices"]["disp0_dma_via_dart"] = "sweet-disp0: DMA via DART" in qlog
+
+          # W2 measurement: did any real driver probe the synthetic nubs?
+          for dev in ("sweet-dart", "sweet-disp0", "sweet-mipi-dsim"):
+              v["kernel"][dev.replace("sweet-","")+"_writes"] = len(re.findall(f"{dev}: W ", qlog))
+          v["kernel"]["any_device_traffic"] = any(
+              x > 0 for k, x in v["kernel"].items() if k.endswith("_writes"))
+
+          # M3 stage detection (same markers as qemu-m3-rootfs.yml), WITH devices on
+          user_daemons = ["backboardd", "springboard", "mediaserverd", "locked", "usermanagerd"]
+          user_domain = any(d in both.lower() for d in user_daemons)
+          spawn_cycle = ("xpcproxy" in both and "posix_spawn" in both) or "spawn" in both.lower()
+          execd_launchd = "init running as PID" in both or "launchd" in both.lower()
+          early_boot = "BSD root: md0" in both
+          kernel_panic = "panic(cpu " in both
+          stage = ("user-domain" if (user_domain and spawn_cycle) else
+                   "launchd-early-boot" if early_boot and execd_launchd else
+                   "mounted" if early_boot else "booting")
+          v["kernel"]["stage_with_devices"] = stage
+          v["kernel"]["kernel_panic"] = kernel_panic
+          m = re.search(r'description:\s*(.{0,140}?)(?:handshake|Please go to|$)', both)
+          v["kernel"]["exit_reason"] = m.group(1).strip() if m else ""
+
+          # W1 gate: the M3 verdicts must HOLD with the display devices on
+          v["gates"]["devices_realized"] = all(v["devices"][d+"_realized"]
+              for d in ("sweet-dart", "sweet-mipi-dsim", "sweet-disp0"))
+          v["gates"]["disp0_dma_via_dart"] = v["devices"]["disp0_dma_via_dart"]
+          v["gates"]["m3_stage_holds_with_devices"] = stage in (
+              "mounted", "launchd-early-boot", "user-domain")
+          v["gates"]["no_kernel_panic"] = not kernel_panic
+
+          json.dump(v, open(out/"full-boot-verdict.json", "w"), indent=1)
+          print(json.dumps(v, indent=1))
+          g = v["gates"]
+          if not (g["devices_realized"] and g["disp0_dma_via_dart"]
+                  and g["m3_stage_holds_with_devices"] and g["no_kernel_panic"]):
+              sys.exit("W1 gate FAILED: " + json.dumps(g))
+          PY
+
+      - name: LIVE control on the real boot (wallpaper paint + UART into the guest)
+        run: |
+          export PATH="$PWD/qemu-prefix-sweet/bin:$PATH"
+          set +e
+          ./target/release/sweet-rust emu-boot --ipsw "$IPSW" out-ctl \
+            --kernel kernel/kernel.development.sweet \
+            --ramdisk mini-root.img \
+            --product dt/Firmware_all_flash_DeviceTree.d22ap.im4p \
+            --display-adt --sweet-devices --highmem \
+            --wallpaper wall/clownfish-1080x2400.png \
+            --send "hello from the host" \
+            --secs 150 || true
+          set -e
+          cat out-ctl/emu-verdict.json 2>/dev/null || echo "(no emu verdict)"
+
+      - name: Screen-control gate
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          try:
+              v = json.load(open('out-ctl/emu-verdict.json'))
+          except Exception as e:
+              sys.exit(f"screen-control gate FAILED: no emu-verdict ({e})")
+          ok = (v.get("pass") and v.get("wallpaper_painted")
+                and v.get("session_alive"))
+          print("screen-control:", "PASS" if ok else "FAIL",
+                {k: v.get(k) for k in ("wallpaper_painted","guest_painted","session_alive")})
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-boot-${{ github.run_id }}
+          path: |
+            out-full/
+            out-ctl/
+            fsck-summary.txt
+            wall/
+          if-no-files-found: warn
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## full-boot (W1 unified) — ${{ github.event.inputs.runner || 'ubuntu-latest-4-cores' }}"
+            echo '```'
+            cat out-full/full-boot-verdict.json 2>/dev/null || echo "(no verdict)"
+            cat out-ctl/emu-verdict.json 2>/dev/null || true
+            echo '```'
+            echo '```'
+            tail -40 out-full/console.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
