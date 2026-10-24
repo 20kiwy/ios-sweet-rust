@@ -80,6 +80,7 @@ jobs:
 
       - name: ADT with the real D22AP display subtree
         run: |
+          mkdir -p out
           ./target/release/sweet-rust make-adt out/m5.adt --qemu --display --dump > out/adt-dump.txt 2>out/make-adt.log || {
             cat out/make-adt.log; exit 1; }
           grep -q "disp0,t8015" out/adt-dump.txt
