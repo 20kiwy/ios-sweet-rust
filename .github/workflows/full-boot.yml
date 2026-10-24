@@ -170,6 +170,10 @@ jobs:
           # W2 session: native symtab parse — no external llvm-nm needed
           MSGREF=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _msgbufp | awk '{print $1}')
           echo "_msgbufp = $MSGREF"
+          # Patch 0047's 4 MiB daemon console ring (see qemu-m3-rootfs.yml)
+          SWEETLOGTOTAL=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _sweet_log_total | awk '{print $1}')
+          SWEETLOGRING=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _sweet_log_ring | awk '{print $1}')
+          echo "sweetlog ring = $SWEETLOGRING total = $SWEETLOGTOTAL"
           set +e
           ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW" out-full \
             --kernel kernel/kernel.development.sweet \
@@ -180,10 +184,30 @@ jobs:
             --highmem --no-logo --secs "$SECS" --dump-ramdisk \
             --snap-every 30 \
             --msgbuf-dump "0x$MSGREF" \
+            --hmp "memsave $SWEETLOGTOTAL 8 sweetlogtotal.bin;memsave $SWEETLOGRING 4194304 sweetlogring.bin" \
             --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 sweetfb_noconsole=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           set -e
           ls -la out-full
+          # QEMU's cwd is the repo root — collect the ring files
+          cp sweetlogtotal.bin sweetlogring.bin out-full/ 2>/dev/null || true
+          python3 - <<'PY'
+          import struct, pathlib
+          out = pathlib.Path("out-full")
+          try:
+              total = struct.unpack('<Q', (out/'sweetlogtotal.bin').read_bytes()[:8])[0]
+          except FileNotFoundError:
+              total = 0
+          ring_path = out/'sweetlogring.bin'
+          if ring_path.exists() and total:
+              ring = ring_path.read_bytes()
+              size = len(ring)
+              text = ring[:total] if total <= size else ring[total % size:] + ring[:total % size]
+              (out/'sweetlog.txt').write_bytes(text)
+              print(f'SWEETLOG: ring {size}, total {total} bytes -> sweetlog.txt')
+          else:
+              print(f'SWEETLOG: no ring data (total={total})')
+          PY
           # W4: the kernel console ring is the userland timeline (the fb
           # console is overdrawn by the GUI once SpringBoard composites)
           strings -n 4 out-full/msgbuf.bin > out-full/msgbuf.txt || true
