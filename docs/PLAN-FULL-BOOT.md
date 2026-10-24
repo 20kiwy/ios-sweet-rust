@@ -22,7 +22,7 @@ rootfs is an empty md0). Full boot = **one pipeline that has both**.
 
 ## 1. The walls, in dependency order
 
-### W1 — unify the pipelines (no new engineering, highest leverage first) — **SHIPPED, CI-run pending**
+### W1 — unify the pipelines (no new engineering, highest leverage first) — **SHIPPED + CI-VERIFIED (run 40063428984, all gates green)**
 
 Run the M3 userland recipe ON TOP of the M5 display world:
 
@@ -53,11 +53,20 @@ the exact M2 wall text. This is the machine half of "control the screen";
 the guest half (touch IN) is W5's BackBoard/HID work.
 
 CI: `.github/workflows/full-boot.yml` runs the unified boot on a 16 GB
-runner (`ubuntu-latest-4-cores`, 7 GB `ubuntu-latest` fallback via
-workflow_dispatch) with the M3 stage verdicts + device checks + VNC
-console-registration + screenshot-captured as the gate and the device
-register traffic as the W2 measurement, plus a live screen-control step
-(real-IPSW wallpaper painted into the guest FB while the kernel runs).
+runner (`ubuntu-latest-4-cores`, `ubuntu-latest` fallback via
+workflow_dispatch — USE THE DISPATCH: `ubuntu-latest-4-cores` is not
+enabled on this plan and a push-triggered run queues forever; measured).
+**Measured verdict (run 40063428984, ubuntu-latest fallback):**
+`stage_with_devices = "user-domain"` (M3 userland markers + spawn cycle
+HOLD with the display world on), all three devices realized, disp0 DMA
+via DART, VNC console registered, 7 console screenshots captured,
+no kernel panic — and the live screen-control step PASSed
+(wallpaper_painted / guest_painted / session_alive all true).
+Gate additionally asserts VNC console registration + screenshot capture.
+
+Caveat: the IPSW-cache upload makes the artifact ~6 GB; the run takes
+~1 h wall on the fallback runner (fork build + 6.6 GB IPSW fetch +
+240 s boot + live control).
 
 ### W2 — make the real drivers probe the synthetic nubs (device traffic > 0)
 
