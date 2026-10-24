@@ -152,6 +152,54 @@ impl Gdb {
         }
         Ok(out)
     }
+
+    /// Read one register by GDB regnum via the `p` packet (64-bit decode).
+    pub fn read_reg(&mut self, num: u32) -> Result<u64> {
+        let r = self.cmd(&format!("p{num:x}"))?;
+        if r.starts_with('E') || r.is_empty() {
+            bail!("gdb p{num:x} failed: {r:.40}");
+        }
+        let b = r.as_bytes();
+        let n = b.len() / 2;
+        if n > 8 {
+            bail!("gdb p{num:x}: {}-byte reg?", n);
+        }
+        let mut bytes = [0u8; 8];
+        for k in 0..n {
+            let hi = (b[k * 2] as char).to_digit(16).unwrap_or(0) as u8;
+            let lo = (b[k * 2 + 1] as char).to_digit(16).unwrap_or(0) as u8;
+            bytes[k] = (hi << 4) | lo;
+        }
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// One vCPU register sample via the `g` packet.
+    ///
+    /// QEMU aarch64 builtin (no XML negotiation) `g` layout: 31 GPR slots
+    /// (x0..x30) as 8 little-endian bytes each, then pc (8 bytes), pstate
+    /// (4 bytes), then the FPU/SIMD block. We decode the first 32 GPR
+    /// slots: index 30 = lr (x30), index 31 = pc. The caller validates
+    /// against the kernel text range — a wrong pc-slot choice is caught
+    /// by the histogram being meaningless, and the raw samples are kept
+    /// either way (honesty rules).
+    pub fn regs_sample(&mut self) -> Result<[u64; 32]> {
+        let r = self.cmd("g")?;
+        if r.starts_with('E') || r.len() < 32 * 16 {
+            bail!("gdb g packet too short: {} chars: {r:.40}", r.len());
+        }
+        let b = r.as_bytes();
+        let mut out = [0u64; 32];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let mut bytes = [0u8; 8];
+            for k in 0..8 {
+                let hi = (b[i * 16 + k * 2] as char).to_digit(16).unwrap_or(0) as u8;
+                let lo = (b[i * 16 + k * 2 + 1] as char).to_digit(16).unwrap_or(0) as u8;
+                bytes[k] = (hi << 4) | lo;
+            }
+            *slot = u64::from_le_bytes(bytes);
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------

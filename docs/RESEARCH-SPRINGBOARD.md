@@ -303,8 +303,11 @@ reality beats the original guess.
   DART-translated surface to FB 0x9c000000" — remains the designed
   answer. Scoped experiments, cheapest first: (a) IOKit-verbose boot
   (debug=0x8) to capture IOMFB's attach/user-client state on the
-  synthetic node; (b) gdb-attach at end-of-boot via QMP `gdbserver` HMP
-  to read backboardd's thread state; (c) the virtual-display kernel
+  synthetic node; (b) gdb-attach at end-of-boot — SHIPPED as
+  `emu-boot --thread-probe FILE.json` (QMP stop -> gdbstub `p` packets ->
+  kernel-symtab-symbolized vCPU PC histogram; the smoke boot's PCs landed
+  in `_cpu_idle` / `_handle_debugger_trap` as expected for a panicked
+  no-rootfs boot — the machinery is validated); (c) the virtual-display kernel
   patch (upstream SWEET patch set) or QEMU `unimplemented-device`
   stubs at the real D22AP MMIO bases (reads-as-zero; a half-matched
   real IOMFB may panic — revert restores the proven stable state).

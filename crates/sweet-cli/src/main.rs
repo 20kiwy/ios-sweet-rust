@@ -277,7 +277,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "emu-boot" => vec![
             "ipsw", "wallpaper", "wallpaper-manifest", "send", "secs", "cpu",
             "strip", "logo-scale", "qemu-datadir", "kernel", "ramdisk",
-            "cmdline", "product", "snap-every", "vnc",
+            "cmdline", "product", "snap-every", "vnc", "thread-probe",
         ],
         "emu-peek" => vec!["addr", "len", "secs", "cpu"],
         "kernel-unpack" => vec![],
@@ -1098,7 +1098,7 @@ fn fb_diff_pixels(a: &[u8], b: &[u8], row_from: u32, row_to: u32) -> u64 {
 fn cmd_emu_boot(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("emu-boot"));
     if f.rest.is_empty() {
-        bail!("usage: emu-boot --ipsw IPSW|URL <OUTDIR> [--wallpaper PNG] [--send TEXT] [--secs 60] | real boot: [--kernel K --ramdisk R --cmdline \"...\" --display-adt --sweet-devices --highmem --product DT]");
+        bail!("usage: emu-boot --ipsw IPSW|URL <OUTDIR> [--wallpaper PNG] [--send TEXT] [--secs 60] | real boot: [--kernel K --ramdisk R --cmdline \"...\" --display-adt --sweet-devices --highmem --product DT] [--thread-probe FILE.json]");
     }
     let ipsw_src = f.val("ipsw").ok_or_else(|| sc::Error::Msg("--ipsw required".into()))?;
     let outdir = PathBuf::from(f.rest[0]);
@@ -1210,6 +1210,13 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
     eprintln!("{}", info.summary());
     // 16GB-runner lesson (same as cmd_ipsw_boot): the loader reads
     // payload.bin from disk; in-RAM copies are dead weight from here on.
+    // (The W4 thread-probe still symbolizes from these — parsed BEFORE the
+    // drop; 70k symbols are a few MB, not a 4 GB kernel copy.)
+    let kernel_syms = if f.has("thread-probe") {
+        sc::macho::symbols(&kernel).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     drop(pl);
     drop(ramdisk);
     drop(kernel);
@@ -1340,6 +1347,25 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
         let cut = t.len().saturating_sub(400);
         t[cut..].to_string()
     }));
+
+    // W4: vCPU PC sampler at the park (gdbstub `g` packets). The guest is
+    // parked in the MACH wall at this point; sampling the vCPU PC N times
+    // (pause -> sample -> cont) and symbolizing against the kernel symtab
+    // answers "kernel idle at a fixed PC" vs "kernel alive" — the research
+    // doc's experiment (b), measured.
+    if let Some(tp) = f.val("thread-probe") {
+        match probe_vcpu_pcs(&mut sess, gdb_port, kernel_syms, 12, 1500) {
+            Ok(probe) => {
+                write_json(Path::new(tp), &probe)?;
+                eprintln!("[thread-probe] {}", probe.dump());
+                verdict.set("thread_probe", J::s(tp));
+            }
+            Err(e) => {
+                eprintln!("[thread-probe] failed: {e}");
+                verdict.set("thread_probe", J::s(format!("failed: {e}")));
+            }
+        }
+    }
 
     sess.kill();
     verdict.set("pass", J::b(pass));
@@ -1473,6 +1499,129 @@ fn logo_image(source: &str) -> Result<(sc::png::Image, String)> {
 fn write_json(path: &Path, v: &J) -> Result<()> {
     std::fs::write(path, format!("{}\n", v.dump()))?;
     Ok(())
+}
+
+/// W4 experiment (b) from docs/RESEARCH-SPRINGBOARD.md — sample the parked
+/// vCPU's PC `n` times (QMP stop -> gdbstub `g` -> QMP cont), symbolize the
+/// PCs against the kernel's own LC_SYMTAB, and answer "kernel idle-looping
+/// at one fixed PC" vs "kernel alive (scheduler hopping)". Std-only; the
+/// gdbstub exposes the vCPU, not guest tasks, so this measures the CPU
+/// sample space — the honest framing is a PC histogram, not per-thread.
+fn probe_vcpu_pcs(
+    sess: &mut sc::control::Session,
+    gdb_port: u16,
+    syms: Vec<(String, u64)>,
+    n: usize,
+    gap_ms: u64,
+) -> Result<J> {
+    let mut syms = syms;
+    syms.sort_by_key(|(_, v)| *v);
+    syms.dedup_by_key(|(_, v)| *v);
+    if syms.is_empty() {
+        bail!("kernel has no LC_SYMTAB symbols to symbolize with");
+    }
+    let kmin = syms.first().map(|(_, v)| *v).unwrap_or(0);
+    let kmax = syms.last().map(|(_, v)| *v).unwrap_or(0);
+    // nearest defined symbol at/below pc, trusted only within 64 KiB
+    let nearest = |pc: u64| -> Option<(String, u64)> {
+        let idx = syms.partition_point(|(_, v)| *v <= pc);
+        if idx == 0 {
+            return None;
+        }
+        let (name, val) = &syms[idx - 1];
+        if pc - val > 0x10000 {
+            return None;
+        }
+        Some((name.clone(), *val))
+    };
+
+    let mut samples: Vec<(u64, u64)> = Vec::new(); // (pc, lr)
+    let mut pc_regnum: u32 = 31; // QEMU builtin guess; self-checked on sample 1
+    for i in 0..n {
+        sess.pause()?;
+        let probe = (|| -> Result<(u64, u64)> {
+            let mut g = sc::control::Gdb::attach(gdb_port)?;
+            let x30 = g.read_reg(30)?;
+            // The g-packet layout turned out to be the GDB-XML one (sp at
+            // slot 31 — the smoke test's slot-31 values were stack
+            // addresses), so pick the PC regnum EMPIRICALLY: whichever of
+            // 31/32 lands inside the kernel symtab range on the first
+            // sample wins, else fall back to 31 and keep the raw values.
+            let c31 = g.read_reg(31).unwrap_or(0);
+            let c32 = g.read_reg(32).unwrap_or(0);
+            if i == 0 {
+                let in31 = c31 >= kmin && c31 <= kmax;
+                let in32 = c32 >= kmin && c32 <= kmax;
+                pc_regnum = match (in31, in32) {
+                    (false, true) => 32,
+                    _ => 31,
+                };
+            }
+            let pc = if pc_regnum == 32 { c32 } else { c31 };
+            Ok((pc, x30))
+        })();
+        sess.cont()?;
+        samples.push(probe?);
+        if i + 1 < n {
+            std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+        }
+    }
+
+    let in_kernel = samples.iter().filter(|(pc, _)| *pc >= kmin && *pc <= kmax).count();
+    // PC histogram
+    let mut hist: Vec<(u64, usize)> = Vec::new();
+    for (pc, _) in &samples {
+        match hist.iter_mut().find(|(v, _)| v == pc) {
+            Some((_, c)) => *c += 1,
+            None => hist.push((*pc, 1)),
+        }
+    }
+    hist.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let unique_pcs = hist.len();
+    let top_pc = hist.first().map(|(pc, c)| *pc).unwrap_or(0);
+    let top_hits = hist.first().map(|(_, c)| *c).unwrap_or(0);
+    let idle_fixed_pc = n >= 3 && top_hits * 10 >= n * 9; // >=90% at one PC
+    let top_symbol = nearest(top_pc).map(|(nm, _)| nm).unwrap_or_default();
+    let idle_like = idle_fixed_pc
+        && (top_symbol.contains("idle")
+            || top_symbol.contains("Idle")
+            || top_symbol.contains("wfi")
+            || top_symbol.contains("hash_nap")
+            || top_symbol.contains("machine_idle"));
+
+    let mut v = J::obj();
+    v.set("n_samples", J::n(n as f64));
+    v.set("pc_regnum", J::n(pc_regnum as f64));
+    v.set("kernel_sym_lo", J::s(format!("{kmin:#x}")));
+    v.set("kernel_sym_hi", J::s(format!("{kmax:#x}")));
+    v.set("pc_in_kernel_text", J::n(in_kernel as f64));
+    v.set("unique_pcs", J::n(unique_pcs as f64));
+    v.set("top_pc", J::s(format!("{top_pc:#x}")));
+    v.set("top_pc_hits", J::n(top_hits as f64));
+    v.set("top_pc_symbol", J::s(top_symbol.clone()));
+    v.set("kernel_idle_fixed_pc", J::b(idle_fixed_pc));
+    v.set("kernel_idle_symbol_match", J::b(idle_like));
+    let mut h = Vec::new();
+    for (pc, c) in hist.iter().take(12) {
+        let mut e = J::obj();
+        e.set("pc", J::s(format!("{pc:#x}")));
+        e.set("hits", J::n(*c as f64));
+        if let Some((nm, val)) = nearest(*pc) {
+            e.set("symbol", J::s(nm));
+            e.set("symbol_at", J::s(format!("{val:#x}")));
+        }
+        h.push(e);
+    }
+    v.set("pc_histogram", J::Arr(h));
+    let mut s = Vec::new();
+    for (pc, lr) in samples.iter() {
+        let mut e = J::obj();
+        e.set("pc", J::s(format!("{pc:#x}")));
+        e.set("lr", J::s(format!("{lr:#x}")));
+        s.push(e);
+    }
+    v.set("samples", J::Arr(s));
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------

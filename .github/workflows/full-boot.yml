@@ -381,9 +381,12 @@ jobs:
             --vnc 127.0.0.1:59 \
             --wallpaper wall/clownfish-1080x2400.png \
             --send "hello from the host" \
+            --thread-probe out-ctl/thread-probe.json \
             --secs 150 || true
           set -e
           cat out-ctl/emu-verdict.json 2>/dev/null || echo "(no emu verdict)"
+          echo "===== W4 vCPU PC probe at the park ====="
+          cat out-ctl/thread-probe.json 2>/dev/null || echo "(no thread probe)"
 
       - name: Screen-control gate
         run: |
