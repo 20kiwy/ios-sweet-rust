@@ -382,10 +382,13 @@ jobs:
             --wallpaper wall/clownfish-1080x2400.png \
             --send "hello from the host" \
             --thread-probe out-ctl/thread-probe.json \
+            --thread-probe-early out-ctl/thread-probe-early.json \
             --secs 150 || true
           set -e
           cat out-ctl/emu-verdict.json 2>/dev/null || echo "(no emu verdict)"
-          echo "===== W4 vCPU PC probe at the park ====="
+          echo "===== W4 vCPU PC probe: EARLY (pre-send, busy userland) ====="
+          cat out-ctl/thread-probe-early.json 2>/dev/null || echo "(no early probe)"
+          echo "===== W4 vCPU PC probe: LATE (at the park, send skipped) ====="
           cat out-ctl/thread-probe.json 2>/dev/null || echo "(no thread probe)"
 
       - name: Screen-control gate

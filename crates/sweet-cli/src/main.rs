@@ -278,6 +278,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
             "ipsw", "wallpaper", "wallpaper-manifest", "send", "secs", "cpu",
             "strip", "logo-scale", "qemu-datadir", "kernel", "ramdisk",
             "cmdline", "product", "snap-every", "vnc", "thread-probe",
+            "thread-probe-early", "send-force",
         ],
         "emu-peek" => vec!["addr", "len", "secs", "cpu"],
         "kernel-unpack" => vec![],
@@ -1212,7 +1213,7 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
     // payload.bin from disk; in-RAM copies are dead weight from here on.
     // (The W4 thread-probe still symbolizes from these — parsed BEFORE the
     // drop; 70k symbols are a few MB, not a 4 GB kernel copy.)
-    let kernel_syms = if f.has("thread-probe") {
+    let kernel_syms = if f.has("thread-probe") || f.has("thread-probe-early") {
         sc::macho::symbols(&kernel).unwrap_or_default()
     } else {
         Vec::new()
@@ -1277,15 +1278,50 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
     let (p2, fb2) = sess.shot("fb-stage2-wallpaper.png")?;
     eprintln!("[*] stage2 -> {}", p2.display());
 
-    // 9. CONTROL ACTION: type into the guest UART
-    sess.serial.send(send_text.as_bytes())?;
-    verdict.set("sent_text", J::s(send_text.clone()));
+    // 9. CONTROL ACTION: type into the guest UART.
+    //     REAL mode: SKIPPED by default — the SWEET kernel treats console
+    //     input as a debugger entry (measured 997b18b: 12/12 vCPU samples
+    //     parked in _handle_debugger_trap after the send) and never comes
+    //     back, poisoning every later measurement. Pass --send-force to
+    //     deliberately drive the debug console (its own experiment).
+    let send_text_effective = if real && send_text != "hello from the host" {
+        send_text.clone()
+    } else if real {
+        String::new() // skipped
+    } else {
+        send_text.clone()
+    };
+    let send_text_effective = if real && f.has("send-force") { send_text.clone() } else { send_text_effective };
+    if !send_text_effective.is_empty() {
+        sess.serial.send(send_text_effective.as_bytes())?;
+    }
+    verdict.set("sent_text", J::s(if send_text_effective.is_empty() {
+        "(skipped: real-mode debug-console park, see --thread-probe evidence)".to_string()
+    } else {
+        send_text_effective.clone()
+    }));
     let t0 = std::time::Instant::now();
     while t0.elapsed().as_secs_f64() < 4.0 {
         sess.serial.pump()?;
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let (p3, fb3) = sess.shot("fb-stage3-input.png")?;
+
+    // 9c. W4 causality probe: sample the vCPU BEFORE any UART traffic in
+    //     this session — the A/B arm against the late probe (--thread-probe).
+    if let Some(tp) = f.val("thread-probe-early") {
+        match probe_vcpu_pcs(&mut sess, gdb_port, kernel_syms.clone(), 8, 400) {
+            Ok(probe) => {
+                write_json(Path::new(tp), &probe)?;
+                eprintln!("[thread-probe-early] {}", probe.dump());
+                verdict.set("thread_probe_early", J::s(tp));
+            }
+            Err(e) => {
+                eprintln!("[thread-probe-early] failed: {e}");
+                verdict.set("thread_probe_early", J::s(format!("failed: {e}")));
+            }
+        }
+    }
     eprintln!("[*] stage3 -> {}", p3.display());
 
     // 9b. REAL mode: let the boot run on and take a mid-flight screenshot
