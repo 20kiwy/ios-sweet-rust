@@ -955,3 +955,229 @@ fn empty_btree_header_node(node_size: usize, max_key: u16) -> Vec<u8> {
     n[o..o + 2].copy_from_slice(&((14 + 106 + 128 + 128) as u16).to_be_bytes());
     n
 }
+
+// ---------------------------------------------------------------------------
+// Read side (W4): parse an image THIS writer (or mkfs-compatible HFSX)
+// produced — the md0 ramdisk dump. The daemons' os_log goes to logd, which
+// persists tracev3 under /var/db/diagnostics on the volume; extracting those
+// files is the "next visibility tool" (RESEARCH-SPRINGBOARD.md, MACH wall).
+// Case-sensitive HFSX ('HX'), binary-compare keys, 4096-byte blocks/nodes —
+// the exact layout `finish()` writes, verified against it.
+// ---------------------------------------------------------------------------
+
+/// One catalog record of a parsed image.
+pub struct HfsEntry {
+    pub path: String,
+    pub cnid: u32,
+    pub is_dir: bool,
+    pub size: u64,
+    /// data-fork extents as (start_block, block_count) in `BLOCK` units
+    pub extents: Vec<(u32, u32)>,
+}
+
+pub struct HfsReader<'a> {
+    img: &'a [u8],
+    block_size: usize,
+    first_leaf: i32,
+    node_size: usize,
+}
+
+const ND_KIND_LEAF: i8 = -1;
+
+impl<'a> HfsReader<'a> {
+    /// Parse the volume header + catalog B-tree parameters.
+    pub fn open(img: &'a [u8]) -> Result<Self> {
+        if img.len() < 2048 {
+            bail!("image too small for an HFS+ volume header");
+        }
+        let vh = 1024usize;
+        let sig = u16::from_be_bytes(img[vh..vh + 2].try_into().unwrap());
+        if sig != VH_SIG {
+            bail!("not an HFSX volume (sig {sig:#x})");
+        }
+        let block_size = u32::from_be_bytes(img[vh + 0x28..vh + 0x2c].try_into().unwrap()) as usize;
+        if block_size == 0 || block_size > 1 << 20 {
+            bail!("bad block size {block_size}");
+        }
+        let cat_start =
+            u32::from_be_bytes(img[vh + 0x120..vh + 0x124].try_into().unwrap()) as u64;
+        let cat_len = u64::from_be_bytes(img[vh + 0x110..vh + 0x118].try_into().unwrap());
+        let cat_off = cat_start * block_size as u64;
+        if cat_len == 0 || cat_off + 64 > img.len() as u64 {
+            bail!("catalog fork out of range (start {cat_start}, len {cat_len})");
+        }
+        let c = &img[cat_off as usize..];
+        // BTHeaderRec at node 0 + 14: treeDepth u16, rootNode u32 @+16,
+        // leafRecords u32 @+20, firstLeafNode i32 @+24, nodeSize u16 @+32.
+        let node_size =
+            u16::from_be_bytes(c[14 + 18..14 + 20].try_into().unwrap()) as usize;
+        if node_size < 512 || node_size > 32768 || (node_size & (node_size - 1)) != 0 {
+            bail!("bad catalog node size {node_size}");
+        }
+        let first_leaf = i32::from_be_bytes(c[14 + 10..14 + 14].try_into().unwrap());
+        Ok(Self { img, block_size, first_leaf, node_size })
+    }
+
+    fn node(&self, n: u32) -> Result<&'a [u8]> {
+        let cat_start =
+            u32::from_be_bytes(self.img[1024 + 0x120..1024 + 0x124].try_into().unwrap()) as u64;
+        let off = cat_start * self.block_size as u64 + n as u64 * self.node_size as u64;
+        if off + self.node_size as u64 > self.img.len() as u64 {
+            bail!("catalog node {n} out of range");
+        }
+        Ok(&self.img[off as usize..off as usize + self.node_size])
+    }
+
+    /// Every catalog file/folder record (thread records skipped), paths
+    /// assembled from the parent chain (writer-parity: root = cnid 2).
+    pub fn entries(&self) -> Result<Vec<HfsEntry>> {
+        // cnid -> (parent, name)
+        let mut byid: std::collections::HashMap<u32, (u32, String)> =
+            std::collections::HashMap::new();
+        let mut raw: Vec<(u32, u32, String, bool, u64, Vec<(u32, u32)>)> = Vec::new();
+        let mut n = self.first_leaf;
+        let mut hops = 0usize;
+        while n >= 0 {
+            hops += 1;
+            if hops > 1_000_000 {
+                bail!("catalog leaf chain does not terminate");
+            }
+            let node = self.node(n as u32)?;
+            let num_rec =
+                u16::from_be_bytes(node[10..12].try_into().unwrap()) as usize;
+            let f_link = u32::from_be_bytes(node[0..4].try_into().unwrap());
+            for i in 0..num_rec {
+                // record offsets are u16s packed at the END of the node
+                let ro = self.node_size - (i + 1) * 2;
+                let rec_off =
+                    u16::from_be_bytes(node[ro..ro + 2].try_into().unwrap()) as usize;
+                if rec_off + 2 > node.len() {
+                    continue;
+                }
+                let klen = u16::from_be_bytes(
+                    node[rec_off..rec_off + 2].try_into().unwrap(),
+                ) as usize;
+                let data = rec_off + 2 + klen;
+                if data + 2 > node.len() {
+                    continue;
+                }
+                let rtype = u16::from_be_bytes(node[data..data + 2].try_into().unwrap());
+                // key: parentID u32 BE + HFSUniStr255 (len u16 BE + UTF-16BE)
+                let key = rec_off + 2;
+                if klen < 6 || key + klen > node.len() {
+                    continue;
+                }
+                let parent =
+                    u32::from_be_bytes(node[key..key + 4].try_into().unwrap());
+                let nlen = u16::from_be_bytes(
+                    node[key + 4..key + 6].try_into().unwrap(),
+                ) as usize;
+                if key + 6 + nlen * 2 > key + klen {
+                    continue;
+                }
+                let name: String = (0..nlen)
+                    .map(|j| {
+                        let o = key + 6 + j * 2;
+                        u16::from_be_bytes(node[o..o + 2].try_into().unwrap())
+                    })
+                    .filter(|&u| (0x20..0x7f).contains(&u))
+                    .map(|u| u as u8 as char)
+                    .collect();
+                match rtype {
+                    REC_FOLDER => {
+                        let cnid =
+                            u32::from_be_bytes(node[data + 8..data + 12].try_into().unwrap());
+                        byid.insert(cnid, (parent, name.clone()));
+                        raw.push((cnid, parent, name, true, 0, vec![]));
+                    }
+                    REC_FILE => {
+                        let cnid =
+                            u32::from_be_bytes(node[data + 8..data + 12].try_into().unwrap());
+                        // HFSPlusCatalogFile: dataFork at +88; fork_data:
+                        // logicalSize u64 @0, extents @16 (8 x {start,count})
+                        let size = u64::from_be_bytes(
+                            node[data + 88..data + 96].try_into().unwrap(),
+                        );
+                        let mut extents = Vec::new();
+                        for e in 0..8 {
+                            let o = data + 88 + 16 + e * 8;
+                            let st = u32::from_be_bytes(
+                                node[o..o + 4].try_into().unwrap(),
+                            );
+                            let ct = u32::from_be_bytes(
+                                node[o + 4..o + 8].try_into().unwrap(),
+                            );
+                            if ct > 0 {
+                                extents.push((st, ct));
+                            }
+                        }
+                        byid.insert(cnid, (parent, name.clone()));
+                        raw.push((cnid, parent, name, false, size, extents));
+                    }
+                    _ => {} // thread records carry no data we need
+                }
+            }
+            if f_link == 0 {
+                break;
+            }
+            n = f_link as i32;
+        }
+        let mut out = Vec::with_capacity(raw.len());
+        for (cnid, parent, name, is_dir, size, extents) in raw {
+            let mut parts: Vec<&str> = vec![name.as_str()];
+            let mut p = parent;
+            let mut guard = 0usize;
+            while p != ROOT_ID {
+                guard += 1;
+                if guard > 512 {
+                    break; // dangling chain: report under a placeholder
+                }
+                match byid.get(&p) {
+                    Some(&(pp, ref pn)) => {
+                        parts.push(pn.as_str());
+                        p = pp;
+                    }
+                    None => break,
+                }
+            }
+            parts.reverse();
+            out.push(HfsEntry {
+                path: format!("/{}", parts.join("/")),
+                cnid,
+                is_dir,
+                size,
+                extents,
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// Read a file's data fork through its extent list.
+    pub fn read(&self, extents: &[(u32, u32)], size: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(size as usize);
+        for (start, count) in extents {
+            let off = *start as u64 * self.block_size as u64;
+            let len = *count as u64 * self.block_size as u64;
+            if off + len > self.img.len() as u64 {
+                break;
+            }
+            out.extend_from_slice(&self.img[off as usize..(off + len) as usize]);
+        }
+        out.truncate(size as usize);
+        out
+    }
+
+    /// All files whose path starts with `prefix`, as (entry, data).
+    pub fn extract_prefix(&self, prefix: &str, max_file: u64) -> Result<Vec<(HfsEntry, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for e in self.entries()? {
+            let take = !e.is_dir && e.path.starts_with(prefix) && e.size <= max_file;
+            if take {
+                let data = self.read(&e.extents, e.size);
+                out.push((e, data));
+            }
+        }
+        Ok(out)
+    }
+}

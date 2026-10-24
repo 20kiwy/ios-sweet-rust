@@ -240,6 +240,11 @@ jobs:
             strings -n 8 "$D" | grep -anE 'launchd.log|boot-task|UMD_INIT|com.apple.xpc' | head -80 \
               > out-m3/guest-launchd-peek.txt || true
             tail -c 200000 "$D" | strings -n 12 > out-m3/guest-strings-tail.txt || true
+            # W4: the daemons' own logs — logd persists os_log as tracev3
+            # under /var/db/diagnostics. Extract with the HFS+ reader.
+            ./target/release/sweet-rust md0-logs "$D" --out out-m3/diag --max-file 64 \
+              > out-m3/diag-listing.txt 2>&1 || true
+            head -40 out-m3/diag-listing.txt || true
           else
             echo "no md0 dump (boot exited early?)"
           fi
@@ -356,6 +361,8 @@ jobs:
             out-m3/guest-strings.txt
             out-m3/guest-launchd-peek.txt
             out-m3/guest-strings-tail.txt
+            out-m3/diag-listing.txt
+            out-m3/diag*
             fsck.log
             fsck-summary.txt
           retention-days: 30

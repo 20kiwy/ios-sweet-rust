@@ -102,6 +102,12 @@ COMMANDS:
         Write the physical RAM image (segments + ADT + boot_args) without
         running QEMU - for debugging loaders.
 
+    md0-logs <md0-dump.img> [--out DIR] [--prefix /var/db/diagnostics]
+        [--max-file MB]
+        Extract files from an md0 HFS+ dump (W4 daemon logs: logd's
+        tracev3 under /var/db/diagnostics). Prints the matching paths;
+        writes them under --out with '/' -> '__' in names.
+
     boot-qemu <PAYLOAD> <OUTDIR> [--secs 20] [--cpu cortex-a76] [--gdb]
               [--sweet-devices] [--vnc 127.0.0.1:5901]
         [--snap-every N]  # interval fb screenshots while the guest runs
@@ -248,6 +254,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "boot-qemu" => cmd_boot_qemu(rest),
         "macho-sym" => cmd_macho_sym(rest),
         "place-image" => cmd_place_image(rest),
+        "md0-logs" => cmd_md0_logs(rest),
         "ipsw-boot" => cmd_ipsw_boot(rest),
         other => {
             eprintln!("unknown command {other:?} (see --help)");
@@ -279,6 +286,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "make-bootimg" => vec!["kernel", "ramdisk", "dtb", "cmdline", "o"],
         "logo-extract" | "inject-logo" => vec![],
         "fb-render" => vec!["w", "h", "logo-scale"],
+        "md0-logs" => vec!["out", "prefix", "max-file"],
         "demo-kernel" => vec!["color", "strip", "png"],
         "hello-extract" => vec!["lang", "ipsw"],
         "mkiosroot" => vec!["os", "systemos", "appos", "profile", "out"],
@@ -1748,6 +1756,34 @@ fn cmd_boot_qemu(args: &[String]) -> Result<()> {
 
 /// Debug/diagnostic: lay a payload out at its physical addresses (the RAM
 /// image QEMU loads) without running QEMU.
+/// md0-logs: extract daemon-log files from an md0 HFS+ dump (W4). logd
+/// persists the daemons' os_log as tracev3 under /var/db/diagnostics — the
+/// MACH-wall diagnosis reads backboardd's own words from there.
+fn cmd_md0_logs(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("md0-logs"));
+    let Some(path) = f.rest.first() else {
+        bail!("usage: md0-logs <md0-dump.img> [--out DIR] [--prefix P] [--max-file MB]");
+    };
+    let prefix = f.val("prefix").unwrap_or_else(|| "/var/db/diagnostics".into());
+    let max_mb: u64 = f.val("max-file").and_then(|v| v.parse().ok()).unwrap_or(64);
+    let out_dir = f.val("out").unwrap_or_else(|| "md0-logs-out".into());
+    let img = std::fs::read(path)?;
+    let r = sc::hfs::HfsReader::open(&img)?;
+    let mut n = 0usize;
+    for (e, data) in r.extract_prefix(&prefix, max_mb * 1024 * 1024)? {
+        let safe = e.path.trim_start_matches('/').replace('/', "__");
+        let dst = std::path::Path::new(&out_dir).join(&safe);
+        if let Some(p) = dst.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        std::fs::write(&dst, &data)?;
+        println!("{:>10}  {}", data.len(), e.path);
+        n += 1;
+    }
+    eprintln!("[md0-logs] {n} file(s) extracted to {out_dir} (prefix {prefix:?})");
+    Ok(())
+}
+
 fn cmd_place_image(args: &[String]) -> Result<()> {
     if args.len() < 2 {
         bail!("usage: place-image <PAYLOAD> <OUT.ram.bin>");
