@@ -109,10 +109,14 @@ COMMANDS:
     ipsw-boot --ipsw IPSW|URL <OUTDIR> [--kernel K | --demo] [--ramdisk IMAGE]
         [--cmdline \"...\"] [--secs 120] [--product FILE.adt] [--logo-scale 33]
         [--cpu MODEL] [--no-logo] [--live-serial] [--snap-every N]
+        [--display-adt] [--sweet-devices] [--highmem] [--lowmem]
         The full pipeline in one command: IPSW -> logo asset + (kernelcache |
         demo kernel) -> payload -> logo injection -> QEMU -> fb.png +
         boot-verdict.json. Verdict checks: logo visible, serial marker,
-        panic watch.
+        panic watch. --display-adt builds the REAL D22AP display subtree
+        (disp0/dart-disp0/mipi-dsim) into the ADT; --sweet-devices boots on
+        the qemu-sweet fork (build qemu-sweet/ first, fork in PATH) with the
+        three display-path devices attached. Requires the fork when set.
 
     --help | -h       this text
     --version         print version
@@ -256,7 +260,8 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "adt-dump" => vec!["out"],
         "emu-boot" => vec![
             "ipsw", "wallpaper", "wallpaper-manifest", "send", "secs", "cpu",
-            "strip", "logo-scale", "qemu-datadir",
+            "strip", "logo-scale", "qemu-datadir", "kernel", "ramdisk",
+            "cmdline", "product", "snap-every",
         ],
         "emu-peek" => vec!["addr", "len", "secs", "cpu"],
         "kernel-unpack" => vec![],
@@ -1053,7 +1058,7 @@ fn fb_diff_pixels(a: &[u8], b: &[u8], row_from: u32, row_to: u32) -> u64 {
 fn cmd_emu_boot(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("emu-boot"));
     if f.rest.is_empty() {
-        bail!("usage: emu-boot --ipsw IPSW|URL <OUTDIR> [--wallpaper PNG] [--send TEXT] [--secs 60]");
+        bail!("usage: emu-boot --ipsw IPSW|URL <OUTDIR> [--wallpaper PNG] [--send TEXT] [--secs 60] | real boot: [--kernel K --ramdisk R --cmdline \"...\" --display-adt --sweet-devices --highmem --product DT]");
     }
     let ipsw_src = f.val("ipsw").ok_or_else(|| sc::Error::Msg("--ipsw required".into()))?;
     let outdir = PathBuf::from(f.rest[0]);
@@ -1112,47 +1117,102 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
         wall_bgra = Some(bgra);
     }
 
-    // 3. Interactive kernel (polls the UART; paints input onto the strip)
-    let kernel = demo::macho_interactive(0x30c040, strip_rows)?;
-    verdict.set("kernel_source", J::s("demo-interactive"));
+    // 3. kernel: REAL (user file — the "explore the real boot" live control
+    //    session: QMP + gdbstub + serial socket against the SWEET kernel) or
+    //    the interactive demo kernel (control-plane self-test).
+    let real = f.val("kernel").is_some();
+    let kernel: Vec<u8> = if let Some(k) = f.val("kernel") {
+        verdict.set("kernel_source", J::s(k));
+        std::fs::read(k)?
+    } else {
+        verdict.set("kernel_source", J::s("demo-interactive"));
+        demo::macho_interactive(0x30c040, strip_rows)?
+    };
     let strip_top = FB_H.saturating_sub(strip_rows);
 
-    // 4. ADT + payload (lowmem: fits 2G guest RAM on small hosts)
+    // 4. ADT + payload.  Demo: lowmem (fits 2G guest RAM on small hosts).
+    //    Real: --highmem for the multi-GB md0 (mini-root), --product for the
+    //    real MobileGestalt identity, --display-adt for the D22AP display
+    //    subtree, --cmdline for the proven boot args, --sweet-devices for
+    //    the qemu-sweet fork devices.
+    let phys_override = if real && f.has("highmem") {
+        Some((mkadt::HIGH_PHYS_BASE, mkadt::HIGH_MEM_SIZE))
+    } else {
+        Some((mkadt::LOW_PHYS_BASE, mkadt::LOW_MEM_SIZE))
+    };
+    let product = if real {
+        f.val("product")
+            .map(|p| -> Result<Vec<(String, Vec<u8>)>> {
+                let buf = load_adtish(Path::new(p))?;
+                mkadt::d22ap_product(&buf)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let root = mkadt::build(&AdtOptions {
         qemu: true,
-        product: None,
-        phys_override: Some((mkadt::LOW_PHYS_BASE, mkadt::LOW_MEM_SIZE)),
+        product: product.as_deref(),
+        phys_override,
+        display: f.has("display-adt"),
         ..Default::default()
     })?;
     let adt_blob = adt::serialize(&root);
     ipsw::save(&outdir.join("qemu.adt"), &adt_blob)?;
-    let (pl, info) = payload::build(&kernel, &adt_blob, "debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0", None)?;
+    let cmdline = f
+        .val("cmdline")
+        .unwrap_or("debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0")
+        .to_string();
+    let ramdisk = f.val("ramdisk").map(|p| std::fs::read(p)).transpose()?;
+    let (pl, info) = payload::build(&kernel, &adt_blob, &cmdline, ramdisk.as_deref())?;
     let payload_path = outdir.join("payload.bin");
     ipsw::save(&payload_path, &pl)?;
     eprintln!("{}", info.summary());
+    // 16GB-runner lesson (same as cmd_ipsw_boot): the loader reads
+    // payload.bin from disk; in-RAM copies are dead weight from here on.
+    drop(pl);
+    drop(ramdisk);
+    drop(kernel);
+    drop(adt_blob);
+    if f.has("display-adt") {
+        verdict.set("adt_display_subtree", J::b(true));
+    }
+    if f.has("sweet-devices") {
+        verdict.set("sweet_devices", J::b(true));
+    }
 
-    // 5. Boot the live session
+    // 5. Boot the live session (fork QEMU comes from PATH when
+    //    --sweet-devices is set — same contract as boot-qemu).
     let gdb_port = sc::control::free_tcp_port()?;
     let sock = outdir.join("serial.sock");
     let opts = RunOptions {
         secs,
         cpu: f.val("cpu").unwrap_or("cortex-a76").to_string(),
-        logo: logo_blob.clone(),
+        logo: if f.has("no-logo") { None } else { logo_blob.clone() },
         serial_sock: Some(sock),
         ram_file: Some(outdir.join("ram.mmap")),
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
+        sweet_devices: f.has("sweet-devices"),
         ..Default::default()
     };
     let mut sess = sc::control::Session::boot(&payload_path, &outdir, &opts, gdb_port)?;
     let mut pass = true;
 
-    // 6. Wait for the interactive kernel marker. If the socket connect raced
-    //    the boot-time banner, Enter makes the guest reprint it.
+    // 6. Marker / liveness.  Demo: the interactive kernel banner.  Real:
+    //    the kernel never prints to the UART (console goes to the FB), so
+    //    liveness = the guest drew on the framebuffer during the window.
     let marker = "SWEET-RUST interactive kernel OK";
-    let mut marker_ok = sess.serial.wait_marker(marker, 8.0);
-    if !marker_ok {
-        let _ = sess.serial.send(b"\n");
-        marker_ok = sess.serial.wait_marker(marker, 15.0);
+    let mut marker_ok = false;
+    if real {
+        // let the kernel get through early boot before the control actions
+        eprintln!("[*] real boot: giving the kernel {}s of head start", 15.0);
+        std::thread::sleep(std::time::Duration::from_secs_f64(15.0));
+    } else {
+        marker_ok = sess.serial.wait_marker(marker, 8.0);
+        if !marker_ok {
+            let _ = sess.serial.send(b"\n");
+            marker_ok = sess.serial.wait_marker(marker, 15.0);
+        }
     }
     verdict.set("serial_marker", J::b(marker_ok));
 
@@ -1180,6 +1240,19 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
     let (p3, fb3) = sess.shot("fb-stage3-input.png")?;
     eprintln!("[*] stage3 -> {}", p3.display());
 
+    // 9b. REAL mode: let the boot run on and take a mid-flight screenshot
+    //     (the timeline evidence for what the guest painted on its own).
+    let (p4, fb4) = if real {
+        let mid = (secs - 15.0 - 10.0).clamp(5.0, 90.0);
+        eprintln!("[*] real boot: running on for another {mid:.0}s before the mid-flight shot");
+        std::thread::sleep(std::time::Duration::from_secs_f64(mid));
+        let (p, fb) = sess.shot("fb-stage4-boot.png")?;
+        eprintln!("[*] stage4 -> {}", p.display());
+        (Some(p), Some(fb))
+    } else {
+        (None, None)
+    };
+
     // 10. verdicts
     let stride = FB_STRIDE_US as usize;
     let lum1 = mean_luminance(&fb1, 0, FB_H / 3);
@@ -1190,21 +1263,40 @@ fn cmd_emu_boot(args: &[String]) -> Result<()> {
     let input_visible = fb_diff_pixels(&fb2, &fb3, strip_top, FB_H) > 8;
     // raw BGRA corner bytes of the word 0xff30c040 (little endian)
     let corner_ok = fb1.len() >= 4 && fb1[0..4] == [0x40, 0xc0, 0x30, 0xff];
-    verdict.set("kernel_alive", J::b(marker_ok || corner_ok || input_echoed));
-    verdict.set("fb_corner_marker", J::b(corner_ok));
-    verdict.set("logo_visible", J::b(logo_visible));
-    verdict.set("wallpaper_visible", J::b(wallpaper_visible));
-    verdict.set("input_echoed", J::b(input_echoed));
-    verdict.set("input_visible", J::b(input_visible));
+    if real {
+        // REAL-mode verdict: the HOST control plane works against the real
+        // boot — wallpaper paint landed on the guest FB, the guest painted
+        // on its own afterwards (kernel console output), the session lived
+        // to the end.  Demo-only markers do not apply.
+        let guest_painted = match &fb4 {
+            Some(fb4) => fb_mean_abs_diff(&fb3, fb4) > 0.5,
+            None => false,
+        };
+        let session_alive = sess.child_handshake_ok();
+        verdict.set("wallpaper_painted", J::b(fb_mean_abs_diff(&fb1, &fb2) > 8.0));
+        verdict.set("guest_painted", J::b(guest_painted));
+        verdict.set("session_alive", J::b(session_alive));
+        verdict.set("stage4", J::s(p4.as_ref().map(|p| p.display().to_string()).unwrap_or_default()));
+        pass = session_alive
+            && fb_mean_abs_diff(&fb1, &fb2) > 8.0
+            && (marker_ok || guest_painted || input_echoed);
+    } else {
+        verdict.set("kernel_alive", J::b(marker_ok || corner_ok || input_echoed));
+        verdict.set("fb_corner_marker", J::b(corner_ok));
+        verdict.set("logo_visible", J::b(logo_visible));
+        verdict.set("wallpaper_visible", J::b(wallpaper_visible));
+        verdict.set("input_echoed", J::b(input_echoed));
+        verdict.set("input_visible", J::b(input_visible));
+        pass = pass
+            && (marker_ok || corner_ok)
+            && wallpaper_visible
+            && (wall_bgra.is_none() || input_visible || input_echoed);
+    }
     verdict.set("serial_tail", J::s({
         let t = sess.serial.text();
         let cut = t.len().saturating_sub(400);
         t[cut..].to_string()
     }));
-    pass = pass
-        && (marker_ok || corner_ok)
-        && wallpaper_visible
-        && (wall_bgra.is_none() || input_visible || input_echoed);
 
     sess.kill();
     verdict.set("pass", J::b(pass));
@@ -1637,7 +1729,7 @@ fn cmd_place_image(args: &[String]) -> Result<()> {
 fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
     let f = Flags::parse(args, &value_flags("ipsw-boot"));
     if f.rest.is_empty() {
-        bail!("usage: ipsw-boot --ipsw IPSW|URL <OUTDIR> [--kernel K | --demo] [--ramdisk R] [--highmem] [--cmdline ...] [--secs 120]");
+        bail!("usage: ipsw-boot --ipsw IPSW|URL <OUTDIR> [--kernel K | --demo] [--ramdisk R] [--highmem] [--cmdline ...] [--secs 120] [--display-adt] [--sweet-devices]");
     }
     let ipsw_src = f.val("ipsw").ok_or_else(|| sc::Error::Msg("--ipsw required".into()))?;
     let outdir = PathBuf::from(f.rest[0]);
@@ -1726,10 +1818,14 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         qemu: true,
         product: product.as_deref(),
         phys_override,
+        display: f.has("display-adt"),
         ..Default::default()
     })?;
     let adt_blob = adt::serialize(&root);
     ipsw::save(&outdir.join("qemu.adt"), &adt_blob)?;
+    if f.has("display-adt") {
+        verdict.set("adt_display_subtree", J::b(true));
+    }
 
     // 4. payload (+ ramdisk)
     let ramdisk = f.val("ramdisk").map(|p| std::fs::read(p)).transpose()?;
@@ -1758,8 +1854,12 @@ fn cmd_ipsw_boot(args: &[String]) -> Result<()> {
         snap_every: f.val("snap-every").and_then(|v| v.parse().ok()),
         logo: if f.has("no-logo") { None } else { logo_blob.clone() },
         qemu_datadir: f.val("qemu-datadir").map(|d| vec![d.to_string()]).unwrap_or_default(),
+        sweet_devices: f.has("sweet-devices"),
         ..Default::default()
     };
+    if f.has("sweet-devices") {
+        verdict.set("sweet_devices", J::b(true));
+    }
     if let Some(hmps) = f.val("hmp") {
         opts.hmp = hmps.split(';').map(|s| s.to_string()).collect();
     }

@@ -356,6 +356,11 @@ impl Session {
         Ok(())
     }
 
+    /// Is the VM still alive? (a QMP connect + handshake round trip)
+    pub fn child_handshake_ok(&self) -> bool {
+        self.q().is_ok()
+    }
+
     pub fn cont(&self) -> Result<()> {
         self.q()?.hmp("cont")?;
         Ok(())
