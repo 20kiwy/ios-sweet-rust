@@ -48,6 +48,10 @@ COMMANDS:
         Parse the arm64 slice of a (FAT or thin) Mach-O: cputype, segments,
         and every LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB.
 
+    macho-sym <FILE> [PATTERN]
+        Defined symbols of the arm64 slice (native llvm-nm --defined-only
+        parity; no external tool). Prints VALUE NAME lines.
+
     kc-kexts <KERNELCACHE.macho> [--out FILE.md]
         Parse the prelinked kernelcache __PRELINK_INFO plist: every kext
         (bundle id, path, load addr) + IOKitPersonalities (IONameMatch,
@@ -242,6 +246,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "inject-logo" => cmd_inject_logo(rest),
         "demo-kernel" => cmd_demo_kernel(rest),
         "boot-qemu" => cmd_boot_qemu(rest),
+        "macho-sym" => cmd_macho_sym(rest),
         "place-image" => cmd_place_image(rest),
         "ipsw-boot" => cmd_ipsw_boot(rest),
         other => {
@@ -280,7 +285,7 @@ fn value_flags(cmd: &str) -> Vec<&'static str> {
         "decmp-dump" => vec!["member", "out", "bytes", "scan", "rsrc"],
         "rootfs-plan" => vec![],
         "screen-decode" => vec!["kernel", "payload", "nm"],
-        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "snap-every", "vnc"],
+        "boot-qemu" => vec!["secs", "cpu", "logo", "logo-ipsw", "qemu-datadir", "hmp", "msgbuf-dump", "snap-every", "vnc"],
         // --sweet-devices and --display are boolean flags (Flags::has)
         "ipsw-boot" => vec![
             "ipsw", "kernel", "ramdisk", "cmdline", "secs", "product",
@@ -883,6 +888,29 @@ fn cmd_macho_deps(args: &[String]) -> Result<()> {
     for d in &m.dylibs {
         println!("  {d}");
     }
+    Ok(())
+}
+
+/// macho-sym: defined symbols of the arm64 slice (native `llvm-nm
+/// --defined-only` parity). `macho-sym <KERNEL> [PATTERN]` prints
+/// `VALUE NAME` — the W2 msgbuf/`_msgbufp` and font lookups without any
+/// external tool.
+fn cmd_macho_sym(args: &[String]) -> Result<()> {
+    let f = Flags::parse(args, &value_flags("macho-sym"));
+    let Some(path) = f.rest.first() else {
+        bail!("usage: macho-sym <MACHO> [SYMBOL-PATTERN]");
+    };
+    let buf = std::fs::read(path)?;
+    let syms = sc::macho::symbols(&buf)?;
+    let pat = f.rest.get(1).cloned().unwrap_or_default();
+    let mut n = 0usize;
+    for (name, value) in &syms {
+        if pat.is_empty() || name.contains(&pat) {
+            println!("{value:#x} {name}");
+            n += 1;
+        }
+    }
+    eprintln!("[macho-sym] {n} symbol(s) matching {pat:?} (total {})", syms.len());
     Ok(())
 }
 
@@ -1694,6 +1722,10 @@ fn cmd_boot_qemu(args: &[String]) -> Result<()> {
     };
     if let Some(hmps) = f.val("hmp") {
         opts.hmp = hmps.split(';').map(|s| s.to_string()).collect();
+    }
+    if let Some(mb) = f.val("msgbuf-dump") {
+        opts.msgbufp = Some(u64::from_str_radix(mb.trim_start_matches("0x"), 16)
+            .map_err(|e| sc::Error::Msg(format!("--msgbuf-dump: {e}")))?);
     }
     if let Some(logo_path) = f.val("logo") {
         opts.logo = Some(std::fs::read(logo_path)?);

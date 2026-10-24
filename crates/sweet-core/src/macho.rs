@@ -239,6 +239,78 @@ pub fn parse(buf: &[u8]) -> Result<Macho> {
     Ok(m)
 }
 
+/// Every DEFINED symbol of the arm64 slice as `(name, value)` — the native
+/// `llvm-nm --defined-only` parity (W2: the external tool was a sandbox/CI
+/// trap; the kernel's LC_SYMTAB is right there and we already parse Mach-O).
+///
+/// Only `n_type & N_TYPE != 0` entries are reported (defined absolute /
+/// section / prebound-undefined-with-value); pure debug (`N_SO`/`N_FUN`) and
+/// undefined entries are skipped, matching `nm --defined-only` output that
+/// `extract_font`/`screen-decode` previously consumed.
+pub fn symbols(buf: &[u8]) -> Result<Vec<(String, u64)>> {
+    const LC_SYMTAB: u32 = 0x2;
+    const N_TYPE: u8 = 0x0e;
+    let (off, size, _) = fat_slice_arm64(buf)?;
+    let s = &buf[off..off + size];
+    if s.len() < 32 || u32le(s, 0) != MH_MAGIC_64 {
+        bail!("not a 64-bit Mach-O");
+    }
+    let ncmds = u32le(s, 16) as usize;
+    let mut symoff = 0usize;
+    let mut nsyms = 0usize;
+    let mut stroff = 0usize;
+    let mut strsize = 0usize;
+    let mut p = 32usize;
+    for _ in 0..ncmds {
+        if p + 8 > s.len() {
+            bail!("truncated load command at {p:#x}");
+        }
+        let cmd = u32le(s, p);
+        let cmdsize = u32le(s, p + 4) as usize;
+        if cmdsize < 8 || p + cmdsize > s.len() {
+            bail!("bad load command size {cmdsize} at {p:#x}");
+        }
+        if cmd == LC_SYMTAB && cmdsize >= 24 {
+            symoff = u32le(s, p + 8) as usize;
+            nsyms = u32le(s, p + 12) as usize;
+            stroff = u32le(s, p + 16) as usize;
+            strsize = u32le(s, p + 20) as usize;
+            break;
+        }
+        p += cmdsize;
+    }
+    if nsyms == 0 || stroff == 0 || symoff == 0 {
+        bail!("arm64 slice has no LC_SYMTAB (stripped kernel?)");
+    }
+    let strtab_end = (stroff + strsize).min(s.len());
+    let mut out = Vec::new();
+    for i in 0..nsyms {
+        let e = symoff + i * 16;
+        if e + 16 > s.len() {
+            break;
+        }
+        let n_type = s[e + 4];
+        if n_type & N_TYPE == 0 {
+            continue; // undefined or debug entry (local defined keep: N_TYPE!=0)
+        }
+        let n_strx = u32le(s, e) as usize;
+        if n_strx == 0 || stroff + n_strx >= strtab_end {
+            continue;
+        }
+        let name_end = s[stroff + n_strx..strtab_end]
+            .iter()
+            .position(|&c| c == 0)
+            .map(|p| stroff + n_strx + p)
+            .unwrap_or(strtab_end);
+        let name = std::str::from_utf8(&s[stroff + n_strx..name_end]).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        out.push((name.to_string(), u64le(s, e + 8)));
+    }
+    Ok(out)
+}
+
 /// Rewritten pointer count returned alongside the mutated buffer.
 pub fn apply_chained_fixups(buf: &mut [u8], m: &Macho) -> Result<usize> {
     let Some((data_off, _)) = m.fixups else { return Ok(0) };

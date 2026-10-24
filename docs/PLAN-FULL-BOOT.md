@@ -68,31 +68,51 @@ Caveat: the IPSW-cache upload makes the artifact ~6 GB; the run takes
 ~1 h wall on the fallback runner (fork build + 6.6 GB IPSW fetch +
 240 s boot + live control).
 
-### W2 — make the real drivers probe the synthetic nubs (device traffic > 0)
+### W2 — make the real drivers probe the synthetic nubs (device traffic > 0) — **CLOSED (impossible as written, 2026-10-24)**
 
-Today `AppleT8015DART`, `AppleSynopsysMIPIDSIController`,
-`IOMobileFramebuffer` never touch the models (`any_device_traffic=false`).
-Options, in the order we should try them:
+**Verdict (measured, five boots A–E + a static kernel-strings inventory):** the
+booted `kernel.development.sweet` contains **no Apple T8015 driver kexts at
+all**. The only IOKit platform drivers in the binary are
+`AppleARMPlatform` + `AppleInterruptController` (+ the SWEET built-ins).
+`AppleT8015DART`, `AppleSynopsysMIPIDSIController`, `AppleT8015IO`,
+`IOMobileFramebuffer`-as-Apple-kext exist ONLY in the real kernelcache
+(`kc-kexts.md` describes that file — which this pipeline never boots).
+The SWEET kernel is the **SM7150 build** (upstream `dipa-studio/ios-sweet`:
+iOS 16 userland + XNU on Redmi Note 10 Pro) — it can never probe T8015
+devices *by design*.
 
-1. **SWEET patch-set personality work** (the M5 commit's declared next
-   step): inspect why the personalities don't match the synthetic nubs
-   (`IONameMatch` vs our `compatible` strings, `IOProviderClass`
-   `AppleARMIODevice` vs our node names, absence of expected properties —
-   `io-device-name`, `AAPL,phandle` conventions). Adjust `mkadt.rs` first
-   (free), then the SWEET patch set if the kext demands more.
-2. **GIC-mapped interrupts + AIC model**: if matching needs interrupts
-   (M5 measured: dangling `interrupts` wedge nub creation — so this means
-   a REAL AIC stand-in routed to the GIC, plus `interrupt-parent` in the
-   subtree). Non-trivial; only if (1) proves interrupts are the blocker.
-3. **`kexts` triage**: `kc-kexts.md` already maps personalities ↔ kexts;
-   for each of the three drivers, record the exact mismatch reason from an
-   IOKit verbose boot (`debug=0x14e` IOKit trace flags, serial mirrored)
-   BEFORE patching anything.
+Evidence chain:
+* `strings kernel/kernel.development.sweet`: 2 Apple platform drivers, no
+  `AppleT8015*`, no `AppleARMIODevice` personalities; `macho-sym` counts
+  70,853 symbols (kernel.development, keepsyms).
+* Boot A (debug=0x14e): first FULL kernel console ring ever captured
+  (341 lines, `_msgbufp` dump) — IOKit healthy, zero matching output, zero
+  driver probes; M2 mount wall unchanged.
+* Boot B (+`arm-io,t8015` compatible): byte-identical outcome — and the
+  upstream reference (`tools/mkadt.py` line 170) confirms the canonical
+  compatible is `sweet-io`+`arm-io`; reverted.
+* Boot C (+`IOKitDebug=0x1ff`, the tunable IS in the kernel): no change —
+  there is nothing to match.
+* Upstream patch `0046-sweet-iosurface-iomfb.patch` (read, this session):
+  the ENTIRE display path is a built-in RAM shim — AppleCLCD (an
+  `IOMobileFramebuffer`) matches `sweet,display` on `/arm-io/disp0`, the
+  user client serves CoreAnimation's selectors (3/4/5/6/7/8/18/28/72) with
+  a **CPU copy into the panel memory**; vsync is a 60 Hz timer. **No display
+  hardware registers are ever programmed.**
 
-**Gate:** `dart_register_writes > 0` in the m5-verdict (the CI already
-collects it); the traces become the stage-2 register spec.
+Consequences:
+* The `dart_register_writes > 0` gate **as originally intended is
+  architecturally unreachable** on this kernel. The QEMU
+  `sweet-dart`/`sweet-disp0`/`sweet-mipi-dsim` models stay as
+  fidelity decoration (they serve the VNC display OUT and the DMA chain
+  evidence) but are NOT on the boot-critical path.
+* W3 (DART stage-2 walker) loses its "W2 traces as spec" premise. If it is
+  ever revived, the spec source is public DART knowledge (pongoOS,
+  mainline `t8015-common.dtsi`), not kernel traces. **Deprioritized.**
+* The boot-critical path is **W4** (below) — and its cause was found this
+  session.
 
-### W3 — DART stage-2: the real PTE walker (device model work)
+### W3 — DART stage-2: the real PTE walker (device model work) — **DEPRIORITIZED (W2 closed: no guest code programs the DART)**
 
 Driven by the W2 traces, never by guesses (the stage-1 `qemu.log` traces
 ARE the spec — see `qemu-sweet/README.md`):
@@ -108,15 +128,39 @@ ARE the spec — see `qemu-sweet/README.md`):
 (read-back of a known pattern through the DART AS); IOMFB-initiated FB
 flip changes `fb.png` without host help.
 
-### W4 — the IOMFB user client (userland × device)
+### W4 — the IOMFB user client (userland × device) — **CAUSE FOUND + FIXED (2026-10-24)**
 
-M3 measured the MACH wall: userland alive, parked on a working
-`IOMobileFramebuffer` user client. With W2/W3 the client has a device to
-talk to. Measure the exact call that parks (`userspace-deps.md` gates),
-extend the model only for what the call path touches.
+The MACH wall's root cause was in **our ADT port**, not in the kernel or
+the device models. Upstream patch 0046's own header states:
+`IOMobileFramebuffer.framework` (iOS 16.7) **counts `/arm-io` children
+with `device_type = "display-subsystem"`**, waits for that many services
+matching `IOServiceMatching("IOMobileFramebuffer")`, and reads
+`canvas-width`/`canvas-height` from the provider node.
 
-**Gate:** the parking daemon gets past the IOMFB connect; the spawn cycle
-advances one measured daemon further.
+Our `mkadt.rs` had `disp0` with `device_type = "dart"` — a porting bug
+(upstream `tools/mkadt.py` lines 181-191: `display-subsystem`). The
+framework saw ZERO display subsystems → backboardd could never complete
+its launchd check-in (`com.apple.backboard.display.services`) →
+SpringBoard waited on backboardd → the whole userland parked in mach_msg
+at t=44 s of the boot (run 40034787036).
+
+FIXED this session: `device_type = "display-subsystem"` restored; the
+default ADT is now semantically identical to upstream's `mkadt.py --qemu`
+output (verified by `adt-dump` diff: only random-seed + phandle numbering
+order differ; both internally consistent).
+
+The kernel-side SWEET IOMFB (patch 0046) is complete on its own: user
+client selectors 3/4/5/6/7/8/18/28/72, SwapEnd = CPU layer copy, vsync =
+60 Hz timer. `sweetfb_noconsole=1` (now in the CI cmdline) pauses the
+text console on the first swap so the framebuffer shows the pure GUI —
+the prerequisite for clean SpringBoard/Settings screenshots (W5).
+
+**Measurement (next CI run):** the unified verdict now records
+`daemons_execd[_count]` + `last_msgbuf_ts` against the freeze baseline
+`mach_wall_freeze_baseline_ts = 45.0`. Gate to pin from that evidence:
+`last_msgbuf_ts > baseline` and a daemon roster that grows past the
+baseline set. **Gate:** the parking daemon gets past the IOMFB connect;
+the spawn cycle advances one measured daemon further.
 
 ### W5 — SpringBoard first frame (the finish line of the plan, §M7)
 
@@ -127,13 +171,26 @@ root) or is W1–W4.
 
 ## 2. Immediate next actions (ordered)
 
-1. **W1** — `--sweet-devices`/`--display-adt` in `ipsw-boot`; CI job that
-   runs the unified pipeline and asserts the M3 verdicts with devices on.
-2. **W2 diagnosis** — IOKit-verbose boot of the unified pipeline; record
-   the per-driver match failure verbatim into `kc-kexts.md`; then patch
-   `mkadt.rs` (cheap) → SWEET patch set (if needed).
-3. **W3 stage-2 DART** — only after W2 traffic exists (the walker is
-   written against measured writes, not imagined ones).
+1. ~~W1~~ — **SHIPPED + CI-VERIFIED** (run 40063428984).
+2. ~~W2 diagnosis~~ — **CLOSED** (see the W2 verdict: the drivers are not
+   in the kernel; the display path is the built-in RAM shim).
+3. **W4 measurement** — the `display-subsystem` fix ships in this push;
+   the full-boot CI run measures the spawn-cycle advance past the 45 s
+   freeze baseline (`daemons_execd_count`, `last_msgbuf_ts`). Gate pins
+   from that evidence.
+4. **W5 SpringBoard first frame** — once W4's verdict lands: clean GUI
+   frames via `sweetfb_noconsole=1`, VNC capture, then HID injection for
+   the apps/settings/about screenshot goal.
+
+Toolchain additions this session (all tested, no external deps):
+* `macho-sym` — native LC_SYMTAB parse (70,853 symbols on the kernel);
+  `extract_font`/`screen-decode` use it first, llvm-nm only as fallback;
+  the CI `_msgbufp` lookup dropped llvm-nm entirely.
+* `boot-qemu --msgbuf-dump <addr>` — the kernel console ring on every
+  boot (the fb console only ever shows the last screen; serial is empty
+  by design on this kernel).
+* The first FULL kernel console ring ever captured (341 lines, boot A) —
+  the W2 evidence base.
 
 ## 3. Honesty rules (unchanged)
 

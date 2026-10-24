@@ -259,11 +259,21 @@ pub fn build(opts: &AdtOptions) -> Result<Node> {
     //   * --display: the REAL D22AP persona adds `disp0,t8015` + the 4-range
     //     register map + the D22AP display properties, so the real IOMFB
     //     driver stack (IOMobileFramebuffer / AppleMobileDispH10P) matches.
+    //
+    // W4 VERDICT (2026-10-24, upstream tools/mkadt.py lines 181-191 + patch
+    // 0046 header): device_type MUST be "display-subsystem" — userland's
+    // IOMobileFramebuffer.framework COUNTS /arm-io children with this
+    // device_type and waits for that many IOMobileFramebuffer services;
+    // the canvas size is read from the node (SweetFramebuffer.cpp). The
+    // ported "dart" here was THE MACH WALL: backboardd could never register
+    // com.apple.backboard.display.services (framework saw zero display
+    // subsystems), SpringBoard waited on backboardd, the whole userland
+    // parked in mach_msg at t=44s (run 40034787036).
     let mut disp0 = node(
         "disp0",
         vec![
             ph!(),
-            ("device_type", adt::cstr("dart")),
+            ("device_type", adt::cstr("display-subsystem")),
             ("compatible", adt::cstr("sweet,display")),
             ("canvas-width", u32v(&[1125])),
             ("canvas-height", u32v(&[2436])),
@@ -437,7 +447,20 @@ pub fn build(opts: &AdtOptions) -> Result<Node> {
         vec![
             ph!(),
             ("device_type", adt::cstr("sweet-io")),
+            // Upstream-canonical (tools/mkadt.py line 170-171): sweet-io +
+            // arm-io. The session briefly added "arm-io,t8015" hunting the
+            // T8015 plane driver (AppleT8015IO) — MEASURED no-effect (boots
+            // A..E identical) and CORRECTLY so: the SWEET kernel is the
+            // SM7150 build; it contains no Apple T8015 kexts at all
+            // (kernel-strings inventory, W2 verdict). Reverted for byte
+            // parity with upstream.
             ("compatible", [adt::cstr("sweet-io"), adt::cstr("arm-io")].concat()),
+            // NOTE (deliberately NOT added): the real D22AP /arm-io reg
+            // (0x2_08f00000.. ranges, devicetree-d22ap.md line 3647). On the
+            // QEMU virt world those guest-physical addresses are UNASSIGNED —
+            // a driver mapping them gets an external data abort and kills the
+            // boot before any matching output. Revisit only with evidence
+            // that AppleT8015IO start() actually maps its parent's reg.
             ("#address-cells", u32v(&[2])),
             ("#size-cells", u32v(&[2])),
             ("ranges", u64v(&[0, SOC_BASE, 0x1_0000_0000 - SOC_BASE])),

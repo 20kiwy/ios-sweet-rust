@@ -167,8 +167,9 @@ jobs:
       - name: UNIFIED boot — mini-root userland + display subtree + sweet devices
         run: |
           export PATH="$PWD/qemu-prefix-sweet/bin:$PATH"
-          MSGREF=$(llvm-nm kernel/kernel.development.sweet | grep ' _msgbufp$' | awk '{print $1}')
-          echo "_msgbufp = 0x$MSGREF"
+          # W2 session: native symtab parse — no external llvm-nm needed
+          MSGREF=$(./target/release/sweet-rust macho-sym kernel/kernel.development.sweet _msgbufp | awk '{print $1}')
+          echo "_msgbufp = $MSGREF"
           set +e
           ./target/release/sweet-rust ipsw-boot --ipsw "$IPSW" out-full \
             --kernel kernel/kernel.development.sweet \
@@ -179,10 +180,13 @@ jobs:
             --highmem --no-logo --secs "$SECS" --dump-ramdisk \
             --snap-every 30 \
             --msgbuf-dump "0x$MSGREF" \
-            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 sweetfb_noconsole=1 -enable_kprintf_spam -noprogress rd=md0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ncl=49152' \
             || true
           set -e
           ls -la out-full
+          # W4: the kernel console ring is the userland timeline (the fb
+          # console is overdrawn by the GUI once SpringBoard composites)
+          strings -n 4 out-full/msgbuf.bin > out-full/msgbuf.txt || true
           echo "===== console screenshots (the display layer's view -- what VNC serves) ====="
           ls -la out-full/screenshot-*.png 2>/dev/null || echo "(no console screenshots)"
           echo "===== msgbuf tail (early-boot-complete / spawn cycle lands here) ====="
@@ -242,6 +246,21 @@ jobs:
           v["kernel"]["kernel_panic"] = kernel_panic
           m = re.search(r'description:\s*(.{0,140}?)(?:handshake|Please go to|$)', both)
           v["kernel"]["exit_reason"] = m.group(1).strip() if m else ""
+
+          # W4 measurement (device_type=display-subsystem fix, this run):
+          # does the launchd spawn cycle advance PAST the t=44 s MACH wall?
+          # Baseline (run 40034787036, the bug): msgbuf froze at t=45.03 s of
+          # a 240 s boot, backboardd never checked in. Measure first, pin
+          # the gate next run (honesty rules: gate after evidence).
+          execs = re.findall(r'\]: exec (\S+)', msgbuf)
+          v["kernel"]["daemons_execd"] = sorted(set(execs))
+          v["kernel"]["daemons_execd_count"] = len(set(execs))
+          ts = [float(t) for t in re.findall(r'\[\s*(\d+\.\d+)\]:', msgbuf)]
+          v["kernel"]["last_msgbuf_ts"] = max(ts) if ts else 0.0
+          v["kernel"]["mach_wall_freeze_baseline_ts"] = 45.0
+
+          # W4 measurement artifact (gate pinned after this run's evidence)
+          v["gates"]["w4_measured"] = "daemons_execd_count" in v["kernel"]
 
           # W1 gate: the M3 verdicts must HOLD with the display devices on
           v["gates"]["devices_realized"] = all(v["devices"][d+"_realized"]

@@ -1102,21 +1102,35 @@ fn write_loader_chunks(
     Ok(parts)
 }
 
-/// Extract the `_iso_font` glyph table from an unstripped kernel via llvm-nm.
+/// Extract the `_iso_font` glyph table from an unstripped kernel (native
+/// LC_SYMTAB parse first; llvm-nm only as the `--nm` fallback).
 pub fn extract_font(kernel: &Path, payload: &[u8], nm: &str) -> Result<Vec<u8>> {
-    let out = Command::new(nm).args(["--defined-only"]).arg(kernel).output()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut fonts = Vec::new();
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 3 && parts[2] == "_iso_font" {
-            if let Ok(v) = u64::from_str_radix(parts[0], 16) {
-                fonts.push(v);
-            }
+    // Preferred: the NATIVE symtab parse (W2: llvm-nm is not installed in
+    // every sandbox/CI image and the old shell-out failed silently; the
+    // kernel's LC_SYMTAB carries the same `_iso_font` address).
+    let mut fonts: Vec<u64> = Vec::new();
+    if let Ok(buf) = std::fs::read(kernel) {
+        if let Ok(syms) = crate::macho::symbols(&buf) {
+            fonts = syms.iter().filter(|(n, _)| *n == "_iso_font").map(|(_, v)| *v).collect();
         }
     }
     if fonts.len() != 1 {
-        bail!("kernel must contain exactly one _iso_font symbol (found {})", fonts.len());
+        // Fallback: external llvm-nm (kept for fileset/prelinked layouts the
+        // native parse may not cover).
+        let out = Command::new(nm).args(["--defined-only"]).arg(kernel).output()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        fonts = Vec::new();
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 3 && parts[2] == "_iso_font" {
+                if let Ok(v) = u64::from_str_radix(parts[0], 16) {
+                    fonts.push(v);
+                }
+            }
+        }
+        if fonts.len() != 1 {
+            bail!("kernel must contain exactly one _iso_font symbol (found {})", fonts.len());
+        }
     }
     payload_data(payload, fonts[0], 256 * 16)
 }
